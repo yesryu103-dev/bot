@@ -468,6 +468,39 @@ async function telegramRequest(method, payload) {
   return result;
 }
 
+function isPlaceholderTelegramToken(token) {
+  return !token || token === "123456:replace_me" || token.toLowerCase().includes("replace_me");
+}
+
+function maskToken(token) {
+  if (!token) return "(empty)";
+  const [botId, secret = ""] = token.split(":");
+  return `${botId}:${secret.slice(0, 4)}...${secret.slice(-4)}`;
+}
+
+async function validateTelegramConfig() {
+  if (config.dryRun) return;
+  if (isPlaceholderTelegramToken(config.telegramBotToken)) {
+    throw new Error(
+      "Invalid TELEGRAM_BOT_TOKEN: value is empty or still uses 123456:replace_me. Set the real BotFather token in Render Environment.",
+    );
+  }
+  if (!config.telegramChatId) throw new Error("Missing TELEGRAM_CHAT_ID.");
+
+  try {
+    const payload = await telegramRequest("getMe", {});
+    const username = payload.result?.username ? `@${payload.result.username}` : payload.result?.first_name || "unknown bot";
+    console.log(`Telegram token OK for ${username}; token ${maskToken(config.telegramBotToken)}.`);
+  } catch (error) {
+    if (String(error.message).includes("401") || String(error.message).includes("Unauthorized")) {
+      throw new Error(
+        `Telegram rejected TELEGRAM_BOT_TOKEN (${maskToken(config.telegramBotToken)}). Copy a fresh token from BotFather and update Render Environment.`,
+      );
+    }
+    throw error;
+  }
+}
+
 async function sendTradeMenu(chatId = config.telegramChatId) {
   return telegramRequest("sendMessage", {
     chat_id: chatId,
@@ -1086,6 +1119,7 @@ async function main() {
 
   const state = loadState();
   applyStateConfig(state);
+  await validateTelegramConfig();
 
   if (process.argv.includes("--send-menu")) {
     await sendMainMenu();
