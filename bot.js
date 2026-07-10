@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const http = require("node:http");
 const path = require("node:path");
 
 function loadDotenv(filePath = path.join(process.cwd(), ".env")) {
@@ -125,6 +126,26 @@ function loadState() {
 
 function saveState(state) {
   fs.writeFileSync(config.stateFile, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function startHealthServer() {
+  const port = Number(process.env.PORT || 0);
+  if (!port) return;
+
+  const server = http.createServer((req, res) => {
+    if (req.url === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("Telegram bot is running.\n");
+  });
+
+  server.listen(port, () => {
+    console.log(`Health server listening on port ${port}.`);
+  });
 }
 
 function addSeen(state, hashes) {
@@ -1061,6 +1082,8 @@ async function bootState(state) {
 }
 
 async function main() {
+  startHealthServer();
+
   const state = loadState();
   applyStateConfig(state);
 
