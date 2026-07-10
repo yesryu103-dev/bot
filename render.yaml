@@ -1,0 +1,69 @@
+services:
+  - type: worker
+    name: robinhood-telegram-bot
+    runtime: node
+    region: singapore
+    buildCommand: npm ci
+    startCommand: npm start
+    autoDeployTrigger: commit
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: BOT_TITLE
+        value: REPETradingBot
+      - key: BOT_TAGLINE
+        value: Your Gateway to Robinhood DeFi
+      - key: PROJECT_TELEGRAM_URL
+        value: https://t.me/reperob
+      - key: PROJECT_TWITTER_URL
+        value: https://x.com/RobinhoodsPepe
+      - key: PROJECT_WEBSITE_URL
+        value: https://robinrepe.xyz/
+      - key: PAIR_ADDRESS
+        value: 0xb541c2936982dd5c4090783d8f395d3e613c8016
+      - key: BASE_TOKEN_ADDRESS
+        value: 0x5266eeaff092d6136ab63d18b975a60a0cc0c8f7
+      - key: QUOTE_TOKEN_ADDRESS
+        value: 0x0bd7d308f8e1639fab988df18a8011f41eacad73
+      - key: BASE_SYMBOL
+        value: REPE
+      - key: QUOTE_SYMBOL
+        value: WETH
+      - key: POLL_SECONDS
+        value: 3
+      - key: MAX_ITEMS
+        value: 50
+      - key: MIN_USD
+        value: 0
+      - key: MIN_QUOTE_AMOUNT
+        value: 2
+      - key: DRY_RUN
+        value: 0
+      - key: BACKFILL_ON_START
+        value: 0
+      - key: FETCH_TX_DETAILS
+        value: 0
+      - key: BUY_WHEN_BASE_LEAVES_POOL
+        value: 1
+      - key: BUY_AMOUNTS_QUOTE
+        value: 0.01,0.05,0.1,0.25
+      - key: SELL_AMOUNTS_BASE
+        value: 1000,5000,10000,25000
+      - key: ONE_TAP_TRADE
+        value: 0
+      - key: TRADE_ENABLED
+        value: 0
+      - key: RPC_URL
+        sync: false
+      - key: WALLET_PRIVATE_KEY
+        sync: false
+      - key: WALLET_ADDRESS
+        sync: false
+      - key: SWAP_ROUTER_ADDRESS
+        value: 0xCaf681a66D020601342297493863E78C959E5cb2
+      - key: UNISWAP_V3_FEE
+        value: 10000
+      - key: SLIPPAGE_BPS
+        value: 200

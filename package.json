@@ -1,0 +1,19 @@
+{
+  "name": "robinhood-uniswap-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram bot that tracks buy/sell swaps on a Robinhood Uniswap pair using Blockscout.",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "send-menu": "node bot.js --send-menu",
+    "send-trade": "node bot.js --send-trade",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0"
+  }
+}
