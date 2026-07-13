@@ -534,7 +534,10 @@ function loadState() {
 }
 
 function saveState(state) {
-  fs.writeFileSync(config.stateFile, `${JSON.stringify(state, null, 2)}\n`);
+  fs.writeFileSync(
+    config.stateFile,
+    `${JSON.stringify(state, (_, value) => (typeof value === "bigint" ? value.toString() : value), 2)}\n`,
+  );
 }
 
 function startHealthServer() {
@@ -2324,6 +2327,33 @@ function isTradeablePortfolioItem(item, options = {}) {
   return true;
 }
 
+function serializePortfolioItem(item) {
+  if (!item) return null;
+  return {
+    address: normalizeAddress(item.address),
+    symbol: item.symbol || "TOKEN",
+    name: item.name || "",
+    decimals: Number(item.decimals) || 18,
+    amount: Number(item.amount) || 0,
+    type: item.type || "ERC-20",
+    priceUsd: Number(item.priceUsd),
+    liquidityUsd: Number(item.liquidityUsd),
+    valueUsd: Number(item.valueUsd),
+    pairAddress: normalizeAddress(item.pairAddress || ""),
+    pairUrl: item.pairUrl || "",
+  };
+}
+
+function isBagSellableItem(item) {
+  if (!item || !isEvmAddress(item.address)) return false;
+  if (item.address === normalizeAddress(config.quoteTokenAddress || config.lpWethAddress)) return false;
+  if (!(Number(item.amount) > 0)) return false;
+  if (!Number.isFinite(Number(item.priceUsd)) || Number(item.priceUsd) <= 0) return false;
+  if (!isEvmAddress(item.pairAddress)) return false;
+  // Show bag buttons even for small bags (portfolio text still uses stricter tradeable filter).
+  return Number.isFinite(Number(item.valueUsd)) && Number(item.valueUsd) >= 0.01;
+}
+
 function buildPortfolioFromBalances(balances, pairs, options = {}) {
   const minLiquidityUsd = Number(options.minLiquidityUsd ?? config.minPortfolioLiquidityUsd);
   const minValueUsd = Number(options.minValueUsd ?? config.minPortfolioValueUsd);
@@ -2335,6 +2365,7 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
 
   const bestByToken = bestPairMapForTokens(pairs, parsed.map((item) => item.address));
   const tradeable = [];
+  const bagCandidates = [];
   let skipped = 0;
 
   for (const item of parsed) {
@@ -2343,13 +2374,20 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
     const liquidityUsd = Number(pair?.liquidity?.usd);
     const valueUsd = Number.isFinite(priceUsd) ? item.amount * priceUsd : NaN;
     const enriched = {
-      ...item,
+      address: item.address,
+      symbol: item.symbol,
+      name: item.name,
+      decimals: item.decimals,
+      amount: item.amount,
+      type: item.type,
       priceUsd,
       liquidityUsd,
       valueUsd,
       pairAddress: normalizeAddress(pair?.pairAddress || ""),
       pairUrl: pair?.url || (pair?.pairAddress ? `https://dexscreener.com/robinhood/${pair.pairAddress}` : ""),
     };
+
+    if (isBagSellableItem(enriched)) bagCandidates.push(enriched);
 
     if (isTradeablePortfolioItem(enriched, filterOptions)) {
       tradeable.push(enriched);
@@ -2359,11 +2397,14 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
   }
 
   tradeable.sort((a, b) => Number(b.valueUsd || 0) - Number(a.valueUsd || 0));
-  const items = tradeable.slice(0, maxTokens);
+  bagCandidates.sort((a, b) => Number(b.valueUsd || 0) - Number(a.valueUsd || 0));
+  const items = tradeable.slice(0, maxTokens).map(serializePortfolioItem);
+  const bagItems = bagCandidates.slice(0, 6).map(serializePortfolioItem);
   const totalUsd = items.reduce((sum, item) => sum + (Number(item.valueUsd) || 0), 0);
 
   return {
     items,
+    bagItems,
     skipped,
     totalUsd,
     updatedAt: new Date().toISOString(),
@@ -2404,15 +2445,18 @@ function portfolioSectionText(portfolio) {
   }
 
   const items = Array.isArray(portfolio.items) ? portfolio.items : [];
+  const bagItems = Array.isArray(portfolio.bagItems) ? portfolio.bagItems : [];
+  const displayItems = bagItems.length ? bagItems : items;
+  const totalUsd = displayItems.reduce((sum, item) => sum + (Number(item.valueUsd) || 0), 0);
   const lines = [
     `<b>📦 Portfolio</b>`,
-    `Total: <b>${escapeHtml(formatUsd(portfolio.totalUsd))}</b> · Tradeable: <b>${items.length}</b> · Hidden: <b>${Number(portfolio.skipped) || 0}</b>`,
+    `Total: <b>${escapeHtml(formatUsd(totalUsd))}</b> · Bags: <b>${displayItems.length}</b> · Hidden: <b>${Number(portfolio.skipped) || 0}</b>`,
   ];
 
-  if (!items.length) {
-    lines.push(`Không còn token ≥ ${escapeHtml(formatUsd(config.minPortfolioValueUsd))} với LP hợp lệ.`);
+  if (!displayItems.length) {
+    lines.push(`Không còn token ≥ $0.01 với pair WETH để bán.`);
   } else {
-    for (const item of items) {
+    for (const item of displayItems) {
       const chart = item.pairUrl ? ` <a href="${escapeHtml(item.pairUrl)}">chart</a>` : "";
       lines.push(
         `↳ <b>${escapeHtml(item.symbol)}</b> ${escapeHtml(formatTokenAmount(item.amount))} · ${escapeHtml(formatPriceUsd(item.priceUsd))} · <b>${escapeHtml(formatUsd(item.valueUsd))}</b>${chart}`,
@@ -2442,9 +2486,16 @@ function portfolioKeyboard() {
 
 function cachePortfolioSnapshot(state, portfolio) {
   if (!portfolio?.wallet) return null;
+  const items = (Array.isArray(portfolio.items) ? portfolio.items : [])
+    .map(serializePortfolioItem)
+    .filter(Boolean);
+  const bagItems = (Array.isArray(portfolio.bagItems) ? portfolio.bagItems : items)
+    .map(serializePortfolioItem)
+    .filter(Boolean);
   const snapshot = {
     wallet: portfolio.wallet,
-    items: Array.isArray(portfolio.items) ? portfolio.items : [],
+    items,
+    bagItems,
     skipped: Number(portfolio.skipped) || 0,
     totalUsd: Number(portfolio.totalUsd) || 0,
     updatedAt: portfolio.updatedAt || new Date().toISOString(),
@@ -2640,9 +2691,12 @@ function formatBagButtonLabel(item) {
 }
 
 function bagButtonRows(portfolio, maxTokens = 6) {
-  const items = (Array.isArray(portfolio?.items) ? portfolio.items : [])
-    .filter((item) => isEvmAddress(item?.address))
-    .slice(0, maxTokens);
+  const source = Array.isArray(portfolio?.bagItems) && portfolio.bagItems.length
+    ? portfolio.bagItems
+    : Array.isArray(portfolio?.items)
+      ? portfolio.items
+      : [];
+  const items = source.filter((item) => isEvmAddress(item?.address)).slice(0, maxTokens);
   const buttons = items.map((item) => ({
     text: formatBagButtonLabel(item),
     callback_data: `bag:${normalizeAddress(item.address)}`,
@@ -2652,7 +2706,11 @@ function bagButtonRows(portfolio, maxTokens = 6) {
 
 function findBagItem(state, tokenAddress) {
   const token = normalizeAddress(tokenAddress);
-  return (state?.portfolioSnapshot?.items || []).find((item) => normalizeAddress(item.address) === token) || null;
+  const lists = [
+    ...(state?.portfolioSnapshot?.bagItems || []),
+    ...(state?.portfolioSnapshot?.items || []),
+  ];
+  return lists.find((item) => normalizeAddress(item.address) === token) || null;
 }
 
 function bagSellPanelText(item, extras = {}) {

@@ -240,9 +240,10 @@ test("main menu bag buttons open sell panel without changing sniper labels", () 
   const repe = "0x5266eeaff092d6136ab63d18b975a60a0cc0c8f7";
   const cash = "0x020bfc650a365f8bb26819deaabf3e21291018b4";
   const portfolio = {
-    items: [
-      { address: repe, symbol: "REPE", valueUsd: 12.5 },
-      { address: cash, symbol: "CASHCAT", valueUsd: 40 },
+    items: [],
+    bagItems: [
+      { address: repe, symbol: "REPE", valueUsd: 12.5, pairAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      { address: cash, symbol: "CASHCAT", valueUsd: 40, pairAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
     ],
   };
   const keyboard = bot.mainMenuKeyboard(portfolio);
@@ -255,12 +256,12 @@ test("main menu bag buttons open sell panel without changing sniper labels", () 
   assert(callbacks.includes(`bag:${repe}`));
   assert(callbacks.includes(`bag:${cash}`));
 
-  const bagKeyboard = bot.bagSellKeyboard(portfolio.items[0]);
+  const bagKeyboard = bot.bagSellKeyboard(portfolio.bagItems[0]);
   const bagCallbacks = bagKeyboard.inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
   assert(bagCallbacks.includes(`bagsell:${repe}:25%`));
   assert(bagCallbacks.includes(`bagsell:${repe}:ALL`));
   assert(bagCallbacks.includes(`bagtrack:${repe}`));
-  assert.equal(bot.formatBagButtonLabel(portfolio.items[0]), "REPE $12.50");
+  assert.equal(bot.formatBagButtonLabel(portfolio.bagItems[0]), "REPE $12.50");
 });
 
 test("expired Telegram callback errors are recognized", () => {
@@ -459,6 +460,10 @@ test("portfolio keeps liquid tokens and hides junk", () => {
   assert.equal(portfolio.skipped, 2);
   assert.ok(portfolio.totalUsd > 0);
   assert.equal(bot.isTradeablePortfolioItem(portfolio.items[0], { minLiquidityUsd: 50, minValueUsd: 3 }), true);
+  assert.ok(Array.isArray(portfolio.bagItems));
+  assert.ok(portfolio.bagItems.some((item) => item.symbol === "GOOD"));
+  assert.ok(portfolio.bagItems.some((item) => item.symbol === "SCAM"));
+  assert.equal(portfolio.items[0].raw, undefined);
 });
 
 test("portfolio keyboard exposes Update Price", () => {
