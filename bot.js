@@ -70,6 +70,11 @@ const config = {
   lpEthAmounts: parseAmountOptions(process.env.LP_ETH_AMOUNTS || "0.01,0.05,0.1"),
   positionManagerAddress: process.env.POSITION_MANAGER_ADDRESS || "0x73991a25c818bf1f1128deaab1492d45638de0d3",
   v3FactoryAddress: process.env.V3_FACTORY_ADDRESS || "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
+  v2FactoryAddress: process.env.V2_FACTORY_ADDRESS || "0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f",
+  multicall3Address: process.env.MULTICALL3_ADDRESS || "0xcA11bde05977b3631167028862bE2a173976CA11",
+  lpLockerAddresses: parseAmountOptions(process.env.LP_LOCKER_ADDRESSES || "")
+    .map(normalizeAddress)
+    .filter((value) => /^0x[a-f0-9]{40}$/.test(value)),
   uniswapLpUrl:
     process.env.UNISWAP_LP_URL ||
     "https://app.uniswap.org/positions/create/v3?currencyA=0xd7321801caae694090694ff55a9323139f043b88&currencyB=NATIVE&chain=robinhood",
@@ -207,6 +212,10 @@ async function fetchDexTokens(tokenAddresses) {
 
 async function fetchBlockscoutToken(tokenAddress) {
   return fetchJson(`${config.blockscoutBaseUrl}/api/v2/tokens/${tokenAddress}`);
+}
+
+async function fetchBlockscoutAddress(address) {
+  return fetchJson(`${config.blockscoutBaseUrl}/api/v2/addresses/${address}`);
 }
 
 async function fetchTokenHolders(tokenAddress) {
@@ -560,6 +569,7 @@ function analyzePairsMarketRisk(pairs) {
     score,
     warnings,
     primary: true,
+    primaryPair: primary,
   };
 }
 
@@ -613,14 +623,33 @@ function analyzeContractBytecode(code) {
   let score = 0;
   const normalized = String(code || "").toLowerCase().replace(/^0x/, "");
   if (!normalized || normalized === "0x") {
-    return { score: 100, warnings: ["No contract bytecode"], hasOwnerSelector: false, hasBlacklistSelector: false, hasPauseSelector: false, hasMintSelector: false };
+    return {
+      score: 100,
+      warnings: ["No contract bytecode"],
+      hasOwnerSelector: false,
+      hasBlacklistSelector: false,
+      hasPauseSelector: false,
+      hasMintSelector: false,
+      hasTaxSelector: false,
+      hasMaxTxSelector: false,
+      hasTradingToggle: false,
+      hasAccessControl: false,
+      hasProxySelector: false,
+    };
   }
 
   const has = (selector) => normalized.includes(String(selector).toLowerCase().replace(/^0x/, ""));
   const hasOwnerSelector = has("8da5cb5b") || has("893d20e8");
-  const hasBlacklistSelector = has("f9f92be4") || has("fe575a87") || has("e47d6060");
+  const hasBlacklistSelector = has("f9f92be4") || has("fe575a87") || has("e47d6060") || has("153b0d1e");
   const hasPauseSelector = has("5c975abb") || has("8456cb59") || has("3f4ba83a");
   const hasMintSelector = has("40c10f19") || has("a0712d68");
+  const hasTaxSelector =
+    has("4f7041a5") || has("cc1776d3") || has("47062402") || has("2b14ca56") || has("13114a9d") || has("5342acb4");
+  const hasMaxTxSelector =
+    has("8c0b5e22") || has("c8c8ebe4") || has("7d1db4a5") || has("f8b45b05") || has("aa4bde28");
+  const hasTradingToggle = has("ffb54a99") || has("bbc0c742") || has("fa83cb58");
+  const hasAccessControl = has("91d14854") || has("248a9ca3") || has("570ca735") || has("6d70f7ae");
+  const hasProxySelector = has("5c60da1b") || has("52d1902d") || has("f851a440") || has("6e9960c3");
 
   if (hasBlacklistSelector) {
     warnings.push("Bytecode has blacklist-related selectors");
@@ -634,18 +663,682 @@ function analyzeContractBytecode(code) {
     warnings.push("Bytecode has mint selector — supply can inflate");
     score += 25;
   }
+  if (hasTaxSelector) {
+    warnings.push("Bytecode has tax/fee selectors");
+    score += 15;
+  }
+  if (hasMaxTxSelector) {
+    warnings.push("Bytecode has maxTx/maxWallet selectors");
+    score += 12;
+  }
+  if (hasTradingToggle) {
+    warnings.push("Bytecode has trading enable/disable selectors");
+    score += 15;
+  }
+  if (hasAccessControl) {
+    warnings.push("Bytecode has AccessControl/operator roles — renounce may be incomplete");
+    score += 18;
+  }
+  if (hasProxySelector) {
+    warnings.push("Bytecode has proxy/admin selectors");
+    score += 20;
+  }
   if (hasOwnerSelector) {
     warnings.push("Ownable-style owner selector present");
     score += 8;
   }
 
-  return { score, warnings, hasOwnerSelector, hasBlacklistSelector, hasPauseSelector, hasMintSelector };
+  return {
+    score,
+    warnings,
+    hasOwnerSelector,
+    hasBlacklistSelector,
+    hasPauseSelector,
+    hasMintSelector,
+    hasTaxSelector,
+    hasMaxTxSelector,
+    hasTradingToggle,
+    hasAccessControl,
+    hasProxySelector,
+  };
+}
+
+function storageAddress(slotValue) {
+  const hex = String(slotValue || "").toLowerCase().replace(/^0x/, "").padStart(64, "0");
+  return normalizeAddress(`0x${hex.slice(24)}`);
+}
+
+async function analyzeProxyRisk(provider, tokenAddress, addressInfo = null) {
+  const notes = [];
+  const dangers = [];
+  let score = 0;
+  const token = normalizeAddress(tokenAddress);
+
+  const IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+  const ADMIN_SLOT = "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
+  const BEACON_SLOT = "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50";
+
+  let impl = "";
+  let admin = "";
+  let beacon = "";
+  try {
+    const [implRaw, adminRaw, beaconRaw] = await Promise.all([
+      provider.getStorage(token, IMPLEMENTATION_SLOT),
+      provider.getStorage(token, ADMIN_SLOT),
+      provider.getStorage(token, BEACON_SLOT),
+    ]);
+    impl = storageAddress(implRaw);
+    admin = storageAddress(adminRaw);
+    beacon = storageAddress(beaconRaw);
+  } catch (error) {
+    notes.push(`Proxy storage read failed: ${error.message}`);
+    return { score: 5, notes, dangers, isProxy: null, impl, admin };
+  }
+
+  const proxyType = String(addressInfo?.proxy_type || "").toLowerCase();
+  const implementations = Array.isArray(addressInfo?.implementations) ? addressInfo.implementations : [];
+  const isProxy =
+    Boolean(proxyType) ||
+    implementations.length > 0 ||
+    (!isDeadOrZeroAddress(impl) && isEvmAddress(impl)) ||
+    (!isDeadOrZeroAddress(admin) && isEvmAddress(admin)) ||
+    (!isDeadOrZeroAddress(beacon) && isEvmAddress(beacon));
+
+  if (!isProxy) {
+    return { score: 0, notes, dangers, isProxy: false, impl, admin };
+  }
+
+  notes.push(`Upgradeable proxy detected${proxyType ? ` (${proxyType})` : ""}`);
+  score += 30;
+
+  if (admin && !isDeadOrZeroAddress(admin)) {
+    dangers.push(`Proxy admin still active: ${admin}`);
+    score += 25;
+  } else if (beacon && !isDeadOrZeroAddress(beacon)) {
+    dangers.push(`Proxy beacon still set: ${beacon}`);
+    score += 25;
+  } else {
+    notes.push("Proxy admin/beacon slot empty — verify implementation immutability");
+  }
+
+  if (impl && !isDeadOrZeroAddress(impl)) {
+    notes.push(`Implementation: ${impl}`);
+  }
+
+  return { score, notes, dangers, isProxy: true, impl, admin, beacon };
+}
+
+async function readTokenRiskViews(provider, tokenAddress) {
+  const { ethers } = require("ethers");
+  const token = normalizeAddress(tokenAddress);
+  const iface = new ethers.Interface([
+    "function sellTax() view returns (uint256)",
+    "function buyTax() view returns (uint256)",
+    "function sellFee() view returns (uint256)",
+    "function buyFee() view returns (uint256)",
+    "function totalFees() view returns (uint256)",
+    "function maxTxAmount() view returns (uint256)",
+    "function maxTransactionAmount() view returns (uint256)",
+    "function maxWallet() view returns (uint256)",
+    "function maxWalletAmount() view returns (uint256)",
+    "function tradingOpen() view returns (bool)",
+    "function tradingActive() view returns (bool)",
+    "function paused() view returns (bool)",
+  ]);
+
+  const calls = [
+    "sellTax",
+    "buyTax",
+    "sellFee",
+    "buyFee",
+    "totalFees",
+    "maxTxAmount",
+    "maxTransactionAmount",
+    "maxWallet",
+    "maxWalletAmount",
+    "tradingOpen",
+    "tradingActive",
+    "paused",
+  ].map((name) => ({
+    name,
+    target: token,
+    data: iface.encodeFunctionData(name, []),
+  }));
+
+  const results = await aggregate3(provider, calls);
+  const values = {};
+  calls.forEach((call, index) => {
+    const result = results[index];
+    if (!result?.success || !result.returnData || result.returnData === "0x") return;
+    try {
+      const decoded = iface.decodeFunctionResult(call.name, result.returnData)[0];
+      values[call.name] = decoded;
+    } catch {
+      // ignore
+    }
+  });
+
+  const notes = [];
+  const dangers = [];
+  let score = 0;
+
+  const asPct = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    if (n > 1000) return n / 100; // bps-like
+    return n;
+  };
+
+  for (const key of ["sellTax", "sellFee", "buyTax", "buyFee", "totalFees"]) {
+    if (values[key] === undefined) continue;
+    const pct = asPct(values[key]);
+    if (pct === null) continue;
+    notes.push(`${key}=${pct}%`);
+    if (pct >= 20) {
+      dangers.push(`High ${key}: ${pct}%`);
+      score += 40;
+    } else if (pct >= 10) {
+      score += 20;
+    } else if (pct >= 5) {
+      score += 10;
+    }
+  }
+
+  if (values.paused === true) {
+    dangers.push("Token paused() == true");
+    score += 50;
+  }
+  if (values.tradingOpen === false || values.tradingActive === false) {
+    dangers.push("Trading disabled according to contract view");
+    score += 45;
+  }
+
+  const maxTx = values.maxTxAmount ?? values.maxTransactionAmount;
+  const maxWallet = values.maxWallet ?? values.maxWalletAmount;
+  if (maxTx !== undefined && BigInt(maxTx) > 0n) {
+    notes.push(`maxTxAmount set (${maxTx.toString()})`);
+    score += 8;
+  }
+  if (maxWallet !== undefined && BigInt(maxWallet) > 0n) {
+    notes.push(`maxWallet set (${maxWallet.toString()})`);
+    score += 6;
+  }
+
+  return { score, notes, dangers, values };
+}
+
+async function analyzeRoundTripTax(provider, tokenAddress, quoteToken, fee, amountInQuote = 10n ** 15n) {
+  const { ethers } = require("ethers");
+  if (!quoteToken || !fee) {
+    return { score: 0, notes: [], dangers: [], lossPct: null };
+  }
+
+  const quoter = new ethers.Contract(
+    config.quoterAddress,
+    [
+      "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
+    ],
+    provider,
+  );
+
+  try {
+    const buy = await quoter.quoteExactInputSingle.staticCall({
+      tokenIn: quoteToken,
+      tokenOut: tokenAddress,
+      amountIn: amountInQuote,
+      fee,
+      sqrtPriceLimitX96: 0,
+    });
+    const bought = BigInt(buy.amountOut ?? buy[0]);
+    if (bought <= 0n) {
+      return { score: 25, notes: ["Round-trip buy quote returned 0"], dangers: [], lossPct: 100 };
+    }
+    const sell = await quoter.quoteExactInputSingle.staticCall({
+      tokenIn: tokenAddress,
+      tokenOut: quoteToken,
+      amountIn: bought,
+      fee,
+      sqrtPriceLimitX96: 0,
+    });
+    const sold = BigInt(sell.amountOut ?? sell[0]);
+    const lossPct = Number(amountInQuote - sold) * 100 / Number(amountInQuote);
+    const feePct = Number(fee) / 100; // 10000 = 1%
+    const expectedFloor = feePct * 2 + 1; // two swaps + tiny impact
+    const notes = [`Round-trip loss ~${lossPct.toFixed(2)}% (pool fee ${feePct}%×2)`];
+    const dangers = [];
+    let score = 0;
+    if (lossPct >= 40) {
+      dangers.push(`Extreme round-trip loss ${lossPct.toFixed(1)}% — likely sell tax/honeypot`);
+      score += 55;
+    } else if (lossPct >= expectedFloor + 12) {
+      dangers.push(`High round-trip loss ${lossPct.toFixed(1)}% beyond pool fees — likely tax`);
+      score += 35;
+    } else if (lossPct >= expectedFloor + 5) {
+      notes.push("Round-trip loss above fee floor — possible tax or thin depth");
+      score += 12;
+    }
+    return { score, notes, dangers, lossPct, bought, sold };
+  } catch (error) {
+    return {
+      score: 15,
+      notes: [`Round-trip tax check failed: ${classifyRestrictionError(error)}`],
+      dangers: [],
+      lossPct: null,
+    };
+  }
+}
+
+function analyzeV4HookRisk(primaryPair, allPairs = []) {
+  const notes = [];
+  const dangers = [];
+  let score = 0;
+  const list = (Array.isArray(allPairs) ? allPairs : []).filter(Boolean);
+  const v4Pairs = list.filter((pair) => !isV3Pair(pair));
+  const primaryIsV4 = primaryPair && !isV3Pair(primaryPair);
+
+  if (primaryIsV4) {
+    dangers.push("Primary pool is Uniswap v4 — custom hooks can tax/block/steal swaps");
+    score += 35;
+    const addr = String(primaryPair.pairAddress || "");
+    if (addr.length > 42) {
+      notes.push("v4 pool id (not a contract) — hooks address not readable from Dexscreener");
+    }
+    notes.push("Prefer trading the deepest v3 WETH pool when available");
+  } else if (v4Pairs.length) {
+    notes.push(`${v4Pairs.length} secondary v4 pool(s) — ignore for sizing; hooks risk on those pools`);
+    score += 6;
+  }
+
+  return { score, notes, dangers, primaryIsV4, v4Count: v4Pairs.length };
+}
+
+function classifyOwnerStatus({ ownerAddress = "", ownerReadable = false, hasOwnerSelector = false } = {}) {
+  const owner = normalizeAddress(ownerAddress);
+  if (ownerReadable && isDeadOrZeroAddress(owner)) {
+    return {
+      ownerActive: false,
+      ownerRenounced: true,
+      ownerAddress: owner || "0x0000000000000000000000000000000000000000",
+      score: 0,
+      notes: ["Owner renounced (owner = 0x0 / dead)"],
+      dangers: [],
+    };
+  }
+  if (ownerReadable && owner && !isDeadOrZeroAddress(owner)) {
+    return {
+      ownerActive: true,
+      ownerRenounced: false,
+      ownerAddress: owner,
+      score: 25,
+      notes: [],
+      dangers: [`Owner still active: ${owner}`],
+    };
+  }
+  if (!hasOwnerSelector) {
+    return {
+      ownerActive: false,
+      ownerRenounced: null,
+      ownerAddress: "",
+      score: 5,
+      notes: ["No Ownable owner() — non-ownable or custom admin"],
+      dangers: [],
+    };
+  }
+  return {
+    ownerActive: false,
+    ownerRenounced: null,
+    ownerAddress: "",
+    score: 8,
+    notes: ["Could not read owner()"],
+    dangers: [],
+  };
+}
+
+async function aggregate3(provider, calls) {
+  const { ethers } = require("ethers");
+  const multicall = new ethers.Contract(
+    config.multicall3Address,
+    [
+      "function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[])",
+    ],
+    provider,
+  );
+  return multicall.aggregate3.staticCall(
+    calls.map((call) => ({
+      target: call.target,
+      allowFailure: true,
+      callData: call.data,
+    })),
+  );
+}
+
+async function analyzeV2LpBurn(provider, tokenAddress) {
+  const { ethers } = require("ethers");
+  const token = normalizeAddress(tokenAddress);
+  const weth = normalizeAddress(config.lpWethAddress);
+  const factory = new ethers.Contract(
+    config.v2FactoryAddress,
+    ["function getPair(address,address) view returns (address)"],
+    provider,
+  );
+  const pairAddress = normalizeAddress(await factory.getPair(token, weth));
+  if (!pairAddress || pairAddress === ethers.ZeroAddress) {
+    return { hasV2: false, burnedPct: 0, notes: [], score: 0 };
+  }
+
+  const pair = new ethers.Contract(
+    pairAddress,
+    ["function totalSupply() view returns (uint256)", "function balanceOf(address) view returns (uint256)"],
+    provider,
+  );
+  const dead = "0x000000000000000000000000000000000000dead";
+  const [totalSupply, deadBal, oneBal] = await Promise.all([
+    pair.totalSupply(),
+    pair.balanceOf(dead),
+    pair.balanceOf("0x0000000000000000000000000000000000000001"),
+  ]);
+  const burned = BigInt(deadBal) + BigInt(oneBal);
+  const total = BigInt(totalSupply);
+  const burnedPct = total > 0n ? Number((burned * 10000n) / total) / 100 : 0;
+  if (burnedPct >= 90) {
+    return { hasV2: true, burnedPct, notes: [`V2 LP burned ~${burnedPct.toFixed(1)}% to dead`], score: -5 };
+  }
+  if (burnedPct >= 50) {
+    return { hasV2: true, burnedPct, notes: [`V2 LP partially burned (~${burnedPct.toFixed(1)}%)`], score: 5 };
+  }
+  return { hasV2: true, burnedPct, notes: [`V2 LP mostly unburned (~${burnedPct.toFixed(1)}% burned)`], score: 18 };
+}
+
+async function sumMatchingV3Positions(provider, holder, token0, token1, fee, maxNfts = 80) {
+  const { ethers } = require("ethers");
+  const npmAbi = [
+    "function balanceOf(address owner) view returns (uint256)",
+    "function tokenOfOwnerByIndex(address owner,uint256 index) view returns (uint256)",
+    "function getApproved(uint256 tokenId) view returns (address)",
+    "function isApprovedForAll(address owner,address operator) view returns (bool)",
+    "function positions(uint256 tokenId) view returns (uint96 nonce,address operator,address token0,address token1,uint24 fee,int24 tickLower,int24 tickUpper,uint128 liquidity,uint256 feeGrowthInside0LastX128,uint256 feeGrowthInside1LastX128,uint128 tokensOwed0,uint128 tokensOwed1)",
+  ];
+  const npm = new ethers.Contract(config.positionManagerAddress, npmAbi, provider);
+  const npmIface = npm.interface;
+  let balance = 0n;
+  try {
+    balance = BigInt(await npm.balanceOf(holder));
+  } catch {
+    return { liquidity: 0n, positions: [], approvals: [] };
+  }
+  if (balance <= 0n) return { liquidity: 0n, positions: [], approvals: [] };
+
+  const count = Math.min(Number(balance), maxNfts);
+  const idCalls = [];
+  for (let index = 0; index < count; index += 1) {
+    idCalls.push({
+      target: config.positionManagerAddress,
+      data: npmIface.encodeFunctionData("tokenOfOwnerByIndex", [holder, index]),
+    });
+  }
+  const idResults = await aggregate3(provider, idCalls);
+  const tokenIds = [];
+  for (const result of idResults) {
+    if (!result.success) continue;
+    try {
+      tokenIds.push(npmIface.decodeFunctionResult("tokenOfOwnerByIndex", result.returnData)[0]);
+    } catch {
+      // ignore
+    }
+  }
+
+  const posCalls = tokenIds.map((tokenId) => ({
+    target: config.positionManagerAddress,
+    data: npmIface.encodeFunctionData("positions", [tokenId]),
+  }));
+  const approvedCalls = tokenIds.map((tokenId) => ({
+    target: config.positionManagerAddress,
+    data: npmIface.encodeFunctionData("getApproved", [tokenId]),
+  }));
+  const [posResults, approvedResults] = await Promise.all([
+    posCalls.length ? aggregate3(provider, posCalls) : Promise.resolve([]),
+    approvedCalls.length ? aggregate3(provider, approvedCalls) : Promise.resolve([]),
+  ]);
+
+  let matched = 0n;
+  const positions = [];
+  const approvals = [];
+  const t0 = normalizeAddress(token0);
+  const t1 = normalizeAddress(token1);
+  for (let index = 0; index < posResults.length; index += 1) {
+    const result = posResults[index];
+    if (!result.success) continue;
+    try {
+      const decoded = npmIface.decodeFunctionResult("positions", result.returnData);
+      const posToken0 = normalizeAddress(decoded.token0 ?? decoded[2]);
+      const posToken1 = normalizeAddress(decoded.token1 ?? decoded[3]);
+      const posFee = Number(decoded.fee ?? decoded[4]);
+      const tickLower = Number(decoded.tickLower ?? decoded[5]);
+      const tickUpper = Number(decoded.tickUpper ?? decoded[6]);
+      const liquidity = BigInt(decoded.liquidity ?? decoded[7]);
+      const operator = normalizeAddress(decoded.operator ?? decoded[1]);
+      const samePair = (posToken0 === t0 && posToken1 === t1) || (posToken0 === t1 && posToken1 === t0);
+      if (!(samePair && Number(fee) === posFee) || liquidity <= 0n) continue;
+      matched += liquidity;
+      positions.push({
+        tokenId: tokenIds[index],
+        liquidity,
+        tickLower,
+        tickUpper,
+        width: tickUpper - tickLower,
+        operator,
+      });
+      const approvedResult = approvedResults[index];
+      if (approvedResult?.success) {
+        try {
+          const approved = normalizeAddress(
+            npmIface.decodeFunctionResult("getApproved", approvedResult.returnData)[0],
+          );
+          if (approved && !isDeadOrZeroAddress(approved)) {
+            approvals.push({ tokenId: tokenIds[index], approved });
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (operator && !isDeadOrZeroAddress(operator)) {
+        approvals.push({ tokenId: tokenIds[index], approved: operator, via: "operator" });
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return { liquidity: matched, positions, approvals };
+}
+
+async function analyzeV3LpBurnAndLock(provider, primaryPair, extraHolders = []) {
+  const { ethers } = require("ethers");
+  if (!primaryPair?.pairAddress || !isV3Pair(primaryPair)) {
+    return { burnedPct: 0, lockedPct: 0, notes: ["No v3 primary pool to check LP burn/lock"], score: 0, dangers: [] };
+  }
+
+  const pool = new ethers.Contract(
+    primaryPair.pairAddress,
+    [
+      "function token0() view returns (address)",
+      "function token1() view returns (address)",
+      "function fee() view returns (uint24)",
+      "function liquidity() view returns (uint128)",
+      "function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,uint8 feeProtocol,bool unlocked)",
+    ],
+    provider,
+  );
+
+  let token0;
+  let token1;
+  let fee;
+  let poolLiquidity;
+  let currentTick = 0;
+  try {
+    [token0, token1, fee, poolLiquidity] = await Promise.all([
+      pool.token0(),
+      pool.token1(),
+      pool.fee(),
+      pool.liquidity(),
+    ]);
+    try {
+      const slot0 = await pool.slot0();
+      currentTick = Number(slot0.tick ?? slot0[1]);
+    } catch {
+      currentTick = 0;
+    }
+  } catch (error) {
+    return { burnedPct: 0, lockedPct: 0, notes: [`Could not read v3 pool LP state: ${error.message}`], score: 10, dangers: [] };
+  }
+
+  poolLiquidity = BigInt(poolLiquidity);
+  if (poolLiquidity <= 0n) {
+    return { burnedPct: 0, lockedPct: 0, notes: ["Primary v3 pool has zero liquidity"], score: 40, dangers: [] };
+  }
+
+  const dead = "0x000000000000000000000000000000000000dead";
+  const nearDead = "0x0000000000000000000000000000000000000001";
+  const deadA = await sumMatchingV3Positions(provider, dead, token0, token1, fee);
+  const deadB = await sumMatchingV3Positions(provider, nearDead, token0, token1, fee);
+  const burnedLiq = deadA.liquidity + deadB.liquidity;
+  const burnedPositions = [...deadA.positions, ...deadB.positions];
+  const burnedApprovals = [...deadA.approvals, ...deadB.approvals];
+
+  let lockedLiq = 0n;
+  const lockedPositions = [];
+  for (const locker of config.lpLockerAddresses || []) {
+    const stats = await sumMatchingV3Positions(provider, locker, token0, token1, fee);
+    lockedLiq += stats.liquidity;
+    lockedPositions.push(...stats.positions);
+  }
+
+  let teamLiq = 0n;
+  const teamNotes = [];
+  for (const holder of extraHolders || []) {
+    if (!isEvmAddress(holder) || isDeadOrZeroAddress(holder)) continue;
+    const stats = await sumMatchingV3Positions(provider, holder, token0, token1, fee);
+    if (stats.liquidity <= 0n) continue;
+    teamLiq += stats.liquidity;
+    teamNotes.push(`Creator/team wallet holds V3 LP NFT liquidity (~${((Number(stats.liquidity) * 100) / Number(poolLiquidity)).toFixed(1)}% of active)`);
+    for (const approval of stats.approvals) {
+      burnedApprovals.push(approval);
+    }
+  }
+
+  const burnedPct = Number((burnedLiq * 10000n) / poolLiquidity) / 100;
+  const lockedPct = Number((lockedLiq * 10000n) / poolLiquidity) / 100;
+  const teamPct = Number((teamLiq * 10000n) / poolLiquidity) / 100;
+  const securedPct = burnedPct + lockedPct;
+  const notes = [...teamNotes];
+  const dangers = [];
+  let score = 0;
+
+  if (burnedPct >= 80) {
+    notes.push(`V3 LP burned ~${burnedPct.toFixed(1)}% (NFT to dead)`);
+    score -= 8;
+  } else if (burnedPct >= 20) {
+    notes.push(`V3 LP partially burned ~${burnedPct.toFixed(1)}%`);
+    score += 5;
+  } else {
+    notes.push(`V3 LP burned ~${burnedPct.toFixed(1)}%`);
+  }
+
+  if (!(config.lpLockerAddresses || []).length) {
+    notes.push("No LP locker addresses configured (set LP_LOCKER_ADDRESSES)");
+  } else if (lockedPct >= 80) {
+    notes.push(`V3 LP locked ~${lockedPct.toFixed(1)}% in known locker(s)`);
+    score -= 8;
+  } else if (lockedPct >= 20) {
+    notes.push(`V3 LP partially locked ~${lockedPct.toFixed(1)}%`);
+    score += 5;
+  } else {
+    notes.push(`V3 LP locked ~${lockedPct.toFixed(1)}% in known locker(s)`);
+  }
+
+  if (teamPct >= 20) {
+    dangers.push(`Creator/team still controls ~${teamPct.toFixed(1)}% of active V3 liquidity (can pull)`);
+    score += 35;
+  } else if (teamPct >= 5) {
+    notes.push(`Creator/team controls ~${teamPct.toFixed(1)}% of active V3 liquidity`);
+    score += 15;
+  }
+
+  if (securedPct < 20) {
+    notes.push("LP not meaningfully burned/locked — position owner can still pull liquidity");
+    score += 25;
+  } else if (securedPct < 50) {
+    notes.push("Only part of LP is burned/locked");
+    score += 12;
+  }
+
+  if (burnedApprovals.length) {
+    dangers.push(`V3 LP NFT still approved/operator set (${burnedApprovals[0].approved}) — burn may be bypassable`);
+    score += 40;
+  }
+
+  const ranged = [...burnedPositions, ...lockedPositions];
+  if (ranged.length) {
+    const narrow = ranged.filter((pos) => pos.width > 0 && pos.width < 10000);
+    const narrowLiq = narrow.reduce((sum, pos) => sum + pos.liquidity, 0n);
+    const totalTracked = ranged.reduce((sum, pos) => sum + pos.liquidity, 0n);
+    if (totalTracked > 0n && narrowLiq * 2n >= totalTracked) {
+      notes.push("Tracked LP positions use narrow tick ranges — depth can vanish if price leaves range");
+      score += 15;
+    }
+    const inRangeLiq = ranged
+      .filter((pos) => currentTick >= pos.tickLower && currentTick < pos.tickUpper)
+      .reduce((sum, pos) => sum + pos.liquidity, 0n);
+    if (totalTracked > 0n && inRangeLiq * 5n < totalTracked) {
+      notes.push("Most burned/locked LP is out of range — visible LP may overstate exit depth");
+      score += 12;
+    }
+  }
+
+  return {
+    burnedPct,
+    lockedPct,
+    teamPct,
+    securedPct,
+    notes,
+    dangers,
+    score,
+    poolAddress: normalizeAddress(primaryPair.pairAddress),
+  };
+}
+
+// keep old name used elsewhere
+async function sumMatchingV3Liquidity(provider, holder, token0, token1, fee, maxNfts = 80) {
+  const stats = await sumMatchingV3Positions(provider, holder, token0, token1, fee, maxNfts);
+  return stats.liquidity;
 }
 
 function scoreHoneypotFindings(findings) {
-  let score = Number(findings.marketScore || 0) + Number(findings.holderScore || 0) + Number(findings.contractScore || 0);
-  const dangers = [];
-  const notes = [...(findings.marketWarnings || []), ...(findings.holderWarnings || []), ...(findings.contractWarnings || [])];
+  let score =
+    Number(findings.marketScore || 0) +
+    Number(findings.holderScore || 0) +
+    Number(findings.contractScore || 0) +
+    Number(findings.ownerScore || 0) +
+    Number(findings.lpScore || 0) +
+    Number(findings.proxyScore || 0) +
+    Number(findings.taxScore || 0) +
+    Number(findings.v4Score || 0);
+  const dangers = [
+    ...(findings.ownerDangers || []),
+    ...(findings.proxyDangers || []),
+    ...(findings.taxDangers || []),
+    ...(findings.lpDangers || []),
+    ...(findings.v4Dangers || []),
+  ];
+  const notes = [
+    ...(findings.marketWarnings || []),
+    ...(findings.holderWarnings || []),
+    ...(findings.contractWarnings || []),
+    ...(findings.ownerNotes || []),
+    ...(findings.lpNotes || []),
+    ...(findings.proxyNotes || []),
+    ...(findings.taxNotes || []),
+    ...(findings.v4Notes || []),
+  ];
 
   if (!findings.hasCode) {
     dangers.push("No contract bytecode at this address");
@@ -663,9 +1356,20 @@ function scoreHoneypotFindings(findings) {
     notes.push(`V3 sell quote failed: ${findings.quoteError || "no route"}`);
     score += 20;
   }
-  if (findings.ownerActive) {
+  if (findings.routerSellOk === false) {
+    dangers.push(`Router sell simulation failed: ${findings.routerSellError || "restricted"}`);
+    score += 35;
+  } else if (findings.routerSellOk === true) {
+    notes.push("Router sell simulation passed");
+  }
+  if (findings.ownerActive && findings.ownerAddress) {
     dangers.push(`Owner still active: ${findings.ownerAddress}`);
-    score += 25;
+  }
+  if (findings.ownerRenounced === true && findings.proxyIsProxy) {
+    dangers.push("Owner renounced but contract is upgradeable proxy — admin can still rug");
+    score += 20;
+  } else if (findings.ownerRenounced === true) {
+    notes.unshift("Owner renounced");
   }
   if (findings.transferOk === true) {
     notes.push("Transfer simulation passed — NOT proof of safety (soft rugs often pass this)");
@@ -684,8 +1388,8 @@ function scoreHoneypotFindings(findings) {
 
   return {
     verdict,
-    score,
-    dangers,
+    score: Math.max(0, score),
+    dangers: [...new Set(dangers)],
     notes: [...new Set(notes)],
   };
 }
@@ -701,14 +1405,14 @@ function formatHoneypotReport(report) {
   for (const danger of report.dangers || []) {
     lines.push(`🚨 ${escapeHtml(danger)}`);
   }
-  for (const note of (report.notes || []).slice(0, 6)) {
+  for (const note of (report.notes || []).slice(0, 12)) {
     lines.push(`• ${escapeHtml(note)}`);
   }
 
   if (report.verdict === "DANGER") {
     lines.push("<b>Cảnh báo: token rủi ro cao / có dấu hiệu scam. Theo dõi vẫn bật — đừng mua.</b>");
   } else if (report.verdict === "CAUTION") {
-    lines.push("<b>Thận trọng: chưa đủ an toàn để ape. Kiểm tra LP/holder/chart trước khi mua.</b>");
+    lines.push("<b>Thận trọng: chưa đủ an toàn để ape. Kiểm tra LP burn/lock, holder và chart trước khi mua.</b>");
   }
 
   return lines.join("\n");
@@ -738,8 +1442,27 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
     transferError: "",
     quoteOk: null,
     quoteError: "",
+    routerSellOk: null,
+    routerSellError: "",
     ownerActive: false,
+    ownerRenounced: null,
     ownerAddress: "",
+    ownerScore: 0,
+    ownerNotes: [],
+    ownerDangers: [],
+    lpScore: 0,
+    lpNotes: [],
+    lpDangers: [],
+    proxyScore: 0,
+    proxyNotes: [],
+    proxyDangers: [],
+    proxyIsProxy: false,
+    taxScore: 0,
+    taxNotes: [],
+    taxDangers: [],
+    v4Score: 0,
+    v4Notes: [],
+    v4Dangers: [],
     marketScore: market.score,
     marketWarnings: market.warnings,
     holderScore: 0,
@@ -757,10 +1480,17 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
     findings.contractWarnings = bytecodeRisk.warnings;
 
     let totalSupplyRaw = "0";
+    let creatorAddress = "";
+    let addressInfo = null;
     try {
-      const tokenInfo = await fetchBlockscoutToken(token);
+      const [tokenInfo, addrInfo] = await Promise.all([
+        fetchBlockscoutToken(token),
+        fetchBlockscoutAddress(token).catch(() => null),
+      ]);
+      addressInfo = addrInfo;
       findings.reputation = String(tokenInfo?.reputation || "").toLowerCase();
       totalSupplyRaw = String(tokenInfo?.total_supply || "0");
+      creatorAddress = normalizeAddress(addrInfo?.creator_address_hash || "");
     } catch (error) {
       findings.marketWarnings.push(`Blockscout token info unavailable: ${error.message}`);
     }
@@ -772,24 +1502,80 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
         provider,
       );
       let owner = "";
+      let ownerReadable = false;
       try {
         owner = normalizeAddress(await tokenContract.owner());
+        ownerReadable = true;
       } catch {
         try {
           owner = normalizeAddress(await tokenContract.getOwner());
+          ownerReadable = true;
         } catch {
           owner = "";
         }
       }
-      if (owner && !isDeadOrZeroAddress(owner)) {
-        findings.ownerActive = true;
-        findings.ownerAddress = owner;
-      }
+      const ownerStatus = classifyOwnerStatus({
+        ownerAddress: owner,
+        ownerReadable,
+        hasOwnerSelector: bytecodeRisk.hasOwnerSelector,
+      });
+      findings.ownerActive = ownerStatus.ownerActive;
+      findings.ownerRenounced = ownerStatus.ownerRenounced;
+      findings.ownerAddress = ownerStatus.ownerAddress;
+      findings.ownerScore = ownerStatus.score;
+      findings.ownerNotes = ownerStatus.notes;
+      findings.ownerDangers = ownerStatus.dangers;
     } catch {
       // ignore
     }
 
+    try {
+      const proxyRisk = await analyzeProxyRisk(provider, token, addressInfo);
+      findings.proxyScore = proxyRisk.score;
+      findings.proxyNotes = proxyRisk.notes;
+      findings.proxyDangers = proxyRisk.dangers;
+      findings.proxyIsProxy = Boolean(proxyRisk.isProxy);
+    } catch (error) {
+      findings.proxyNotes.push(`Proxy check failed: ${error.message}`);
+    }
+
+    const v4Risk = analyzeV4HookRisk(market.primaryPair || choosePrimaryDexPair(pairs) || pair, pairs);
+    findings.v4Score = v4Risk.score;
+    findings.v4Notes = v4Risk.notes;
+    findings.v4Dangers = v4Risk.dangers;
+
+    try {
+      const viewRisk = await readTokenRiskViews(provider, token);
+      findings.taxScore += Number(viewRisk.score || 0);
+      findings.taxNotes.push(...(viewRisk.notes || []));
+      findings.taxDangers.push(...(viewRisk.dangers || []));
+    } catch (error) {
+      findings.taxNotes.push(`Tax/maxTx view check failed: ${error.message}`);
+    }
+
+    try {
+      const extraHolders = [creatorAddress, findings.ownerAddress].filter(Boolean);
+      const [v2Lp, v3Lp] = await Promise.all([
+        analyzeV2LpBurn(provider, token),
+        analyzeV3LpBurnAndLock(
+          provider,
+          market.primaryPair || choosePrimaryDexPair(pairs) || pair,
+          extraHolders,
+        ),
+      ]);
+      findings.lpScore = Number(v2Lp.score || 0) + Number(v3Lp.score || 0);
+      findings.lpNotes = [...(v2Lp.notes || []), ...(v3Lp.notes || [])];
+      findings.lpDangers = [...(v3Lp.dangers || [])];
+      findings.lpV2BurnedPct = v2Lp.burnedPct;
+      findings.lpV3BurnedPct = v3Lp.burnedPct;
+      findings.lpV3LockedPct = v3Lp.lockedPct;
+    } catch (error) {
+      findings.lpNotes.push(`LP burn/lock check failed: ${error.message}`);
+      findings.lpScore += 5;
+    }
+
     let probeAmount = 0n;
+    let probeAddress = "";
     let holders = [];
     try {
       holders = await fetchTokenHolders(token);
@@ -799,6 +1585,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
         token,
         quoteToken,
         config.swapRouterAddress,
+        config.positionManagerAddress,
       ];
       const concentration = analyzeHolderConcentration(holders, totalSupplyRaw, excluded);
       findings.holderScore = concentration.score;
@@ -807,6 +1594,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
       const probe = pickProbeHolder(holders, excluded);
       if (probe) {
         probeAmount = probe.raw / 1000n || 1n;
+        probeAddress = probe.address;
         const erc20 = new ethers.Contract(
           token,
           ["function transfer(address to,uint256 amount) returns (bool)"],
@@ -825,6 +1613,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
       findings.transferError = classifyRestrictionError(error);
     }
 
+    let usedFee = feeCandidates[0] || config.uniswapV3Fee;
     if (probeAmount > 0n && quoteToken) {
       let quoted = false;
       let lastQuoteError = "";
@@ -849,6 +1638,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
             lastQuoteError = "zero amount out";
             continue;
           }
+          usedFee = fee;
           quoted = true;
           break;
         } catch (error) {
@@ -858,6 +1648,61 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
       if (!quoted) {
         findings.quoteOk = false;
         findings.quoteError = lastQuoteError || "no route";
+      }
+    }
+
+    if (quoteToken && usedFee) {
+      try {
+        const tax = await analyzeRoundTripTax(provider, token, quoteToken, usedFee);
+        findings.taxScore += Number(tax.score || 0);
+        findings.taxNotes.push(...(tax.notes || []));
+        findings.taxDangers.push(...(tax.dangers || []));
+        findings.roundTripLossPct = tax.lossPct;
+      } catch (error) {
+        findings.taxNotes.push(`Round-trip tax check failed: ${error.message}`);
+      }
+    }
+
+    // Router sell path: only mark failure when revert is clearly restriction (not allowance).
+    if (probeAmount > 0n && probeAddress && quoteToken && findings.quoteOk) {
+      try {
+        const router = new ethers.Contract(
+          config.swapRouterAddress,
+          [
+            "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
+          ],
+          provider,
+        );
+        await router.exactInputSingle.staticCall(
+          {
+            tokenIn: token,
+            tokenOut: quoteToken,
+            fee: usedFee,
+            recipient: probeAddress,
+            deadline: 9999999999,
+            amountIn: probeAmount,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0,
+          },
+          { from: probeAddress },
+        );
+        findings.routerSellOk = true;
+      } catch (error) {
+        const classified = classifyRestrictionError(error);
+        const raw = String(error?.shortMessage || error?.message || "").toLowerCase();
+        if (
+          classified === "transfer restricted" ||
+          raw.includes("blacklist") ||
+          raw.includes("trading") ||
+          raw.includes("paused") ||
+          raw.includes("honeypot")
+        ) {
+          findings.routerSellOk = false;
+          findings.routerSellError = classified;
+        } else {
+          findings.routerSellOk = null;
+          findings.taxNotes.push("Router sell sim skipped (needs allowance / non-restriction revert)");
+        }
       }
     }
   } catch (error) {
@@ -3486,6 +4331,13 @@ module.exports = {
   portfolioKeyboard,
   portfolioPanelText,
   scoreHoneypotFindings,
+  classifyOwnerStatus,
+  analyzeV2LpBurn,
+  analyzeV3LpBurnAndLock,
+  analyzeProxyRisk,
+  analyzeRoundTripTax,
+  analyzeV4HookRisk,
+  readTokenRiskViews,
   shouldTradeImmediately,
   sniperTradeKeyboard,
   sortUniswapTokens,

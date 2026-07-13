@@ -478,6 +478,142 @@ test("holder concentration flags dominant wallet", () => {
   assert.ok(result.score >= 40);
 });
 
+test("owner status marks renounced vs active", () => {
+  const renounced = bot.classifyOwnerStatus({
+    ownerAddress: "0x0000000000000000000000000000000000000000",
+    ownerReadable: true,
+    hasOwnerSelector: true,
+  });
+  assert.equal(renounced.ownerRenounced, true);
+  assert.equal(renounced.ownerActive, false);
+  assert.ok(renounced.notes.some((item) => item.toLowerCase().includes("renounced")));
+
+  const active = bot.classifyOwnerStatus({
+    ownerAddress: "0x1111111111111111111111111111111111111111",
+    ownerReadable: true,
+    hasOwnerSelector: true,
+  });
+  assert.equal(active.ownerActive, true);
+  assert.equal(active.ownerRenounced, false);
+  assert.ok(active.score >= 25);
+  assert.ok(active.dangers.some((item) => item.includes("Owner still active")));
+});
+
+test("honeypot scorer includes LP not burned/locked as caution", () => {
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: true,
+    quoteOk: true,
+    marketScore: 0,
+    marketWarnings: [],
+    holderScore: 0,
+    holderWarnings: [],
+    contractScore: 0,
+    contractWarnings: [],
+    ownerRenounced: true,
+    ownerScore: 0,
+    ownerNotes: ["Owner renounced"],
+    lpScore: 25,
+    lpNotes: ["LP not meaningfully burned/locked — position owner can still pull liquidity"],
+  });
+
+  assert.equal(report.verdict, "CAUTION");
+  assert.ok(report.notes.some((item) => item.toLowerCase().includes("burn")));
+});
+
+test("honeypot scorer keeps healthy renounced token SAFE without LP risk", () => {
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: true,
+    quoteOk: true,
+    marketScore: 0,
+    marketWarnings: [],
+    holderScore: 0,
+    holderWarnings: [],
+    contractScore: 0,
+    contractWarnings: [],
+    ownerRenounced: true,
+    ownerScore: 0,
+    ownerNotes: ["Owner renounced"],
+    lpScore: -8,
+    lpNotes: ["V3 LP burned ~95.0% (NFT to dead)"],
+  });
+
+  assert.equal(report.verdict, "SAFE");
+  assert.ok(report.notes.some((item) => item.toLowerCase().includes("renounced")));
+});
+
+test("proxy + renounced owner is not SAFE", () => {
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: true,
+    quoteOk: true,
+    marketScore: 0,
+    marketWarnings: [],
+    holderScore: 0,
+    holderWarnings: [],
+    contractScore: 0,
+    contractWarnings: [],
+    ownerRenounced: true,
+    ownerScore: 0,
+    proxyIsProxy: true,
+    proxyScore: 30,
+    proxyDangers: ["Proxy admin still active: 0x1111111111111111111111111111111111111111"],
+    proxyNotes: ["Upgradeable proxy detected"],
+  });
+  assert.notEqual(report.verdict, "SAFE");
+  assert.ok(report.dangers.some((item) => item.toLowerCase().includes("proxy")));
+});
+
+test("round-trip tax score marks extreme loss as DANGER", () => {
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: true,
+    quoteOk: true,
+    marketScore: 0,
+    marketWarnings: [],
+    taxScore: 55,
+    taxDangers: ["Extreme round-trip loss 55.0% — likely sell tax/honeypot"],
+    taxNotes: ["Round-trip loss ~55.00% (pool fee 1%×2)"],
+  });
+  assert.equal(report.verdict, "DANGER");
+});
+
+test("v4 primary pool is flagged", () => {
+  const risk = bot.analyzeV4HookRisk(
+    {
+      pairAddress: "0xb721c41770ebba210c0cf074e6f0a091f844a453a2dd3a155af876825f91f4df",
+      labels: ["v4"],
+      liquidity: { usd: 1000 },
+    },
+    [],
+  );
+  assert.equal(risk.primaryIsV4, true);
+  assert.ok(risk.score >= 30);
+  assert.ok(risk.dangers.some((item) => item.toLowerCase().includes("v4")));
+});
+
+test("bytecode flags tax maxTx and access control selectors", () => {
+  // selectors concatenated as if present in bytecode
+  const code =
+    "0x" +
+    "4f7041a5" + // buyTax
+    "cc1776d3" + // sellTax
+    "8c0b5e22" + // maxTxAmount
+    "91d14854" + // hasRole
+    "5c60da1b"; // implementation
+  const risk = bot.analyzeContractBytecode(code);
+  assert.equal(risk.hasTaxSelector, true);
+  assert.equal(risk.hasMaxTxSelector, true);
+  assert.equal(risk.hasAccessControl, true);
+  assert.equal(risk.hasProxySelector, true);
+  assert.ok(risk.score >= 40);
+});
+
 test("probe holder skips pool dead and contracts", () => {
   const pair = "0xb541c2936982dd5c4090783d8f395d3e613c8016";
   const probe = bot.pickProbeHolder(
