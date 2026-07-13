@@ -1394,25 +1394,142 @@ function scoreHoneypotFindings(findings) {
   };
 }
 
-function formatHoneypotReport(report) {
-  if (!report) return "Security audit: unavailable";
+function localizeAuditLine(text) {
+  let line = String(text || "").trim();
+  if (!line) return "";
 
-  const icon = report.verdict === "SAFE" ? "✅" : report.verdict === "CAUTION" ? "⚠️" : "🚨";
-  const lines = [
-    `<b>Security audit</b>: ${icon} <b>${escapeHtml(report.verdict)}</b> (score ${report.score})`,
+  const replacements = [
+    [/^Primary pool:\s*v3\s*(.+)$/i, "Pool chính: Uniswap v3 · $1"],
+    [/^Primary pool:\s*v4\s*(.+)$/i, "Pool chính: Uniswap v4 · $1"],
+    [/^Also has (.+)$/i, "Còn $1"],
+    [/^Multiple thin pools — fragmented liquidity \/ chart bait risk$/i, "Nhiều pool mỏng — dễ bị chart bait"],
+    [/^Heavy Dexscreener boosts \((.+)\) — paid hype common on scams$/i, "Boost Dexscreener nặng ($1) — hay là hype trả tiền"],
+    [/^Volume >> liquidity \(wash \/ sniper churn risk\)$/i, "Volume >> thanh khoản — nghi wash/sniper"],
+    [/^Bytecode has trading enable\/disable selectors$/i, "Contract có thể bật/tắt trading"],
+    [/^Bytecode has blacklist-related selectors$/i, "Contract có blacklist"],
+    [/^Bytecode has pause\/unpause selectors$/i, "Contract có pause"],
+    [/^Bytecode has mint selector — supply can inflate$/i, "Contract có mint — supply có thể tăng"],
+    [/^Bytecode has tax\/fee selectors$/i, "Contract có tax/fee"],
+    [/^Bytecode has maxTx\/maxWallet selectors$/i, "Contract có maxTx/maxWallet"],
+    [/^Bytecode has AccessControl\/operator roles — renounce may be incomplete$/i, "Còn role/operator — renounce có thể giả"],
+    [/^Bytecode has proxy\/admin selectors$/i, "Contract có dấu hiệu proxy/admin"],
+    [/^Ownable-style owner selector present$/i, "Còn selector owner (Ownable)"],
+    [/^Owner renounced \(owner = 0x0 \/ dead\)$/i, "Owner đã renounce (0x0/dead)"],
+    [/^Owner renounced$/i, "Owner đã renounce"],
+    [/^Owner still active:\s*(.+)$/i, "Owner còn active: $1"],
+    [/^No Ownable owner\(\) — non-ownable or custom admin$/i, "Không có owner() chuẩn — có thể admin riêng"],
+    [/^Could not read owner\(\)$/i, "Không đọc được owner()"],
+    [/^V2 LP burned ~(.+)% to dead$/i, "LP V2 đã burn ~$1%"],
+    [/^V2 LP partially burned \(~(.+)%\)$/i, "LP V2 burn một phần (~$1%)"],
+    [/^V2 LP mostly unburned \(~(.+)% burned\)$/i, "LP V2 gần như chưa burn (~$1% đã burn)"],
+    [/^V3 LP burned ~(.+)% \(NFT to dead\)$/i, "LP V3 burn ~$1% (NFT → dead)"],
+    [/^V3 LP partially burned ~(.+)%$/i, "LP V3 burn một phần ~$1%"],
+    [/^V3 LP burned ~(.+)%$/i, "LP V3 burn ~$1%"],
+    [/^V3 LP locked ~(.+)% in known locker\(s\)$/i, "LP V3 lock ~$1% ở locker"],
+    [/^V3 LP partially locked ~(.+)%$/i, "LP V3 lock một phần ~$1%"],
+    [/^No LP locker addresses configured \(set LP_LOCKER_ADDRESSES\)$/i, "Chưa cấu hình địa chỉ locker LP"],
+    [/^LP not meaningfully burned\/locked — position owner can still pull liquidity$/i, "LP gần như chưa burn/lock — vẫn rút được"],
+    [/^Only part of LP is burned\/locked$/i, "LP mới burn/lock một phần"],
+    [/^Could not read v3 pool LP state:\s*(.+)$/i, "Không đọc được LP V3: $1"],
+    [/^No v3 primary pool to check LP burn\/lock$/i, "Không có pool V3 chính để check burn/lock"],
+    [/^Primary v3 pool has zero liquidity$/i, "Pool V3 chính hết thanh khoản"],
+    [/^Creator\/team still controls ~(.+)% of active V3 liquidity \(can pull\)$/i, "Team còn giữ ~$1% LP V3 (rút được)"],
+    [/^Creator\/team controls ~(.+)% of active V3 liquidity$/i, "Team còn giữ ~$1% LP V3"],
+    [/^Creator\/team wallet holds V3 LP NFT liquidity \((.+)\)$/i, "Ví creator/team còn LP NFT ($1)"],
+    [/^V3 LP NFT still approved\/operator set \((.+)\) — burn may be bypassable$/i, "NFT LP vẫn còn approve/operator ($1) — burn có thể giả"],
+    [/^Tracked LP positions use narrow tick ranges — depth can vanish if price leaves range$/i, "LP range hẹp — giá lệch range là hết depth"],
+    [/^Most burned\/locked LP is out of range — visible LP may overstate exit depth$/i, "LP burn/lock đa số out-of-range — depth ảo"],
+    [/^Round-trip tax check failed:\s*(.+)$/i, "Check thuế round-trip lỗi: $1"],
+    [/^Round-trip loss ~(.+)% \(pool fee (.+)\)$/i, "Lỗ round-trip ~$1% (phí pool $2)"],
+    [/^Round-trip loss above fee floor — possible tax or thin depth$/i, "Lỗ round-trip cao hơn phí — nghi có tax hoặc pool mỏng"],
+    [/^Extreme round-trip loss (.+)% — likely sell tax\/honeypot$/i, "Lỗ round-trip cực cao $1% — nghi tax/honeypot"],
+    [/^High round-trip loss (.+)% beyond pool fees — likely tax$/i, "Lỗ round-trip cao $1% — nghi có tax"],
+    [/^Round-trip buy quote returned 0$/i, "Quote mua round-trip ra 0"],
+    [/^\d+ secondary v4 pool\(s\) — ignore for sizing; hooks risk on those pools$/i, "Có pool V4 phụ — bỏ qua khi tính size; rủi ro hooks"],
+    [/^Primary pool is Uniswap v4 — custom hooks can tax\/block\/steal swaps$/i, "Pool chính là V4 — hooks có thể tax/chặn/rug swap"],
+    [/^Prefer trading the deepest v3 WETH pool when available$/i, "Nên trade pool V3/WETH sâu nhất nếu có"],
+    [/^v4 pool id \(not a contract\) — hooks address not readable from Dexscreener$/i, "Pool V4 (pool id) — không đọc được hooks từ Dexscreener"],
+    [/^Upgradeable proxy detected(.*)$/i, "Phát hiện proxy nâng cấp được$1"],
+    [/^Proxy admin still active:\s*(.+)$/i, "Proxy admin còn active: $1"],
+    [/^Owner renounced but contract is upgradeable proxy — admin can still rug$/i, "Đã renounce nhưng còn proxy — admin vẫn rug được"],
+    [/^Sell\/transfer simulation failed:\s*(.+)$/i, "Sim transfer/sell fail: $1"],
+    [/^Router sell simulation failed:\s*(.+)$/i, "Sim bán qua router fail: $1"],
+    [/^Router sell simulation passed$/i, "Sim bán qua router OK"],
+    [/^Router sell sim skipped \(needs allowance \/ non-restriction revert\)$/i, "Bỏ qua sim router (thiếu allowance)"],
+    [/^V3 sell quote failed:\s*(.+)$/i, "Quote bán V3 fail: $1"],
+    [/^Transfer simulation passed — NOT proof of safety \(soft rugs often pass this\)$/i, "Transfer OK — chưa chứng minh an toàn"],
+    [/^V3 sell quote passed — market\/rug risk can still exist$/i, "Quote bán OK — vẫn có thể rug mềm"],
+    [/^No withdrawable liquidity on Dexscreener$/i, "Không có thanh khoản trên Dexscreener"],
+    [/^Dangerously thin liquidity \((.+)\)$/i, "Thanh khoản cực mỏng ($1)"],
+    [/^Very thin liquidity \((.+)\) — hard to exit$/i, "Thanh khoản rất mỏng ($1) — khó thoát"],
+    [/^Low liquidity \((.+)\)$/i, "Thanh khoản thấp ($1)"],
+    [/^LP\/FDV only (.+)% — classic soft-rug profile$/i, "LP/FDV chỉ $1% — profile soft-rug"],
+    [/^Thin LP vs FDV \((.+)%\)$/i, "LP mỏng so với FDV ($1%)"],
+    [/^LP covers just (.+)% of FDV$/i, "LP chỉ cover $1% FDV"],
+    [/^24h buys with zero sells \(classic honeypot pattern\)$/i, "24h chỉ mua không bán — pattern honeypot"],
+    [/^Extreme buy\/sell skew \((.+) in 24h\)$/i, "Lệch mua/bán mạnh ($1 trong 24h)"],
+    [/^Brand-new pair \((.+)h old\)$/i, "Pair mới tạo ($1h)"],
+    [/^Very new pair \((.+)h old\)$/i, "Pair rất mới ($1h)"],
+    [/^No project website on Dexscreener$/i, "Chưa có website trên Dexscreener"],
+    [/^Top wallet holds (.+)% supply — dump risk$/i, "Ví top giữ $1% supply — rủi ro dump"],
+    [/^Top wallet holds (.+)% supply$/i, "Ví top giữ $1% supply"],
+    [/^Top 10 wallets hold (.+)% supply$/i, "Top 10 ví giữ $1% supply"],
+    [/^No contract bytecode at this address$/i, "Không có bytecode tại địa chỉ này"],
+    [/^Blockscout reputation:\s*(.+)$/i, "Reputation Blockscout: $1"],
+    [/^No EOA holder found to simulate transfer$/i, "Không tìm thấy ví EOA để sim transfer"],
+    [/^Trading disabled according to contract view$/i, "Trading đang tắt theo view contract"],
+    [/^Token paused\(\) == true$/i, "Token đang paused"],
   ];
 
-  for (const danger of report.dangers || []) {
+  for (const [pattern, replacement] of replacements) {
+    if (pattern.test(line)) {
+      line = line.replace(pattern, replacement);
+      break;
+    }
+  }
+
+  // Trim noisy technical revert tails for Telegram readability.
+  line = line.replace(/\s*\(action="?call"?[^)]*\)\s*$/i, "");
+  line = line.replace(/\s*\(could not decode.*?\)\s*$/i, "");
+  if (line.length > 140) line = `${line.slice(0, 137)}...`;
+  return line;
+}
+
+function formatHoneypotReport(report) {
+  if (!report) return "Kiểm tra bảo mật: không có dữ liệu";
+
+  const verdictVi =
+    report.verdict === "SAFE" ? "AN TOÀN" : report.verdict === "CAUTION" ? "CẨN TRỌNG" : "NGUY HIỂM";
+  const icon = report.verdict === "SAFE" ? "✅" : report.verdict === "CAUTION" ? "⚠️" : "🚨";
+
+  const skipNote = (line) => {
+    const lower = String(line || "").toLowerCase();
+    if (lower.includes("ownable-style") && report.ownerRenounced) return true;
+    if (lower.includes("transfer simulation passed")) return true;
+    if (lower.includes("v3 sell quote passed")) return true;
+    if (lower.includes("router sell simulation passed")) return true;
+    if (lower.includes("no lp locker addresses configured")) return true;
+    return false;
+  };
+
+  const dangers = [...new Set((report.dangers || []).map(localizeAuditLine).filter(Boolean))];
+  const notes = [...new Set((report.notes || []).filter((n) => !skipNote(n)).map(localizeAuditLine).filter(Boolean))]
+    .filter((note) => !dangers.includes(note))
+    .slice(0, 5);
+
+  const lines = [`<b>Bảo mật</b>: ${icon} <b>${verdictVi}</b> (${report.score})`];
+
+  for (const danger of dangers.slice(0, 4)) {
     lines.push(`🚨 ${escapeHtml(danger)}`);
   }
-  for (const note of (report.notes || []).slice(0, 12)) {
+  for (const note of notes) {
     lines.push(`• ${escapeHtml(note)}`);
   }
 
   if (report.verdict === "DANGER") {
-    lines.push("<b>Cảnh báo: token rủi ro cao / có dấu hiệu scam. Theo dõi vẫn bật — đừng mua.</b>");
+    lines.push("<b>Đừng mua — token rủi ro cao / nghi scam. Theo dõi vẫn bật.</b>");
   } else if (report.verdict === "CAUTION") {
-    lines.push("<b>Thận trọng: chưa đủ an toàn để ape. Kiểm tra LP burn/lock, holder và chart trước khi mua.</b>");
+    lines.push("<b>Chưa nên ape — kiểm tra LP burn/lock, holder và chart trước.</b>");
   }
 
   return lines.join("\n");

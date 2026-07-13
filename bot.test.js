@@ -614,6 +614,39 @@ test("bytecode flags tax maxTx and access control selectors", () => {
   assert.ok(risk.score >= 40);
 });
 
+test("honeypot report is compact Vietnamese", () => {
+  const text = bot.formatHoneypotReport({
+    verdict: "DANGER",
+    score: 108,
+    dangers: [],
+    notes: [
+      "Primary pool: v3 $19.77K liq · LP/FDV 24.2%",
+      "Multiple thin pools — fragmented liquidity / chart bait risk",
+      "Heavy Dexscreener boosts (100) — paid hype common on scams",
+      "Volume >> liquidity (wash / sniper churn risk)",
+      "Bytecode has trading enable/disable selectors",
+      "Owner renounced",
+      "Ownable-style owner selector present",
+      "V2 LP burned ~100.0% to dead",
+      "Could not read v3 pool LP state: execution reverted (no data present; ...)",
+      "No LP locker addresses configured (set LP_LOCKER_ADDRESSES)",
+      "Round-trip tax check failed: unexpected error",
+      "1 secondary v4 pool(s) — ignore for sizing; hooks risk on those pools",
+      "Transfer simulation passed — NOT proof of safety (soft rugs often pass this)",
+      "V3 sell quote passed — market/rug risk can still exist",
+    ],
+    ownerRenounced: true,
+  });
+
+  assert.match(text, /Bảo mật/);
+  assert.match(text, /NGUY HIỂM/);
+  assert.match(text, /Đừng mua/);
+  assert.equal(text.includes("Security audit"), false);
+  assert.equal(text.includes("Ownable-style"), false);
+  assert.equal(text.includes("NOT proof of safety"), false);
+  assert.ok(text.split("\n").length <= 10);
+});
+
 test("probe holder skips pool dead and contracts", () => {
   const pair = "0xb541c2936982dd5c4090783d8f395d3e613c8016";
   const probe = bot.pickProbeHolder(
