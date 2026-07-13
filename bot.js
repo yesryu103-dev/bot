@@ -60,6 +60,19 @@ const config = {
   minPortfolioLiquidityUsd: Number(process.env.MIN_PORTFOLIO_LIQUIDITY_USD || 50),
   minPortfolioValueUsd: Number(process.env.MIN_PORTFOLIO_VALUE_USD || 3),
   portfolioMaxTokens: Number(process.env.PORTFOLIO_MAX_TOKENS || 25),
+  // Uniswap v3 concentrated LP preset from the provided Uniswap UI link.
+  lpTokenAddress: normalizeAddress(process.env.LP_TOKEN_ADDRESS || "0xd7321801caae694090694ff55a9323139f043b88"),
+  lpWethAddress: normalizeAddress(process.env.QUOTE_TOKEN_ADDRESS || "0x0bd7d308f8e1639fab988df18a8011f41eacad73"),
+  lpFee: Number(process.env.LP_FEE || 10000),
+  lpTickSpacing: Number(process.env.LP_TICK_SPACING || 200),
+  lpTickLower: Number(process.env.LP_TICK_LOWER || 111400),
+  lpTickUpper: Number(process.env.LP_TICK_UPPER || 125200),
+  lpEthAmounts: parseAmountOptions(process.env.LP_ETH_AMOUNTS || "0.01,0.05,0.1"),
+  positionManagerAddress: process.env.POSITION_MANAGER_ADDRESS || "0x73991a25c818bf1f1128deaab1492d45638de0d3",
+  v3FactoryAddress: process.env.V3_FACTORY_ADDRESS || "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
+  uniswapLpUrl:
+    process.env.UNISWAP_LP_URL ||
+    "https://app.uniswap.org/positions/create/v3?currencyA=0xd7321801caae694090694ff55a9323139f043b88&currencyB=NATIVE&chain=robinhood",
 };
 
 function truthy(value) {
@@ -1147,10 +1160,10 @@ function mainMenuKeyboard() {
     inline_keyboard: [
       [{ text: "Buy & Sell", callback_data: "panel:trade" }],
       [
+        { text: "Add LP", callback_data: "panel:lp" },
         { text: "Portfolio", callback_data: "panel:portfolio" },
-        { text: "Update Price", callback_data: "portfolio:refresh" },
       ],
-      [{ text: "Copy Trades", callback_data: "soon:Copy Trades" }],
+      [{ text: "Update Price", callback_data: "portfolio:refresh" }],
       [
         { text: "Profile", callback_data: "panel:profile" },
         { text: "Wallets", callback_data: "panel:wallets" },
@@ -1497,6 +1510,12 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     console.warn(`Honeypot check failed for ${tokenAddress}: ${error.message}`);
   }
 
+  try {
+    await prepareLpFromToken(tokenAddress, state);
+  } catch (error) {
+    console.warn(`LP pool prepare failed for ${tokenAddress}: ${error.message}`);
+  }
+
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
@@ -1508,11 +1527,13 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       "",
       formatHoneypotReport(honeypotReport),
       "",
-      "Muốn xem cả ví? Gửi <code>/portfolio</code> hoặc paste địa chỉ ví.",
+      state.lp?.poolAddress
+        ? `LP pool sẵn sàng (fee ${state.lp.fee / 10000}%). Bấm <b>Add LP</b> để chọn range.`
+        : "Chưa có Uniswap v3 pool TOKEN/WETH để Add LP.",
     ].join("\n"),
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-    reply_markup: mainMenuKeyboard(),
+    reply_markup: afterTrackKeyboard(),
   });
 }
 
@@ -1673,6 +1694,763 @@ function tradeMessage(trade) {
 function numberToDecimalString(value, maxDecimals = 18) {
   if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid decimal value: ${value}`);
   return value.toFixed(maxDecimals).replace(/\.?0+$/, "") || "0";
+}
+
+const Q96 = 2n ** 96n;
+
+function mulDiv(a, b, denominator) {
+  return (BigInt(a) * BigInt(b)) / BigInt(denominator);
+}
+
+function sortUniswapTokens(tokenA, tokenB) {
+  const a = normalizeAddress(tokenA);
+  const b = normalizeAddress(tokenB);
+  return BigInt(a) < BigInt(b) ? [a, b] : [b, a];
+}
+
+function alignTick(tick, tickSpacing) {
+  const spacing = Number(tickSpacing);
+  let compressed = Math.trunc(tick / spacing);
+  if (tick < 0 && tick % spacing !== 0) compressed -= 1;
+  return compressed * spacing;
+}
+
+/** Uniswap v3 TickMath.getSqrtRatioAtTick (JS port). */
+function getSqrtRatioAtTick(tick) {
+  if (!Number.isInteger(tick) || tick < -887272 || tick > 887272) {
+    throw new Error(`Tick out of bounds: ${tick}`);
+  }
+
+  const absTick = tick < 0 ? -tick : tick;
+  let ratio = (absTick & 0x1) !== 0 ? 0xfffcb933bd6fad37aa2d162d1a594001n : 0x100000000000000000000000000000000n;
+  if ((absTick & 0x2) !== 0) ratio = (ratio * 0xfff97272373d413259a46990580e213an) >> 128n;
+  if ((absTick & 0x4) !== 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdccn) >> 128n;
+  if ((absTick & 0x8) !== 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0n) >> 128n;
+  if ((absTick & 0x10) !== 0) ratio = (ratio * 0xffcb9843d60f6159c9db58835c926644n) >> 128n;
+  if ((absTick & 0x20) !== 0) ratio = (ratio * 0xff973b41fa98c081472e6896dfb254c0n) >> 128n;
+  if ((absTick & 0x40) !== 0) ratio = (ratio * 0xff2ea16466c96a3843ec78b326b52861n) >> 128n;
+  if ((absTick & 0x80) !== 0) ratio = (ratio * 0xfe5dee046a99a2a911cd461f6a2f1f8bn) >> 128n;
+  if ((absTick & 0x100) !== 0) ratio = (ratio * 0xfcbe86c7900a88aedcffc83b479aa3a4n) >> 128n;
+  if ((absTick & 0x200) !== 0) ratio = (ratio * 0xf987a7253ac413176f2b074cf7815e54n) >> 128n;
+  if ((absTick & 0x400) !== 0) ratio = (ratio * 0xf3392b0822b70005940c7a398e4b70f3n) >> 128n;
+  if ((absTick & 0x800) !== 0) ratio = (ratio * 0xe7159475a2c29b7440d0c1917764be19n) >> 128n;
+  if ((absTick & 0x1000) !== 0) ratio = (ratio * 0xd097f3bdfd2022b8845ad8f792aa5825n) >> 128n;
+  if ((absTick & 0x2000) !== 0) ratio = (ratio * 0xa9f746462d870fdf8a65dc1f90e061e5n) >> 128n;
+  if ((absTick & 0x4000) !== 0) ratio = (ratio * 0x70d869a156d2a4b9e3039c5db1a5d043n) >> 128n;
+  if ((absTick & 0x8000) !== 0) ratio = (ratio * 0x31be135f97d08fd981231505542fcfa6n) >> 128n;
+  if ((absTick & 0x10000) !== 0) ratio = (ratio * 0x9aa508b5b7a84e1c677de54f3e99bc9n) >> 128n;
+  if ((absTick & 0x20000) !== 0) ratio = (ratio * 0x5d6af8dedb81196699c329225ee604n) >> 128n;
+  if ((absTick & 0x40000) !== 0) ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98n) >> 128n;
+  if ((absTick & 0x80000) !== 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2n) >> 128n;
+
+  if (tick > 0) ratio = (2n ** 256n - 1n) / ratio;
+  return (ratio >> 32n) + (ratio % (1n << 32n) === 0n ? 0n : 1n);
+}
+
+function getLiquidityForAmount0(sqrtRatioAX96, sqrtRatioBX96, amount0) {
+  let sqrtA = BigInt(sqrtRatioAX96);
+  let sqrtB = BigInt(sqrtRatioBX96);
+  if (sqrtA > sqrtB) [sqrtA, sqrtB] = [sqrtB, sqrtA];
+  const intermediate = mulDiv(sqrtA, sqrtB, Q96);
+  return mulDiv(amount0, intermediate, sqrtB - sqrtA);
+}
+
+function getLiquidityForAmount1(sqrtRatioAX96, sqrtRatioBX96, amount1) {
+  let sqrtA = BigInt(sqrtRatioAX96);
+  let sqrtB = BigInt(sqrtRatioBX96);
+  if (sqrtA > sqrtB) [sqrtA, sqrtB] = [sqrtB, sqrtA];
+  return mulDiv(amount1, Q96, sqrtB - sqrtA);
+}
+
+function getAmount0ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity) {
+  let sqrtA = BigInt(sqrtRatioAX96);
+  let sqrtB = BigInt(sqrtRatioBX96);
+  if (sqrtA > sqrtB) [sqrtA, sqrtB] = [sqrtB, sqrtA];
+  return ((liquidity << 96n) * (sqrtB - sqrtA)) / sqrtB / sqrtA;
+}
+
+function getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity) {
+  let sqrtA = BigInt(sqrtRatioAX96);
+  let sqrtB = BigInt(sqrtRatioBX96);
+  if (sqrtA > sqrtB) [sqrtA, sqrtB] = [sqrtB, sqrtA];
+  return mulDiv(liquidity, sqrtB - sqrtA, Q96);
+}
+
+function amountsForExactEth({ sqrtPriceX96, tickLower, tickUpper, ethAmount, wethIsToken0 }) {
+  const sqrtLower = getSqrtRatioAtTick(tickLower);
+  const sqrtUpper = getSqrtRatioAtTick(tickUpper);
+  const sqrtCurrent = BigInt(sqrtPriceX96);
+  const eth = BigInt(ethAmount);
+
+  if (wethIsToken0) {
+    if (sqrtCurrent <= sqrtLower) {
+      const liquidity = getLiquidityForAmount0(sqrtLower, sqrtUpper, eth);
+      return {
+        amount0: getAmount0ForLiquidity(sqrtLower, sqrtUpper, liquidity),
+        amount1: 0n,
+        ethRaw: eth,
+        tokenRaw: 0n,
+        liquidity,
+        positionSide: "below-range",
+      };
+    }
+    if (sqrtCurrent >= sqrtUpper) {
+      return {
+        amount0: 0n,
+        amount1: 0n,
+        ethRaw: 0n,
+        tokenRaw: 0n,
+        liquidity: 0n,
+        positionSide: "above-range",
+        error: "Giá đang trên range LP. Chọn range rộng hơn hoặc đợi giá quay lại.",
+      };
+    }
+    const liquidity = getLiquidityForAmount0(sqrtCurrent, sqrtUpper, eth);
+    const amount1 = getAmount1ForLiquidity(sqrtLower, sqrtCurrent, liquidity);
+    return {
+      amount0: getAmount0ForLiquidity(sqrtCurrent, sqrtUpper, liquidity),
+      amount1,
+      ethRaw: eth,
+      tokenRaw: amount1,
+      liquidity,
+      positionSide: "in-range",
+    };
+  }
+
+  // ETH is token1
+  if (sqrtCurrent >= sqrtUpper) {
+    const liquidity = getLiquidityForAmount1(sqrtLower, sqrtUpper, eth);
+    return {
+      amount0: 0n,
+      amount1: getAmount1ForLiquidity(sqrtLower, sqrtUpper, liquidity),
+      ethRaw: eth,
+      tokenRaw: 0n,
+      liquidity,
+      positionSide: "above-range",
+    };
+  }
+  if (sqrtCurrent <= sqrtLower) {
+    return {
+      amount0: 0n,
+      amount1: 0n,
+      ethRaw: 0n,
+      tokenRaw: 0n,
+      liquidity: 0n,
+      positionSide: "below-range",
+      error: "Giá đang dưới range LP. Chọn range rộng hơn hoặc đợi giá quay lại.",
+    };
+  }
+  const liquidity = getLiquidityForAmount1(sqrtLower, sqrtCurrent, eth);
+  const amount0 = getAmount0ForLiquidity(sqrtCurrent, sqrtUpper, liquidity);
+  return {
+    amount0,
+    amount1: getAmount1ForLiquidity(sqrtLower, sqrtCurrent, liquidity),
+    ethRaw: eth,
+    tokenRaw: amount0,
+    liquidity,
+    positionSide: "in-range",
+  };
+}
+
+function feeToTickSpacing(fee) {
+  const map = { 100: 1, 500: 10, 3000: 60, 10000: 200 };
+  return map[Number(fee)] || Number(config.lpTickSpacing) || 60;
+}
+
+function ticksAroundPrice(currentTick, percent, tickSpacing) {
+  if (String(percent) === "full") {
+    return {
+      tickLower: alignTick(-887220, tickSpacing),
+      tickUpper: alignTick(887220, tickSpacing),
+      rangeLabel: "Full range",
+    };
+  }
+
+  const pct = Number(percent);
+  if (!Number.isFinite(pct) || pct <= 0) throw new Error("Invalid range percent.");
+  const delta = Math.max(tickSpacing, Math.round(Math.log(1 + pct / 100) / Math.log(1.0001)));
+  let tickLower = alignTick(currentTick - delta, tickSpacing);
+  let tickUpper = alignTick(currentTick + delta, tickSpacing);
+  if (tickLower >= tickUpper) {
+    tickLower = alignTick(currentTick - tickSpacing, tickSpacing);
+    tickUpper = alignTick(currentTick + tickSpacing * 2, tickSpacing);
+  }
+  return { tickLower, tickUpper, rangeLabel: `±${pct}%` };
+}
+
+function lpPreset(state = {}) {
+  const saved = state.lp || {};
+  const tokenAddress = normalizeAddress(saved.tokenAddress || "");
+  const fee = Number(saved.fee || config.lpFee || 10000);
+  const tickSpacing = Number(saved.tickSpacing || feeToTickSpacing(fee));
+  const hasRange = saved.tickLower != null && saved.tickUpper != null;
+  const tickLower = hasRange ? alignTick(Number(saved.tickLower), tickSpacing) : null;
+  const tickUpper = hasRange ? alignTick(Number(saved.tickUpper), tickSpacing) : null;
+  const [token0, token1] = tokenAddress
+    ? sortUniswapTokens(config.lpWethAddress, tokenAddress)
+    : ["", ""];
+  return {
+    token0,
+    token1,
+    fee,
+    tickSpacing,
+    tickLower,
+    tickUpper,
+    rangeLabel: saved.rangeLabel || "",
+    wethIsToken0: token0 === normalizeAddress(config.lpWethAddress),
+    tokenAddress,
+    poolAddress: normalizeAddress(saved.poolAddress || ""),
+    symbol: saved.symbol || "TOKEN",
+    decimals: Number(saved.decimals || 18),
+  };
+}
+
+function lpRangeKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "±5%", callback_data: "lp:range:5" },
+        { text: "±15%", callback_data: "lp:range:15" },
+        { text: "±50%", callback_data: "lp:range:50" },
+      ],
+      [{ text: "Full range", callback_data: "lp:range:full" }],
+      [
+        { text: "Refresh", callback_data: "panel:lp" },
+        { text: "Main Menu", callback_data: "menu" },
+      ],
+    ],
+  };
+}
+
+function lpAmountKeyboard() {
+  const amountButtons = config.lpEthAmounts.map((amount) => ({
+    text: `${amount} ETH`,
+    callback_data: `lp:preview:${amount}`,
+  }));
+  return {
+    inline_keyboard: [
+      ...chunkButtons(amountButtons, 3),
+      [
+        { text: "Đổi range", callback_data: "lp:ranges" },
+        { text: "Main Menu", callback_data: "menu" },
+      ],
+    ],
+  };
+}
+
+function lpConfirmKeyboard(ethAmount) {
+  return {
+    inline_keyboard: [
+      [{ text: `Confirm add ${ethAmount} ETH LP`, callback_data: `lp:confirm:${ethAmount}` }],
+      [
+        { text: "Back", callback_data: "lp:amounts" },
+        { text: "Main Menu", callback_data: "menu" },
+      ],
+    ],
+  };
+}
+
+function afterTrackKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "➕ Add LP", callback_data: "lp:ranges" }],
+      [
+        { text: "Buy & Sell", callback_data: "panel:trade" },
+        { text: "Portfolio", callback_data: "panel:portfolio" },
+      ],
+      [{ text: "Main Menu", callback_data: "menu" }],
+    ],
+  };
+}
+
+async function discoverV3WethPool(tokenAddress) {
+  const { ethers } = require("ethers");
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com");
+  const token = normalizeAddress(tokenAddress);
+  const weth = normalizeAddress(config.lpWethAddress);
+  if (token === weth) throw new Error("Không add LP cho WETH với chính nó.");
+
+  const [token0, token1] = sortUniswapTokens(token, weth);
+  const factory = new ethers.Contract(
+    config.v3FactoryAddress,
+    ["function getPool(address,address,uint24) view returns (address)"],
+    provider,
+  );
+
+  let best = null;
+  for (const fee of [10000, 3000, 500, 100]) {
+    const poolAddress = await factory.getPool(token0, token1, fee);
+    if (!poolAddress || poolAddress === ethers.ZeroAddress) continue;
+    const pool = new ethers.Contract(
+      poolAddress,
+      [
+        "function liquidity() view returns (uint128)",
+        "function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16,uint16,uint16,uint8,bool)",
+      ],
+      provider,
+    );
+    const [liquidity, slot0] = await Promise.all([pool.liquidity(), pool.slot0()]);
+    if (!best || BigInt(liquidity) > best.liquidity) {
+      best = {
+        provider,
+        poolAddress: normalizeAddress(poolAddress),
+        fee,
+        tickSpacing: feeToTickSpacing(fee),
+        token0,
+        token1,
+        wethIsToken0: token0 === weth,
+        liquidity: BigInt(liquidity),
+        sqrtPriceX96: BigInt(slot0.sqrtPriceX96),
+        tick: Number(slot0.tick),
+      };
+    }
+  }
+
+  if (!best) throw new Error("Không tìm thấy Uniswap v3 pool TOKEN/WETH trên Robinhood.");
+
+  const erc20 = new ethers.Contract(
+    token,
+    ["function symbol() view returns (string)", "function decimals() view returns (uint8)"],
+    provider,
+  );
+  const [symbol, decimals] = await Promise.all([
+    erc20.symbol().catch(() => "TOKEN"),
+    erc20.decimals().catch(() => 18),
+  ]);
+
+  return {
+    ...best,
+    tokenAddress: token,
+    symbol: String(symbol || "TOKEN"),
+    decimals: Number(decimals || 18),
+  };
+}
+
+async function prepareLpFromToken(tokenAddress, state, rangePercent = null) {
+  const discovered = await discoverV3WethPool(tokenAddress);
+  const sameToken = state.lp?.tokenAddress === discovered.tokenAddress;
+  let tickLower = sameToken ? state.lp.tickLower : null;
+  let tickUpper = sameToken ? state.lp.tickUpper : null;
+  let rangeLabel = sameToken ? state.lp.rangeLabel : null;
+
+  if (rangePercent != null) {
+    const ranged = ticksAroundPrice(discovered.tick, rangePercent, discovered.tickSpacing);
+    tickLower = ranged.tickLower;
+    tickUpper = ranged.tickUpper;
+    rangeLabel = ranged.rangeLabel;
+  }
+
+  state.lp = {
+    tokenAddress: discovered.tokenAddress,
+    symbol: discovered.symbol,
+    decimals: discovered.decimals,
+    fee: discovered.fee,
+    tickSpacing: discovered.tickSpacing,
+    poolAddress: discovered.poolAddress,
+    token0: discovered.token0,
+    token1: discovered.token1,
+    wethIsToken0: discovered.wethIsToken0,
+    tickLower,
+    tickUpper,
+    rangeLabel,
+  };
+  saveState(state);
+  return { discovered, preset: lpPreset(state) };
+}
+
+async function fetchLpPoolState(state = {}) {
+  const { ethers } = require("ethers");
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com");
+  let preset = lpPreset(state);
+
+  if (!preset.tokenAddress) {
+    throw new Error("Chưa chọn token. Paste contract token vào chat trước.");
+  }
+
+  if (!preset.poolAddress) {
+    await prepareLpFromToken(preset.tokenAddress, state);
+    preset = lpPreset(state);
+  }
+
+  const factory = new ethers.Contract(
+    config.v3FactoryAddress,
+    ["function getPool(address,address,uint24) view returns (address)"],
+    provider,
+  );
+  const poolAddress =
+    preset.poolAddress || (await factory.getPool(preset.token0, preset.token1, preset.fee));
+  if (!poolAddress || poolAddress === ethers.ZeroAddress) {
+    throw new Error("LP pool not found for this token/fee.");
+  }
+
+  const pool = new ethers.Contract(
+    poolAddress,
+    [
+      "function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,uint8 feeProtocol,bool unlocked)",
+      "function liquidity() view returns (uint128)",
+    ],
+    provider,
+  );
+  const token = new ethers.Contract(
+    preset.tokenAddress,
+    ["function symbol() view returns (string)", "function decimals() view returns (uint8)"],
+    provider,
+  );
+
+  const [slot0, poolLiquidity, symbol, decimals] = await Promise.all([
+    pool.slot0(),
+    pool.liquidity(),
+    token.symbol().catch(() => preset.symbol || "TOKEN"),
+    token.decimals().catch(() => preset.decimals || 18),
+  ]);
+
+  return {
+    provider,
+    preset: {
+      ...preset,
+      poolAddress: normalizeAddress(poolAddress),
+      symbol: String(symbol || preset.symbol || "TOKEN"),
+      decimals: Number(decimals || preset.decimals || 18),
+    },
+    poolAddress: normalizeAddress(poolAddress),
+    sqrtPriceX96: BigInt(slot0.sqrtPriceX96),
+    tick: Number(slot0.tick),
+    poolLiquidity: BigInt(poolLiquidity),
+    symbol: String(symbol || preset.symbol || "TOKEN"),
+    decimals: Number(decimals || preset.decimals || 18),
+    inRange:
+      preset.tickLower != null &&
+      preset.tickUpper != null &&
+      Number(slot0.tick) >= preset.tickLower &&
+      Number(slot0.tick) < preset.tickUpper,
+  };
+}
+
+function buildLpPreview(poolState, ethAmountText) {
+  const { ethers } = require("ethers");
+  if (poolState.preset.tickLower == null || poolState.preset.tickUpper == null) {
+    throw new Error("Chưa chọn range. Bấm ±5% / ±15% / ±50% / Full range trước.");
+  }
+  const ethAmount = Number(ethAmountText);
+  if (!Number.isFinite(ethAmount) || ethAmount <= 0) throw new Error("Invalid ETH amount.");
+
+  const ethRaw = ethers.parseEther(String(ethAmountText));
+  const amounts = amountsForExactEth({
+    sqrtPriceX96: poolState.sqrtPriceX96,
+    tickLower: poolState.preset.tickLower,
+    tickUpper: poolState.preset.tickUpper,
+    ethAmount: ethRaw,
+    wethIsToken0: poolState.preset.wethIsToken0,
+  });
+  if (amounts.error) throw new Error(amounts.error);
+
+  const amount0Min = (amounts.amount0 * BigInt(10000 - config.slippageBps)) / 10000n;
+  const amount1Min = (amounts.amount1 * BigInt(10000 - config.slippageBps)) / 10000n;
+  const tokenRaw = poolState.preset.wethIsToken0 ? amounts.amount1 : amounts.amount0;
+
+  return {
+    ethAmount: String(ethAmountText),
+    symbol: poolState.symbol,
+    decimals: poolState.decimals,
+    tick: poolState.tick,
+    inRange: poolState.inRange,
+    positionSide: amounts.positionSide,
+    amount0: amounts.amount0,
+    amount1: amounts.amount1,
+    amount0Min,
+    amount1Min,
+    ethRaw: amounts.ethRaw,
+    tokenRaw,
+    liquidity: amounts.liquidity,
+    ethText: ethers.formatEther(amounts.ethRaw),
+    tokenText: ethers.formatUnits(tokenRaw, poolState.decimals),
+  };
+}
+
+function lpPanelText(poolState, { preview = null, step = "range" } = {}) {
+  const hasRange = poolState?.preset?.tickLower != null && poolState?.preset?.tickUpper != null;
+  const lines = [
+    `<b>Add Liquidity (Uniswap v3)</b>`,
+    poolState
+      ? `Token: <b>${escapeHtml(poolState.symbol)}</b> <code>${escapeHtml(compactAddress(poolState.preset.tokenAddress))}</code>`
+      : "Chưa chọn token.",
+  ];
+
+  if (poolState) {
+    lines.push(
+      `Fee: <b>${poolState.preset.fee / 10000}%</b> · Pool <code>${escapeHtml(compactAddress(poolState.poolAddress))}</code>`,
+      `Current tick: <code>${poolState.tick}</code>`,
+    );
+    if (hasRange && step !== "range") {
+      lines.push(
+        `Range (${escapeHtml(poolState.preset.rangeLabel || "custom")}): <code>${poolState.preset.tickLower}</code> → <code>${poolState.preset.tickUpper}</code>`,
+        `${poolState.inRange ? "✅ In range" : "⚠️ Out of range"}`,
+      );
+    }
+  }
+
+  lines.push(`Trading: <b>${config.tradeEnabled ? "ON" : "OFF"}</b>`, "");
+
+  if (!poolState) {
+    lines.push("Paste contract token vào chat để bot đọc pool, rồi chọn range.");
+  } else if (step === "range" || preview == null && step !== "amount" && step !== "preview") {
+    lines.push("Bước 2: chọn range quanh giá hiện tại.");
+  } else if (preview) {
+    lines.push(
+      `<b>Preview ${escapeHtml(preview.ethAmount)} ETH</b>`,
+      `Deposit ETH: <b>${escapeHtml(Number(preview.ethText).toPrecision(6))}</b>`,
+      `Deposit ${escapeHtml(preview.symbol)}: <b>${escapeHtml(Number(preview.tokenText).toPrecision(6))}</b>`,
+      `Side: <code>${escapeHtml(preview.positionSide)}</code>`,
+      `Slippage: <b>${config.slippageBps / 100}%</b>`,
+      "",
+      "Bấm Confirm để mint position NFT.",
+    );
+  } else {
+    lines.push("Bước 3: chọn số ETH muốn add vào LP.");
+  }
+
+  return lines.join("\n");
+}
+
+async function executeAddLiquidity(ethAmountText, state = {}) {
+  if (!config.tradeEnabled) {
+    throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 và cấu hình WALLET_PRIVATE_KEY trước khi add LP.");
+  }
+  if (!config.rpcUrl || !config.walletPrivateKey) {
+    throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
+  }
+  if (!state.lp?.tokenAddress) {
+    throw new Error("Chưa chọn token LP. Paste contract trước.");
+  }
+  if (state.lp.tickLower == null || state.lp.tickUpper == null) {
+    throw new Error("Chưa chọn range LP.");
+  }
+
+  const { ethers } = require("ethers");
+  const poolState = await fetchLpPoolState(state);
+  const preview = buildLpPreview(poolState, ethAmountText);
+  const wallet = new ethers.Wallet(config.walletPrivateKey, poolState.provider);
+  const npm = new ethers.Contract(
+    config.positionManagerAddress,
+    [
+      "function mint((address token0,address token1,uint24 fee,int24 tickLower,int24 tickUpper,uint256 amount0Desired,uint256 amount1Desired,uint256 amount0Min,uint256 amount1Min,address recipient,uint256 deadline) params) payable returns (uint256 tokenId,uint128 liquidity,uint256 amount0,uint256 amount1)",
+      "function refundETH() payable",
+    ],
+    wallet,
+  );
+
+  const ethBalance = await poolState.provider.getBalance(wallet.address);
+  if (ethBalance < preview.ethRaw) {
+    throw new Error(`Not enough ETH. Need ~${preview.ethText}, wallet has ${ethers.formatEther(ethBalance)}.`);
+  }
+
+  const token = new ethers.Contract(
+    poolState.preset.tokenAddress,
+    [
+      "function balanceOf(address) view returns (uint256)",
+      "function allowance(address owner,address spender) view returns (uint256)",
+      "function approve(address spender,uint256 amount) returns (bool)",
+    ],
+    wallet,
+  );
+  const tokenBalance = await token.balanceOf(wallet.address);
+  if (tokenBalance < preview.tokenRaw) {
+    throw new Error(
+      `Not enough ${preview.symbol}. Need ~${preview.tokenText}, wallet has ${ethers.formatUnits(tokenBalance, preview.decimals)}.`,
+    );
+  }
+
+  if (config.dryRun) {
+    console.log(`[lp:mint:dry-run] ${JSON.stringify({
+      token: poolState.preset.tokenAddress,
+      eth: preview.ethText,
+      amountToken: preview.tokenText,
+      ticks: [poolState.preset.tickLower, poolState.preset.tickUpper],
+    })}`);
+    return {
+      hash: "dry-run",
+      tokenId: "0",
+      amount0: preview.ethText,
+      amount1: preview.tokenText,
+      symbol: preview.symbol,
+      wallet: wallet.address,
+    };
+  }
+
+  if (preview.tokenRaw > 0n) {
+    const allowance = await token.allowance(wallet.address, config.positionManagerAddress);
+    if (allowance < preview.tokenRaw) {
+      const approveTx = await token.approve(config.positionManagerAddress, preview.tokenRaw);
+      await approveTx.wait();
+    }
+  }
+
+  const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
+  const tx = await npm.mint(
+    {
+      token0: poolState.preset.token0,
+      token1: poolState.preset.token1,
+      fee: poolState.preset.fee,
+      tickLower: poolState.preset.tickLower,
+      tickUpper: poolState.preset.tickUpper,
+      amount0Desired: preview.amount0,
+      amount1Desired: preview.amount1,
+      amount0Min: preview.amount0Min,
+      amount1Min: preview.amount1Min,
+      recipient: wallet.address,
+      deadline,
+    },
+    { value: preview.ethRaw },
+  );
+  const receipt = await tx.wait();
+
+  let tokenId = "";
+  try {
+    const iface = new ethers.Interface([
+      "event IncreaseLiquidity(uint256 indexed tokenId,uint128 liquidity,uint256 amount0,uint256 amount1)",
+    ]);
+    for (const log of receipt.logs || []) {
+      try {
+        const parsed = iface.parseLog(log);
+        if (parsed?.name === "IncreaseLiquidity") {
+          tokenId = parsed.args.tokenId.toString();
+          break;
+        }
+      } catch {
+        // ignore unrelated logs
+      }
+    }
+  } catch {
+    // ignore parse failures
+  }
+
+  try {
+    await (await npm.refundETH()).wait();
+  } catch {
+    // no leftover ETH is fine
+  }
+
+  return {
+    hash: tx.hash,
+    tokenId: tokenId || "n/a",
+    amount0: preview.ethText,
+    amount1: preview.tokenText,
+    symbol: preview.symbol,
+    wallet: wallet.address,
+  };
+}
+
+async function showLpPanel(callbackQuery, state) {
+  try {
+    if (!state.lp?.tokenAddress && state.trackedPair?.baseTokenAddress) {
+      await prepareLpFromToken(state.trackedPair.baseTokenAddress, state);
+    }
+    if (!state.lp?.tokenAddress) {
+      await editTradeMessage(
+        callbackQuery,
+        [
+          `<b>Add Liquidity (Uniswap v3)</b>`,
+          "Paste contract token vào chat.",
+          "Bot sẽ đọc pool TOKEN/WETH → bạn chọn range → chọn ETH → Confirm.",
+        ].join("\n"),
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+
+    const poolState = await fetchLpPoolState(state);
+    const hasRange = state.lp.tickLower != null && state.lp.tickUpper != null;
+    if (!hasRange) {
+      await editTradeMessage(callbackQuery, lpPanelText(poolState, { step: "range" }), lpRangeKeyboard());
+    } else {
+      await editTradeMessage(callbackQuery, lpPanelText(poolState, { step: "amount" }), lpAmountKeyboard());
+    }
+  } catch (error) {
+    await editTradeMessage(
+      callbackQuery,
+      `<b>Add LP</b>\n${escapeHtml(error.message)}`,
+      mainMenuKeyboard(),
+    );
+  }
+}
+
+async function showLpRanges(callbackQuery, state) {
+  try {
+    if (!state.lp?.tokenAddress && state.trackedPair?.baseTokenAddress) {
+      await prepareLpFromToken(state.trackedPair.baseTokenAddress, state);
+    }
+    if (!state.lp?.tokenAddress) {
+      await editTradeMessage(
+        callbackQuery,
+        `<b>Add LP</b>\nPaste contract token trước.`,
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+    const poolState = await fetchLpPoolState(state);
+    await editTradeMessage(callbackQuery, lpPanelText(poolState, { step: "range" }), lpRangeKeyboard());
+  } catch (error) {
+    await editTradeMessage(callbackQuery, `<b>Add LP</b>\n${escapeHtml(error.message)}`, mainMenuKeyboard());
+  }
+}
+
+async function applyLpRange(callbackQuery, state, percent) {
+  try {
+    if (!state.lp?.tokenAddress) throw new Error("Chưa chọn token.");
+    const poolState = await fetchLpPoolState(state);
+    const ranged = ticksAroundPrice(poolState.tick, percent, poolState.preset.tickSpacing);
+    state.lp = {
+      ...state.lp,
+      tickLower: ranged.tickLower,
+      tickUpper: ranged.tickUpper,
+      rangeLabel: ranged.rangeLabel,
+    };
+    saveState(state);
+    const updated = await fetchLpPoolState(state);
+    await editTradeMessage(callbackQuery, lpPanelText(updated, { step: "amount" }), lpAmountKeyboard());
+  } catch (error) {
+    await editTradeMessage(callbackQuery, `<b>Chọn range thất bại</b>\n${escapeHtml(error.message)}`, lpRangeKeyboard());
+  }
+}
+
+async function showLpPreview(callbackQuery, state, ethAmount) {
+  try {
+    const poolState = await fetchLpPoolState(state);
+    const preview = buildLpPreview(poolState, ethAmount);
+    await editTradeMessage(callbackQuery, lpPanelText(poolState, { preview, step: "preview" }), lpConfirmKeyboard(ethAmount));
+  } catch (error) {
+    await editTradeMessage(
+      callbackQuery,
+      `<b>Add LP preview failed</b>\n${escapeHtml(error.message)}`,
+      lpAmountKeyboard(),
+    );
+  }
+}
+
+async function runConfirmedAddLiquidity(callbackQuery, state, ethAmount) {
+  await editTradeMessage(callbackQuery, `<b>Adding LP with ${escapeHtml(ethAmount)} ETH...</b>`, null);
+  try {
+    const result = await executeAddLiquidity(ethAmount, state);
+    const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>LP minted</b>`,
+        `Token ID: <code>${escapeHtml(result.tokenId)}</code>`,
+        `ETH: <b>${escapeHtml(Number(result.amount0).toPrecision(6))}</b>`,
+        `${escapeHtml(result.symbol)}: <b>${escapeHtml(Number(result.amount1).toPrecision(6))}</b>`,
+        `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
+        `<a href="${escapeHtml(txUrl)}">Tx</a>`,
+      ].join("\n"),
+      lpAmountKeyboard(),
+    );
+  } catch (error) {
+    await editTradeMessage(
+      callbackQuery,
+      `<b>LP not minted</b>\n${escapeHtml(error.message)}`,
+      lpAmountKeyboard(),
+    );
+  }
 }
 
 async function getWalletTokenBalance(tokenAddress) {
@@ -1873,6 +2651,44 @@ async function handleCallbackQuery(callbackQuery, state) {
     return;
   }
 
+  if (data === "panel:lp") {
+    await showLpPanel(callbackQuery, state);
+    return;
+  }
+
+  if (data === "lp:ranges") {
+    await showLpRanges(callbackQuery, state);
+    return;
+  }
+
+  if (data === "lp:amounts") {
+    try {
+      const poolState = await fetchLpPoolState(state);
+      await editTradeMessage(callbackQuery, lpPanelText(poolState, { step: "amount" }), lpAmountKeyboard());
+    } catch (error) {
+      await editTradeMessage(callbackQuery, `<b>Add LP</b>\n${escapeHtml(error.message)}`, mainMenuKeyboard());
+    }
+    return;
+  }
+
+  if (data.startsWith("lp:range:")) {
+    const percent = data.slice("lp:range:".length);
+    await applyLpRange(callbackQuery, state, percent);
+    return;
+  }
+
+  if (data.startsWith("lp:preview:")) {
+    const ethAmount = data.slice("lp:preview:".length);
+    await showLpPreview(callbackQuery, state, ethAmount);
+    return;
+  }
+
+  if (data.startsWith("lp:confirm:")) {
+    const ethAmount = data.slice("lp:confirm:".length);
+    await runConfirmedAddLiquidity(callbackQuery, state, ethAmount);
+    return;
+  }
+
   if (data === "panel:portfolio" || data === "portfolio:refresh") {
     await showPortfolio(chatId, state, { editCallback: callbackQuery });
     return;
@@ -1997,6 +2813,45 @@ async function handleTelegramMessage(message, state) {
 
   if (text === "/trade") {
     await sendTradeMenu(chatId);
+    return;
+  }
+
+  if (text === "/lp" || text.startsWith("/lp@")) {
+    try {
+      if (!state.lp?.tokenAddress && state.trackedPair?.baseTokenAddress) {
+        await prepareLpFromToken(state.trackedPair.baseTokenAddress, state);
+      }
+      if (!state.lp?.tokenAddress) {
+        await telegramRequest("sendMessage", {
+          chat_id: chatId,
+          text: [
+            `<b>Add Liquidity</b>`,
+            "Paste contract token vào chat.",
+            "Flow: đọc pool → chọn range → chọn ETH → Confirm.",
+          ].join("\n"),
+          parse_mode: "HTML",
+          disable_web_page_preview: "true",
+          reply_markup: mainMenuKeyboard(),
+        });
+        return;
+      }
+      const poolState = await fetchLpPoolState(state);
+      await telegramRequest("sendMessage", {
+        chat_id: chatId,
+        text: lpPanelText(poolState, { step: "range" }),
+        parse_mode: "HTML",
+        disable_web_page_preview: "true",
+        reply_markup: lpRangeKeyboard(),
+      });
+    } catch (error) {
+      await telegramRequest("sendMessage", {
+        chat_id: chatId,
+        text: `<b>Add LP</b>\n${escapeHtml(error.message)}`,
+        parse_mode: "HTML",
+        disable_web_page_preview: "true",
+        reply_markup: mainMenuKeyboard(),
+      });
+    }
     return;
   }
 
@@ -2170,17 +3025,23 @@ if (require.main === module) {
 }
 
 module.exports = {
+  alignTick,
   analyzeContractBytecode,
   analyzeDexMarketRisk,
   analyzeHolderConcentration,
   analyzePairsMarketRisk,
+  amountsForExactEth,
+  amountsForEthLiquidity: amountsForExactEth,
+  buildLpPreview,
   buildPortfolioFromBalances,
   classifyFromTransaction,
   classifyRestrictionError,
   config,
+  feeToTickSpacing,
   formatHoneypotReport,
   formatUnits,
   getPortfolioWallet,
+  getSqrtRatioAtTick,
   groupHashes,
   groupTransfers,
   isAuthorizedChat,
@@ -2189,6 +3050,8 @@ module.exports = {
   isMessageNotModifiedError,
   isPollingConflictError,
   isTradeablePortfolioItem,
+  lpPreset,
+  ticksAroundPrice,
   normalizeAddress,
   mainMenuKeyboard,
   mainPanelText,
@@ -2201,6 +3064,7 @@ module.exports = {
   scoreHoneypotFindings,
   shouldTradeImmediately,
   sniperTradeKeyboard,
+  sortUniswapTokens,
   staticMainPanelText,
   trackedPairFromDexPair,
   tradePanelText,

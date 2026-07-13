@@ -142,9 +142,9 @@ test("main menu looks like a trading dashboard", () => {
 
   assert(text.includes(bot.config.botTitle));
   assert(labels.includes("Buy & Sell"));
+  assert(labels.includes("Add LP"));
   assert(labels.includes("Portfolio"));
   assert(labels.includes("Update Price"));
-  assert(labels.includes("Copy Trades"));
   assert(labels.includes("Profile"));
   assert(labels.includes("Wallets"));
   assert.equal(labels.includes("Sniper"), false);
@@ -441,4 +441,50 @@ test("probe holder skips pool dead and contracts", () => {
   );
 
   assert.equal(probe.address, "0x2a7c37742c7dd2e24143be825a1970284b47e6f6");
+});
+
+test("LP preset matches Uniswap link range", () => {
+  const preset = bot.lpPreset({
+    lp: {
+      tokenAddress: "0xd7321801caae694090694ff55a9323139f043b88",
+      fee: 10000,
+      tickSpacing: 200,
+      tickLower: 111400,
+      tickUpper: 125200,
+    },
+  });
+  assert.equal(preset.fee, 10000);
+  assert.equal(preset.tickLower, 111400);
+  assert.equal(preset.tickUpper, 125200);
+  assert.equal(preset.wethIsToken0, true);
+  assert.equal(bot.alignTick(111450, 200), 111400);
+});
+
+test("LP amount math needs both sides when price is in range", () => {
+  const tickLower = 111400;
+  const tickUpper = 125200;
+  const tickCurrent = 118255;
+  const sqrtPriceX96 = bot.getSqrtRatioAtTick(tickCurrent);
+  const ethWei = 10n ** 16n; // 0.01 ETH
+  const amounts = bot.amountsForExactEth({
+    sqrtPriceX96,
+    tickLower,
+    tickUpper,
+    ethAmount: ethWei,
+    wethIsToken0: true,
+  });
+
+  assert.equal(amounts.positionSide, "in-range");
+  assert.ok(amounts.amount0 > 0n);
+  assert.ok(amounts.amount1 > 0n);
+  assert.ok(amounts.liquidity > 0n);
+});
+
+test("LP range percents expand around current tick", () => {
+  const ranged = bot.ticksAroundPrice(118255, 15, 200);
+  assert.ok(ranged.tickLower < 118255);
+  assert.ok(ranged.tickUpper > 118255);
+  assert.equal(ranged.tickLower % 200, 0);
+  assert.equal(ranged.tickUpper % 200, 0);
+  assert.equal(bot.feeToTickSpacing(10000), 200);
 });
