@@ -91,14 +91,20 @@ function addressOf(value) {
 
 async function fetchJson(url, options = {}, retries = 3) {
   let lastError;
+  const { timeoutMs: rawTimeoutMs, ...fetchOptions } = options;
+  const timeoutMs = Number(rawTimeoutMs || 30000);
 
   for (let attempt = 1; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
       const response = await fetch(url, {
-        ...options,
+        ...fetchOptions,
+        signal: controller.signal,
         headers: {
           "user-agent": "robinhood-uniswap-telegram-bot/1.0",
-          ...(options.headers || {}),
+          ...(fetchOptions.headers || {}),
         },
       });
 
@@ -115,14 +121,21 @@ async function fetchJson(url, options = {}, retries = 3) {
 
       return response.json();
     } catch (error) {
-      lastError = error;
-      const message = String(error?.message || "");
-      const retryable = message.includes("500") || message.includes("502") || message.includes("503") || message.includes("504");
+      lastError = error?.name === "AbortError" ? new Error(`Request timed out after ${timeoutMs}ms: ${url}`) : error;
+      const message = String(lastError?.message || "");
+      const retryable =
+        message.includes("timed out") ||
+        message.includes("500") ||
+        message.includes("502") ||
+        message.includes("503") ||
+        message.includes("504");
       if (retryable && attempt < retries) {
         await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
         continue;
       }
-      throw error;
+      throw lastError;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -193,12 +206,16 @@ function saveState(state) {
 
 function startHealthServer() {
   const port = Number(process.env.PORT || 0);
-  if (!port) return;
+  if (!port) {
+    console.log("No PORT set; health server disabled (Background Worker mode).");
+    return;
+  }
 
   const server = http.createServer((req, res) => {
-    if (req.url === "/healthz") {
+    const pathName = String(req.url || "/").split("?")[0];
+    if (pathName === "/healthz" || pathName === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+      res.end(JSON.stringify({ ok: true, service: "robinhood-telegram-bot" }));
       return;
     }
 
@@ -206,8 +223,9 @@ function startHealthServer() {
     res.end("Telegram bot is running.\n");
   });
 
-  server.listen(port, () => {
-    console.log(`Health server listening on port ${port}.`);
+  // Render Web Services probe 0.0.0.0:$PORT — binding localhost makes deploy hang.
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`Health server listening on 0.0.0.0:${port}.`);
   });
 }
 
@@ -1820,11 +1838,19 @@ async function bootState(state) {
 }
 
 async function main() {
+  console.log("Starting robinhood-telegram-bot...");
   startHealthServer();
 
   const state = loadState();
   applyStateConfig(state);
-  await validateTelegramConfig();
+
+  try {
+    await validateTelegramConfig();
+  } catch (error) {
+    // Keep process alive so Render health checks can pass; Telegram loop will retry.
+    console.error(`Telegram config validation failed: ${error.message}`);
+    console.error("Health server stays up; bot will keep retrying Telegram access.");
+  }
 
   if (process.argv.includes("--send-menu")) {
     await sendMainMenu();
@@ -1847,6 +1873,7 @@ async function main() {
     if (once) return;
   }
 
+  console.log("Entering poll loop.");
   while (true) {
     try {
       await processTelegramUpdates(state);
