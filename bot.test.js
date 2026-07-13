@@ -143,6 +143,7 @@ test("main menu looks like a trading dashboard", () => {
   assert(text.includes(bot.config.botTitle));
   assert(labels.includes("Buy & Sell"));
   assert(labels.includes("Add LP"));
+  assert(labels.includes("My LP"));
   assert(labels.includes("Portfolio"));
   assert(labels.includes("Update Price"));
   assert(labels.includes("Profile"));
@@ -487,4 +488,9 @@ test("LP range percents expand around current tick", () => {
   assert.equal(ranged.tickLower % 200, 0);
   assert.equal(ranged.tickUpper % 200, 0);
   assert.equal(bot.feeToTickSpacing(10000), 200);
+});
+
+test("LP remove percent scales liquidity", () => {
+  assert.equal(bot.liquidityPercent(1000n, 25), 250n);
+  assert.equal(bot.liquidityPercent(1000n, 100), 1000n);
 });

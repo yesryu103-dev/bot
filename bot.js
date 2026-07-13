@@ -1161,9 +1161,12 @@ function mainMenuKeyboard() {
       [{ text: "Buy & Sell", callback_data: "panel:trade" }],
       [
         { text: "Add LP", callback_data: "panel:lp" },
-        { text: "Portfolio", callback_data: "panel:portfolio" },
+        { text: "My LP", callback_data: "panel:mylp" },
       ],
-      [{ text: "Update Price", callback_data: "portfolio:refresh" }],
+      [
+        { text: "Portfolio", callback_data: "panel:portfolio" },
+        { text: "Update Price", callback_data: "portfolio:refresh" },
+      ],
       [
         { text: "Profile", callback_data: "panel:profile" },
         { text: "Wallets", callback_data: "panel:wallets" },
@@ -2442,13 +2445,370 @@ async function runConfirmedAddLiquidity(callbackQuery, state, ethAmount) {
         `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
         `<a href="${escapeHtml(txUrl)}">Tx</a>`,
       ].join("\n"),
-      lpAmountKeyboard(),
+      {
+        inline_keyboard: [
+          [{ text: "My LP", callback_data: "panel:mylp" }],
+          [{ text: "Add more", callback_data: "lp:amounts" }, { text: "Main Menu", callback_data: "menu" }],
+        ],
+      },
     );
   } catch (error) {
     await editTradeMessage(
       callbackQuery,
       `<b>LP not minted</b>\n${escapeHtml(error.message)}`,
       lpAmountKeyboard(),
+    );
+  }
+}
+
+function npmContract(providerOrSigner) {
+  const { ethers } = require("ethers");
+  return new ethers.Contract(
+    config.positionManagerAddress,
+    [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function tokenOfOwnerByIndex(address owner,uint256 index) view returns (uint256)",
+      "function positions(uint256 tokenId) view returns (uint96 nonce,address operator,address token0,address token1,uint24 fee,int24 tickLower,int24 tickUpper,uint128 liquidity,uint256 feeGrowthInside0LastX128,uint256 feeGrowthInside1LastX128,uint128 tokensOwed0,uint128 tokensOwed1)",
+      "function decreaseLiquidity((uint256 tokenId,uint128 liquidity,uint256 amount0Min,uint256 amount1Min,uint256 deadline) params) payable returns (uint256 amount0,uint256 amount1)",
+      "function collect((uint256 tokenId,address recipient,uint128 amount0Max,uint128 amount1Max) params) payable returns (uint256 amount0,uint256 amount1)",
+      "function burn(uint256 tokenId) payable",
+      "function multicall(bytes[] data) payable returns (bytes[] results)",
+      "function factory() view returns (address)",
+    ],
+    providerOrSigner,
+  );
+}
+
+async function getManagedWallet() {
+  if (!config.rpcUrl || !config.walletPrivateKey) {
+    throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
+  }
+  const { ethers } = require("ethers");
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl);
+  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
+  return { ethers, provider, wallet };
+}
+
+async function readPositionDetails(tokenId, provider) {
+  const { ethers } = require("ethers");
+  const npm = npmContract(provider);
+  const pos = await npm.positions(tokenId);
+  const token0 = normalizeAddress(pos.token0);
+  const token1 = normalizeAddress(pos.token1);
+  const weth = normalizeAddress(config.lpWethAddress);
+  const fee = Number(pos.fee);
+  const tickLower = Number(pos.tickLower);
+  const tickUpper = Number(pos.tickUpper);
+  const liquidity = BigInt(pos.liquidity);
+  const factory = new ethers.Contract(
+    config.v3FactoryAddress,
+    ["function getPool(address,address,uint24) view returns (address)"],
+    provider,
+  );
+  const poolAddress = await factory.getPool(token0, token1, fee);
+  let currentTick = 0;
+  let inRange = false;
+  if (poolAddress && poolAddress !== ethers.ZeroAddress) {
+    const pool = new ethers.Contract(
+      poolAddress,
+      ["function slot0() view returns (uint160,int24 tick,uint16,uint16,uint16,uint8,bool)"],
+      provider,
+    );
+    const slot0 = await pool.slot0();
+    currentTick = Number(slot0.tick);
+    inRange = currentTick >= tickLower && currentTick < tickUpper;
+  }
+
+  const otherToken = token0 === weth ? token1 : token1 === weth ? token0 : token0;
+  const erc20 = new ethers.Contract(otherToken, ["function symbol() view returns (string)", "function decimals() view returns (uint8)"], provider);
+  const [symbol, decimals] = await Promise.all([
+    erc20.symbol().catch(() => "TOKEN"),
+    erc20.decimals().catch(() => 18),
+  ]);
+
+  return {
+    tokenId: String(tokenId),
+    token0,
+    token1,
+    fee,
+    tickLower,
+    tickUpper,
+    liquidity,
+    tokensOwed0: BigInt(pos.tokensOwed0),
+    tokensOwed1: BigInt(pos.tokensOwed1),
+    poolAddress: normalizeAddress(poolAddress || ""),
+    currentTick,
+    inRange,
+    wethIsToken0: token0 === weth,
+    tokenAddress: otherToken,
+    symbol: String(symbol || "TOKEN"),
+    decimals: Number(decimals || 18),
+    tickSpacing: feeToTickSpacing(fee),
+  };
+}
+
+async function fetchWalletLpPositions(max = 8) {
+  const { provider, wallet } = await getManagedWallet();
+  const npm = npmContract(provider);
+  const balance = Number(await npm.balanceOf(wallet.address));
+  if (!balance) return { wallet: wallet.address, positions: [] };
+
+  const count = Math.min(balance, max);
+  const positions = [];
+  for (let index = 0; index < count; index += 1) {
+    const tokenId = await npm.tokenOfOwnerByIndex(wallet.address, index);
+    try {
+      const details = await readPositionDetails(tokenId, provider);
+      if (details.liquidity > 0n || details.tokensOwed0 > 0n || details.tokensOwed1 > 0n) {
+        positions.push(details);
+      }
+    } catch (error) {
+      console.warn(`Could not read LP NFT ${tokenId}: ${error.message}`);
+    }
+  }
+  return { wallet: wallet.address, positions };
+}
+
+function myLpListText(payload) {
+  const lines = [
+    `<b>My LP Positions</b>`,
+    `Wallet: <code>${escapeHtml(compactAddress(payload.wallet))}</code>`,
+    "",
+  ];
+  if (!payload.positions.length) {
+    lines.push("Chưa có position Uniswap v3 nào (hoặc liquidity = 0).");
+    lines.push("Paste token rồi bấm Add LP để tạo mới.");
+    return lines.join("\n");
+  }
+
+  for (const pos of payload.positions) {
+    lines.push(
+      `#${escapeHtml(pos.tokenId)} · <b>${escapeHtml(pos.symbol)}/ETH</b> · fee ${pos.fee / 10000}%`,
+      `Range <code>${pos.tickLower}</code>→<code>${pos.tickUpper}</code> · tick <code>${pos.currentTick}</code> · ${pos.inRange ? "✅ In range" : "⚠️ Out of range"}`,
+      `Liquidity: <code>${escapeHtml(pos.liquidity.toString())}</code>`,
+      "",
+    );
+  }
+  lines.push("Chọn position để Remove hoặc Re-range.");
+  return lines.join("\n");
+}
+
+function myLpListKeyboard(positions) {
+  const rows = positions.map((pos) => [
+    {
+      text: `#${pos.tokenId} ${pos.symbol} ${pos.inRange ? "IN" : "OUT"}`,
+      callback_data: `lp:pos:${pos.tokenId}`,
+    },
+  ]);
+  rows.push([{ text: "Refresh", callback_data: "panel:mylp" }, { text: "Add LP", callback_data: "panel:lp" }]);
+  rows.push([{ text: "Main Menu", callback_data: "menu" }]);
+  return { inline_keyboard: rows };
+}
+
+function lpPositionKeyboard(tokenId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Remove 25%", callback_data: `lp:rm:${tokenId}:25` },
+        { text: "Remove 50%", callback_data: `lp:rm:${tokenId}:50` },
+      ],
+      [{ text: "Remove 100%", callback_data: `lp:rm:${tokenId}:100` }],
+      [{ text: "Re-range (remove → new range)", callback_data: `lp:rerange:${tokenId}` }],
+      [{ text: "Back", callback_data: "panel:mylp" }, { text: "Main Menu", callback_data: "menu" }],
+    ],
+  };
+}
+
+function lpPositionText(pos) {
+  return [
+    `<b>LP #${escapeHtml(pos.tokenId)}</b>`,
+    `Pair: <b>${escapeHtml(pos.symbol)}/ETH</b> · Fee <b>${pos.fee / 10000}%</b>`,
+    `Range: <code>${pos.tickLower}</code> → <code>${pos.tickUpper}</code>`,
+    `Current tick: <code>${pos.currentTick}</code> · ${pos.inRange ? "✅ In range (đang earn fee)" : "⚠️ Out of range (không earn fee đến khi giá quay lại)"}`,
+    `Liquidity: <code>${escapeHtml(pos.liquidity.toString())}</code>`,
+    `Pool: <code>${escapeHtml(compactAddress(pos.poolAddress))}</code>`,
+    "",
+    "Remove: rút liquidity (+ collect fee).",
+    "Re-range: remove 100% rồi chọn range mới và add lại.",
+  ].join("\n");
+}
+
+function liquidityPercent(liquidity, percent) {
+  const pct = BigInt(percent);
+  if (pct >= 100n) return liquidity;
+  return (liquidity * pct) / 100n;
+}
+
+async function executeRemoveLiquidity(tokenId, percent) {
+  if (!config.tradeEnabled) {
+    throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 trước khi remove LP.");
+  }
+  const { ethers, provider, wallet } = await getManagedWallet();
+  const npm = npmContract(wallet);
+  const pos = await readPositionDetails(tokenId, provider);
+  if (pos.liquidity <= 0n && percent > 0) {
+    throw new Error("Position đã hết liquidity.");
+  }
+
+  const removeLiquidity = liquidityPercent(pos.liquidity, percent);
+  const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
+  const maxUint128 = (2n ** 128n) - 1n;
+
+  if (config.dryRun) {
+    console.log(`[lp:remove:dry-run] id=${tokenId} pct=${percent} liq=${removeLiquidity}`);
+    return { hash: "dry-run", tokenId: String(tokenId), percent, burned: percent >= 100, symbol: pos.symbol };
+  }
+
+  const calls = [];
+  if (removeLiquidity > 0n) {
+    calls.push(
+      npm.interface.encodeFunctionData("decreaseLiquidity", [
+        {
+          tokenId,
+          liquidity: removeLiquidity,
+          amount0Min: 0,
+          amount1Min: 0,
+          deadline,
+        },
+      ]),
+    );
+  }
+  calls.push(
+    npm.interface.encodeFunctionData("collect", [
+      {
+        tokenId,
+        recipient: wallet.address,
+        amount0Max: maxUint128,
+        amount1Max: maxUint128,
+      },
+    ]),
+  );
+
+  if (percent >= 100) {
+    // burn only works when liquidity is 0 after decrease+collect
+    calls.push(npm.interface.encodeFunctionData("burn", [tokenId]));
+  }
+
+  let tx;
+  try {
+    tx = await npm.multicall(calls);
+  } catch (error) {
+    // If burn fails because dust remains, retry without burn.
+    if (percent >= 100 && calls.length > 2) {
+      tx = await npm.multicall(calls.slice(0, -1));
+    } else {
+      throw error;
+    }
+  }
+  await tx.wait();
+
+  return {
+    hash: tx.hash,
+    tokenId: String(tokenId),
+    percent,
+    burned: percent >= 100,
+    symbol: pos.symbol,
+    wallet: wallet.address,
+  };
+}
+
+async function showMyLpPanel(callbackQuery) {
+  try {
+    const payload = await fetchWalletLpPositions();
+    await editTradeMessage(callbackQuery, myLpListText(payload), myLpListKeyboard(payload.positions));
+  } catch (error) {
+    await editTradeMessage(
+      callbackQuery,
+      `<b>My LP</b>\n${escapeHtml(error.message)}`,
+      mainMenuKeyboard(),
+    );
+  }
+}
+
+async function showLpPosition(callbackQuery, tokenId) {
+  try {
+    const { provider } = await getManagedWallet();
+    const pos = await readPositionDetails(tokenId, provider);
+    await editTradeMessage(callbackQuery, lpPositionText(pos), lpPositionKeyboard(tokenId));
+  } catch (error) {
+    await editTradeMessage(callbackQuery, `<b>LP position</b>\n${escapeHtml(error.message)}`, {
+      inline_keyboard: [[{ text: "Back", callback_data: "panel:mylp" }]],
+    });
+  }
+}
+
+async function runRemoveLiquidity(callbackQuery, tokenId, percent) {
+  await editTradeMessage(callbackQuery, `<b>Removing ${percent}% from LP #${escapeHtml(tokenId)}...</b>`, null);
+  try {
+    const result = await executeRemoveLiquidity(tokenId, Number(percent));
+    const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>LP removed ${result.percent}%</b>`,
+        `Position: <code>#${escapeHtml(result.tokenId)}</code> · ${escapeHtml(result.symbol)}/ETH`,
+        result.burned ? "NFT burn attempted (full remove)." : "NFT vẫn giữ (partial remove).",
+        `<a href="${escapeHtml(txUrl)}">Tx</a>`,
+      ].join("\n"),
+      {
+        inline_keyboard: [
+          [{ text: "My LP", callback_data: "panel:mylp" }],
+          [{ text: "Main Menu", callback_data: "menu" }],
+        ],
+      },
+    );
+  } catch (error) {
+    await editTradeMessage(
+      callbackQuery,
+      `<b>Remove failed</b>\n${escapeHtml(error.message)}`,
+      lpPositionKeyboard(tokenId),
+    );
+  }
+}
+
+async function startLpRerange(callbackQuery, state, tokenId) {
+  await editTradeMessage(callbackQuery, `<b>Re-range:</b> đang remove 100% LP #${escapeHtml(tokenId)}...`, null);
+  try {
+    const { provider } = await getManagedWallet();
+    const pos = await readPositionDetails(tokenId, provider);
+    const removed = await executeRemoveLiquidity(tokenId, 100);
+
+    state.lp = {
+      tokenAddress: pos.tokenAddress,
+      symbol: pos.symbol,
+      decimals: pos.decimals,
+      fee: pos.fee,
+      tickSpacing: pos.tickSpacing,
+      poolAddress: pos.poolAddress,
+      token0: pos.token0,
+      token1: pos.token1,
+      wethIsToken0: pos.wethIsToken0,
+      tickLower: null,
+      tickUpper: null,
+      rangeLabel: null,
+      rerangeFrom: String(tokenId),
+    };
+    saveState(state);
+
+    const poolState = await fetchLpPoolState(state);
+    const txUrl = `${config.blockscoutBaseUrl}/tx/${removed.hash}`;
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>Old LP removed</b> · <a href="${escapeHtml(txUrl)}">Tx</a>`,
+        `Token: <b>${escapeHtml(pos.symbol)}</b>`,
+        `Old range: <code>${pos.tickLower}</code>→<code>${pos.tickUpper}</code> (${pos.inRange ? "was in range" : "was OUT of range"})`,
+        `Current tick: <code>${poolState.tick}</code>`,
+        "",
+        "Chọn range mới, rồi chọn ETH để mint lại.",
+      ].join("\n"),
+      lpRangeKeyboard(),
+    );
+  } catch (error) {
+    await editTradeMessage(
+      callbackQuery,
+      `<b>Re-range failed</b>\n${escapeHtml(error.message)}`,
+      lpPositionKeyboard(tokenId),
     );
   }
 }
@@ -2653,6 +3013,31 @@ async function handleCallbackQuery(callbackQuery, state) {
 
   if (data === "panel:lp") {
     await showLpPanel(callbackQuery, state);
+    return;
+  }
+
+  if (data === "panel:mylp") {
+    await showMyLpPanel(callbackQuery);
+    return;
+  }
+
+  if (data.startsWith("lp:pos:")) {
+    const tokenId = data.slice("lp:pos:".length);
+    await showLpPosition(callbackQuery, tokenId);
+    return;
+  }
+
+  if (data.startsWith("lp:rm:")) {
+    const parts = data.split(":");
+    const tokenId = parts[2];
+    const percent = parts[3];
+    await runRemoveLiquidity(callbackQuery, tokenId, percent);
+    return;
+  }
+
+  if (data.startsWith("lp:rerange:")) {
+    const tokenId = data.slice("lp:rerange:".length);
+    await startLpRerange(callbackQuery, state, tokenId);
     return;
   }
 
@@ -3051,6 +3436,7 @@ module.exports = {
   isPollingConflictError,
   isTradeablePortfolioItem,
   lpPreset,
+  liquidityPercent,
   ticksAroundPrice,
   normalizeAddress,
   mainMenuKeyboard,
