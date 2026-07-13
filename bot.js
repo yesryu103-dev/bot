@@ -2151,7 +2151,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
         const router = new ethers.Contract(
           config.swapRouterAddress,
           [
-            "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
+            "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
           ],
           provider,
         );
@@ -2161,7 +2161,6 @@ async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
             tokenOut: quoteToken,
             fee: usedFee,
             recipient: probeAddress,
-            deadline: 9999999999,
             amountIn: probeAmount,
             amountOutMinimum: 0,
             sqrtPriceLimitX96: 0,
@@ -4698,16 +4697,6 @@ async function executeSwap(side, amountText, overrides = {}) {
     decimals: decimalsIn,
   });
   const amountOutMinimum = ethers.parseUnits(numberToDecimalString(quote.minOut, decimalsOut), decimalsOut);
-  const deadline = Math.floor(Date.now() / 1000) + 60 * 5;
-
-  const erc20Abi = [
-    "function allowance(address owner,address spender) view returns (uint256)",
-    "function approve(address spender,uint256 amount) returns (bool)",
-    "function balanceOf(address owner) view returns (uint256)",
-  ];
-  const routerAbi = [
-    "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
-  ];
 
   // Buys spend WETH. If wallet only has native ETH, wrap the shortfall first.
   let wrappedEth = 0n;
@@ -4715,6 +4704,16 @@ async function executeSwap(side, amountText, overrides = {}) {
     const ensured = await ensureWethForBuy(wallet, tokenIn, amountIn);
     wrappedEth = ensured.wrapped;
   }
+
+  const erc20Abi = [
+    "function allowance(address owner,address spender) view returns (uint256)",
+    "function approve(address spender,uint256 amount) returns (bool)",
+    "function balanceOf(address owner) view returns (uint256)",
+  ];
+  // Robinhood uses Uniswap SwapRouter02 (no deadline field).
+  const routerAbi = [
+    "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
+  ];
 
   const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
   const balance = await inputToken.balanceOf(wallet.address);
@@ -4736,15 +4735,75 @@ async function executeSwap(side, amountText, overrides = {}) {
     await approveTx.wait();
   }
 
+  // Prefer live pool fee + quoter minOut when possible.
+  let swapFee = fee;
+  const pairAddress = normalizeAddress(overrides.pairAddress || config.pairAddress || "");
+  if (isEvmAddress(pairAddress)) {
+    try {
+      const meta = await getPoolMeta(pairAddress, provider);
+      const matches =
+        (meta.token0 === tokenIn && meta.token1 === tokenOut) ||
+        (meta.token0 === tokenOut && meta.token1 === tokenIn);
+      if (matches && Number.isFinite(meta.fee) && meta.fee > 0) swapFee = meta.fee;
+    } catch {
+      // keep fee
+    }
+  }
+
+  let minOut = amountOutMinimum;
+  try {
+    const quoter = new ethers.Contract(
+      config.quoterAddress,
+      [
+        "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
+      ],
+      provider,
+    );
+    const feeCandidates = [swapFee, 10000, 3000, 500, 100].filter(
+      (value, index, list) => Number.isFinite(value) && value > 0 && list.indexOf(value) === index,
+    );
+    let quoted = 0n;
+    let usedFee = swapFee;
+    let lastQuoteError = "";
+    for (const tryFee of feeCandidates) {
+      try {
+        const result = await quoter.quoteExactInputSingle.staticCall({
+          tokenIn,
+          tokenOut,
+          amountIn,
+          fee: tryFee,
+          sqrtPriceLimitX96: 0,
+        });
+        const amountOut = BigInt(result.amountOut ?? result[0]);
+        if (amountOut <= 0n) {
+          lastQuoteError = "zero amount out";
+          continue;
+        }
+        quoted = amountOut;
+        usedFee = tryFee;
+        break;
+      } catch (error) {
+        lastQuoteError = error.shortMessage || error.message || String(error);
+      }
+    }
+    if (quoted <= 0n) {
+      throw new Error(`Quoter failed for ${tokenInSymbol}->${tokenOutSymbol}: ${lastQuoteError}`);
+    }
+    swapFee = usedFee;
+    minOut = (quoted * BigInt(10000 - config.slippageBps)) / 10000n;
+  } catch (error) {
+    if (String(error.message || "").startsWith("Quoter failed")) throw error;
+    console.warn(`Quoter unavailable, using Dex estimate minOut: ${error.message}`);
+  }
+
   const router = new ethers.Contract(config.swapRouterAddress, routerAbi, wallet);
   const params = {
     tokenIn,
     tokenOut,
-    fee,
+    fee: swapFee,
     recipient: wallet.address,
-    deadline,
     amountIn,
-    amountOutMinimum,
+    amountOutMinimum: minOut,
     sqrtPriceLimitX96: 0,
   };
 
@@ -4754,7 +4813,7 @@ async function executeSwap(side, amountText, overrides = {}) {
     wallet: wallet.address,
     tokenInSymbol,
     tokenOutSymbol,
-    minOut: numberToDecimalString(quote.minOut, 8),
+    minOut: numberToDecimalString(Number(ethers.formatUnits(minOut, decimalsOut)), 8),
     wrappedEth: wrappedEth > 0n ? ethers.formatEther(wrappedEth) : "",
   };
 }
