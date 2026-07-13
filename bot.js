@@ -58,8 +58,6 @@ const config = {
   quoterAddress: process.env.QUOTER_ADDRESS || "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
   uniswapV3Fee: Number(process.env.UNISWAP_V3_FEE || 10000),
   slippageBps: Number(process.env.SLIPPAGE_BPS || 200),
-  // >1 tips the sequencer harder so txs land in the next ~250ms block more reliably.
-  gasFeeMultiplier: Number(process.env.GAS_FEE_MULTIPLIER || 1.5),
   oneTapTrade: truthy(process.env.ONE_TAP_TRADE),
   buyAmountsQuote: parseAmountOptions(process.env.BUY_AMOUNTS_QUOTE || "0.01,0.05,0.1,0.25"),
   sellPercents: parseAmountOptions(process.env.SELL_PERCENTS || "25,50,70")
@@ -221,31 +219,6 @@ function getRpcProvider() {
     cachedRpcProvider._walletRpcUrl = url;
   }
   return cachedRpcProvider;
-}
-
-async function fastTxOverrides(provider = null) {
-  const rpc = provider || getRpcProvider();
-  const fee = await rpc.getFeeData();
-  const mult = Math.max(1, Number(process.env.GAS_FEE_MULTIPLIER || config.gasFeeMultiplier || 1.5));
-  const scale = (value) => {
-    if (value == null) return null;
-    return (BigInt(value) * BigInt(Math.round(mult * 100))) / 100n;
-  };
-
-  const maxPriorityFeePerGas = scale(fee.maxPriorityFeePerGas);
-  let maxFeePerGas = scale(fee.maxFeePerGas || fee.gasPrice);
-  if (maxPriorityFeePerGas != null && maxFeePerGas != null && maxFeePerGas < maxPriorityFeePerGas) {
-    maxFeePerGas = maxPriorityFeePerGas * 2n;
-  }
-
-  const overrides = {};
-  if (maxPriorityFeePerGas != null) overrides.maxPriorityFeePerGas = maxPriorityFeePerGas;
-  if (maxFeePerGas != null) overrides.maxFeePerGas = maxFeePerGas;
-  // Legacy networks / fallback
-  if (!overrides.maxFeePerGas && fee.gasPrice != null) {
-    overrides.gasPrice = scale(fee.gasPrice);
-  }
-  return overrides;
 }
 
 async function getPoolMeta(pairAddress, provider = null) {
@@ -672,7 +645,7 @@ async function ensureWethForBuy(wallet, wethAddress, amountIn) {
     );
   }
 
-  const depositTx = await weth.deposit({ value: shortfall, ...(await fastTxOverrides(wallet.provider)) });
+  const depositTx = await weth.deposit({ value: shortfall });
   await depositTx.wait(1);
   balance = await weth.balanceOf(wallet.address);
   if (balance < amountIn) {
@@ -772,27 +745,22 @@ async function executeSwap(side, amountText, overrides = {}) {
     );
   }
 
-  const gasOverrides = await fastTxOverrides(provider);
-
   if (allowance < amountIn) {
     // Max approve once so later trades skip this extra confirmation.
-    const approveTx = await inputToken.approve(config.swapRouterAddress, ethers.MaxUint256, gasOverrides);
+    const approveTx = await inputToken.approve(config.swapRouterAddress, ethers.MaxUint256);
     await approveTx.wait(1);
   }
 
   const router = new ethers.Contract(config.swapRouterAddress, routerAbi, wallet);
-  const tx = await router.exactInputSingle(
-    {
-      tokenIn,
-      tokenOut,
-      fee: swapFee,
-      recipient: wallet.address,
-      amountIn,
-      amountOutMinimum: minOut,
-      sqrtPriceLimitX96: 0,
-    },
-    gasOverrides,
-  );
+  const tx = await router.exactInputSingle({
+    tokenIn,
+    tokenOut,
+    fee: swapFee,
+    recipient: wallet.address,
+    amountIn,
+    amountOutMinimum: minOut,
+    sqrtPriceLimitX96: 0,
+  });
   // Don't block Telegram on full receipt — hash is enough for the alert UI.
   tx.wait(1).catch((error) => console.warn(`Swap receipt wait failed: ${error.message}`));
 
