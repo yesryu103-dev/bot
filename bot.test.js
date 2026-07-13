@@ -148,6 +148,14 @@ test("sell percent parser and balance math", () => {
   assert.equal(bot.balancePercent(1000n, 100), 1000n);
 });
 
+test("stale trades are not considered fresh for alerts", () => {
+  const now = Date.parse("2026-07-13T14:27:00+07:00");
+  const fresh = { timestamp: "2026-07-13T14:26:30+07:00" };
+  const stale = { timestamp: "2026-07-13T14:20:00+07:00" };
+  assert.equal(bot.isFreshTrade(fresh, now, 90_000), true);
+  assert.equal(bot.isFreshTrade(stale, now, 90_000), false);
+});
+
 test("main menu looks like a trading dashboard", () => {
   const keyboard = bot.mainMenuKeyboard();
   const labels = keyboard.inline_keyboard.flat().map((button) => button.text);

@@ -33,6 +33,8 @@ const config = {
   maxItems: Number(process.env.MAX_ITEMS || 200),
   minUsd: Number(process.env.MIN_USD || 0),
   minQuoteAmount: 1,
+  // Only alert swaps younger than this (realtime). Stale txs after sleep/redeploy are ignored.
+  maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 90_000),
   dryRun: truthy(process.env.DRY_RUN),
   backfillOnStart: truthy(process.env.BACKFILL_ON_START),
   fetchTxDetails: truthy(process.env.FETCH_TX_DETAILS),
@@ -2620,23 +2622,14 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   applyTrackedPair(trackedPair);
   state.trackedPair = trackedPair;
   state.seen = [];
-  let catchupGroups = [];
 
   try {
+    // Mark current history as seen — do NOT backfill old buys/sells.
     const groups = groupTransfers(await fetchTokenTransfers());
-    const catchupMs = Number(process.env.ALERT_CATCHUP_MS || 5 * 60 * 1000);
-    const now = Date.now();
-    const olderHashes = [];
-    for (const group of groups) {
-      const timestamp = Date.parse(String(group.transfers?.[0]?.timestamp || ""));
-      const trade = classifyFromTransaction(transactionFromTransferGroup(group));
-      if (trade && Number.isFinite(timestamp) && now - timestamp <= catchupMs) {
-        catchupGroups.push(group);
-      } else {
-        olderHashes.push(group.hash);
-      }
-    }
-    addSeen(state, olderHashes);
+    addSeen(
+      state,
+      groups.map((group) => group.hash),
+    );
   } catch (error) {
     console.warn(`Could not warm seen transactions for ${trackedPair.baseSymbol}: ${error.message}`);
   }
@@ -2691,10 +2684,6 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     disable_web_page_preview: "true",
     reply_markup: afterTrackKeyboard(),
   });
-
-  if (catchupGroups.length) {
-    await handleNewGroups(catchupGroups, state);
-  }
 }
 
 const trackJobs = [];
@@ -4508,13 +4497,40 @@ async function processTelegramUpdates(state) {
   saveState(state);
 }
 
+function tradeTimestampMs(txOrGroup) {
+  const raw =
+    txOrGroup?.timestamp ||
+    txOrGroup?.transfers?.[0]?.timestamp ||
+    txOrGroup?.token_transfers?.[0]?.timestamp ||
+    "";
+  const parsed = Date.parse(String(raw));
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function isFreshTrade(txOrGroup, nowMs = Date.now(), maxAgeMs = config.maxAlertAgeMs) {
+  const limit = Number(maxAgeMs);
+  if (!Number.isFinite(limit) || limit <= 0) return true;
+  const ts = tradeTimestampMs(txOrGroup);
+  if (!Number.isFinite(ts)) return false;
+  return nowMs - ts <= limit;
+}
+
 async function handleNewGroups(groups, state) {
   const seen = new Set(state.seen || []);
   const newGroups = groups.filter((group) => !seen.has(group.hash)).reverse();
+  const now = Date.now();
 
   for (const group of newGroups) {
     try {
+      if (!isFreshTrade(group, now)) {
+        continue;
+      }
+
       let tx = config.fetchTxDetails ? await fetchTransaction(group.hash) : transactionFromTransferGroup(group);
+      if (!isFreshTrade(tx, now)) {
+        continue;
+      }
+
       let trade = classifyFromTransaction(tx);
 
       // Partial page groups often miss the WETH leg — refetch full tx once.
@@ -4526,6 +4542,7 @@ async function handleNewGroups(groups, state) {
           !tokens.has(config.quoteTokenAddress);
         if (incomplete) {
           tx = await fetchTransaction(group.hash);
+          if (!isFreshTrade(tx, now)) continue;
           trade = classifyFromTransaction(tx);
         }
       }
@@ -4553,32 +4570,13 @@ async function bootState(state) {
       return;
     }
 
-    // After Render sleep/restart, still alert recent large swaps instead of silently marking seen.
-    const catchupMs = Number(process.env.ALERT_CATCHUP_MS || 5 * 60 * 1000);
-    const now = Date.now();
-    const catchupGroups = [];
-    const olderHashes = [];
-
-    for (const group of groups) {
-      const timestamp = Date.parse(String(group.transfers?.[0]?.timestamp || ""));
-      const tx = transactionFromTransferGroup(group);
-      const trade = classifyFromTransaction(tx);
-      const isRecent = Number.isFinite(timestamp) && now - timestamp <= catchupMs;
-      if (trade && isRecent) {
-        catchupGroups.push(group);
-      } else {
-        olderHashes.push(group.hash);
-      }
-    }
-
-    addSeen(state, olderHashes);
-    saveState(state);
-    console.log(
-      `Booted. Marked ${olderHashes.length} older txs seen; catch-up alerts=${catchupGroups.length} (last ${Math.round(catchupMs / 60000)}m).`,
+    // Realtime only: mark everything currently on-chain as seen, never backfill old txs.
+    addSeen(
+      state,
+      groups.map((group) => group.hash),
     );
-    if (catchupGroups.length) {
-      await handleNewGroups(catchupGroups, state);
-    }
+    saveState(state);
+    console.log(`Booted. Marked ${groups.length} existing transactions as seen (no backfill alerts).`);
   } catch (error) {
     if (!state.seen) state.seen = [];
     saveState(state);
@@ -4680,6 +4678,8 @@ module.exports = {
   buildLpPreview,
   buildPortfolioFromBalances,
   classifyFromTransaction,
+  isFreshTrade,
+  tradeTimestampMs,
   classifyRestrictionError,
   config,
   feeToTickSpacing,
