@@ -115,12 +115,16 @@ test("sniper keyboard exposes buy amounts and sell percents", () => {
   const buttons = keyboard.inline_keyboard.flat();
   const labels = buttons.map((button) => button.text);
   const callbacks = buttons.map((button) => button.callback_data).filter(Boolean);
+  const sellAllRow = keyboard.inline_keyboard.find(
+    (row) => row.length === 1 && row[0].callback_data === "qtrade:SELL:ALL",
+  );
 
   assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]} ${bot.config.quoteSymbol}`));
   assert(labels.includes("Sell 25%"));
   assert(labels.includes("Sell 50%"));
   assert(labels.includes("Sell 70%"));
   assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
+  assert.ok(sellAllRow, "Sell All should be its own full-width row");
   assert(callbacks.includes(`qtrade:BUY:${bot.config.buyAmountsQuote[0]}`));
   assert(callbacks.includes("qtrade:SELL:25%"));
   assert(callbacks.includes("qtrade:SELL:50%"));
@@ -179,14 +183,18 @@ test("v3 swap log decoder flags 2 ETH buy", () => {
 test("main menu looks like a trading dashboard", () => {
   const keyboard = bot.mainMenuKeyboard();
   const labels = keyboard.inline_keyboard.flat().map((button) => button.text);
+  const callbacks = keyboard.inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
   const text = bot.staticMainPanelText();
 
   assert(text.includes(bot.config.botTitle));
+  assert(text.includes("Portfolio"));
+  assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
+  assert(callbacks.includes("qtrade:SELL:ALL"));
   assert(labels.includes("Buy & Sell"));
   assert(labels.includes("Honeypot"));
   assert(labels.includes("Add LP"));
   assert(labels.includes("My LP"));
-  assert(labels.includes("Portfolio"));
+  assert.equal(labels.includes("Portfolio"), false);
   assert(labels.includes("Update Price"));
   assert(labels.includes("Profile"));
   assert(labels.includes("Wallets"));
@@ -396,7 +404,13 @@ test("portfolio keeps liquid tokens and hides junk", () => {
 test("portfolio keyboard exposes Update Price", () => {
   const keyboard = bot.portfolioKeyboard();
   assert.equal(keyboard.inline_keyboard[0][0].callback_data, "portfolio:refresh");
-  assert.ok(bot.mainMenuKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "panel:portfolio"));
+  assert.equal(
+    bot.mainMenuKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "panel:portfolio"),
+    false,
+  );
+  assert.ok(
+    bot.mainMenuKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "portfolio:refresh"),
+  );
 });
 
 test("portfolio wallet prefers state over config", () => {

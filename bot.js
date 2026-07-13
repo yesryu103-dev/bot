@@ -2314,38 +2314,46 @@ async function buildPortfolio(walletAddress, options = {}) {
   return { wallet, ...portfolio };
 }
 
-function portfolioPanelText(portfolio) {
+function portfolioSectionText(portfolio) {
   if (!portfolio?.wallet) {
     return [
-      `<b>Portfolio</b>`,
-      "Chưa có ví. Gửi lệnh:",
-      "<code>/wallet 0xYourAddress</code>",
-      "Hoặc paste địa chỉ ví của bạn.",
+      `<b>📦 Portfolio</b>`,
+      "Chưa có ví. Gửi <code>/wallet 0x...</code> hoặc cấu hình WALLET_ADDRESS.",
     ].join("\n");
   }
 
+  if (portfolio.error) {
+    return [
+      `<b>📦 Portfolio</b>`,
+      `Wallet: <code>${escapeHtml(compactAddress(portfolio.wallet))}</code>`,
+      `Không lấy được giá: ${escapeHtml(portfolio.error)}`,
+      "<i>Bấm Update Price để thử lại.</i>",
+    ].join("\n");
+  }
+
+  const items = Array.isArray(portfolio.items) ? portfolio.items : [];
   const lines = [
-    `<b>Portfolio</b>`,
-    `Wallet: <code>${escapeHtml(compactAddress(portfolio.wallet))}</code>`,
-    `Total: <b>${escapeHtml(formatUsd(portfolio.totalUsd))}</b>`,
-    `Tradeable: <b>${portfolio.items.length}</b> | Hidden junk: <b>${portfolio.skipped}</b>`,
-    `Min value: <b>${escapeHtml(formatUsd(config.minPortfolioValueUsd))}</b> | Min liquidity: <b>${escapeHtml(formatUsd(config.minPortfolioLiquidityUsd))}</b>`,
-    "",
+    `<b>📦 Portfolio</b>`,
+    `Total: <b>${escapeHtml(formatUsd(portfolio.totalUsd))}</b> · Tradeable: <b>${items.length}</b> · Hidden: <b>${Number(portfolio.skipped) || 0}</b>`,
   ];
 
-  if (!portfolio.items.length) {
-    lines.push(`Không còn token nào có balance ≥ ${escapeHtml(formatUsd(config.minPortfolioValueUsd))} và thanh khoản hợp lệ.`);
+  if (!items.length) {
+    lines.push(`Không còn token ≥ ${escapeHtml(formatUsd(config.minPortfolioValueUsd))} với LP hợp lệ.`);
   } else {
-    for (const item of portfolio.items) {
+    for (const item of items) {
       const chart = item.pairUrl ? ` <a href="${escapeHtml(item.pairUrl)}">chart</a>` : "";
       lines.push(
-        `<b>${escapeHtml(item.symbol)}</b> ${escapeHtml(formatTokenAmount(item.amount))} · ${escapeHtml(formatPriceUsd(item.priceUsd))} · <b>${escapeHtml(formatUsd(item.valueUsd))}</b>${chart}`,
+        `↳ <b>${escapeHtml(item.symbol)}</b> ${escapeHtml(formatTokenAmount(item.amount))} · ${escapeHtml(formatPriceUsd(item.priceUsd))} · <b>${escapeHtml(formatUsd(item.valueUsd))}</b>${chart}`,
       );
     }
   }
 
-  lines.push("", "<i>Bấm Update Price để quét lại ví và bỏ token rác / hết thanh khoản.</i>");
+  lines.push("<i>Update Price = quét lại ví.</i>");
   return lines.join("\n");
+}
+
+function portfolioPanelText(portfolio) {
+  return portfolioSectionText(portfolio);
 }
 
 function portfolioKeyboard() {
@@ -2358,6 +2366,56 @@ function portfolioKeyboard() {
       ],
     ],
   };
+}
+
+function cachePortfolioSnapshot(state, portfolio) {
+  if (!portfolio?.wallet) return null;
+  const snapshot = {
+    wallet: portfolio.wallet,
+    items: Array.isArray(portfolio.items) ? portfolio.items : [],
+    skipped: Number(portfolio.skipped) || 0,
+    totalUsd: Number(portfolio.totalUsd) || 0,
+    updatedAt: portfolio.updatedAt || new Date().toISOString(),
+    error: portfolio.error || "",
+  };
+  state.portfolioWallet = portfolio.wallet;
+  state.portfolioSnapshot = snapshot;
+  state.portfolioCache = {
+    totalUsd: snapshot.totalUsd,
+    count: snapshot.items.length,
+    skipped: snapshot.skipped,
+    updatedAt: snapshot.updatedAt,
+  };
+  saveState(state);
+  return snapshot;
+}
+
+async function resolveMenuPortfolio(state = {}, { forceRefresh = false } = {}) {
+  const wallet = getPortfolioWallet(state);
+  if (!wallet) return null;
+
+  const cached = state.portfolioSnapshot;
+  if (
+    !forceRefresh &&
+    cached?.wallet === wallet &&
+    Array.isArray(cached.items) &&
+    !cached.error
+  ) {
+    return cached;
+  }
+
+  try {
+    const portfolio = await buildPortfolio(wallet);
+    return cachePortfolioSnapshot(state, portfolio);
+  } catch (error) {
+    return cachePortfolioSnapshot(state, {
+      wallet,
+      items: [],
+      skipped: 0,
+      totalUsd: 0,
+      error: error.message,
+    });
+  }
 }
 
 function escapeHtml(value) {
@@ -2420,18 +2478,16 @@ function sniperTradeKeyboard() {
     text: `Buy ${amount} ${config.quoteSymbol}`,
     callback_data: `qtrade:BUY:${amount}`,
   }));
-  const sellButtons = [...(config.sellPercents || [25, 50, 70]), 100].map((percent) => {
-    const amount = percent >= 100 ? "ALL" : `${percent}%`;
-    return {
-      text: percent >= 100 ? `Sell All ${config.baseSymbol}` : `Sell ${percent}%`,
-      callback_data: `qtrade:SELL:${amount}`,
-    };
-  });
+  const sellButtons = [...(config.sellPercents || [25, 50, 70])].map((percent) => ({
+    text: `Sell ${percent}%`,
+    callback_data: `qtrade:SELL:${percent}%`,
+  }));
 
   return {
     inline_keyboard: [
       ...chunkButtons(buyButtons, 2),
       ...chunkButtons(sellButtons, 2),
+      [{ text: `Sell All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" }],
       [
         { text: "Refresh", callback_data: "menu" },
         { text: "Chart", url: config.dexscreenPairUrl },
@@ -2467,15 +2523,13 @@ function alertTradeKeyboard() {
 function mainMenuKeyboard() {
   return {
     inline_keyboard: [
+      [{ text: `Sell All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" }],
       [{ text: "Buy & Sell", callback_data: "panel:trade" }],
       [
         { text: "Honeypot", callback_data: "panel:honeypot" },
         { text: "Add LP", callback_data: "panel:lp" },
       ],
-      [
-        { text: "My LP", callback_data: "panel:mylp" },
-        { text: "Portfolio", callback_data: "panel:portfolio" },
-      ],
+      [{ text: "My LP", callback_data: "panel:mylp" }],
       [
         { text: "Update Price", callback_data: "portfolio:refresh" },
         { text: "Profile", callback_data: "panel:profile" },
@@ -2559,13 +2613,19 @@ async function fetchEthPriceUsd() {
   return Number.NaN;
 }
 
-async function mainPanelText() {
+async function mainPanelText(options = {}) {
   const ethUsd = await fetchEthPriceUsd();
   const priceText = Number.isFinite(ethUsd) ? `$${ethUsd.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "n/a";
   const wallet = await getDisplayWallet();
   const balance = await getNativeBalance(wallet);
   const walletText = wallet ? compactAddress(wallet) : "Not configured";
   const balanceText = balance ? `${Number(balance).toPrecision(6)} ETH` : "n/a";
+  const portfolio =
+    options.portfolio !== undefined
+      ? options.portfolio
+      : options.state
+        ? await resolveMenuPortfolio(options.state, { forceRefresh: Boolean(options.refreshPortfolio) })
+        : null;
 
   return [
     `🚀 <b>${escapeHtml(config.botTitle)}</b>`,
@@ -2575,6 +2635,8 @@ async function mainPanelText() {
     `💳 <b>Your Wallet</b>`,
     `↳ <code>${escapeHtml(walletText)}</code>`,
     `↳ <b>Balance:</b> <code>${escapeHtml(balanceText)}</code>`,
+    "",
+    portfolioSectionText(portfolio),
   ].join("\n");
 }
 
@@ -2587,6 +2649,8 @@ function staticMainPanelText() {
     `💳 <b>Your Wallet</b>`,
     `↳ <code>${escapeHtml(config.walletAddress ? compactAddress(config.walletAddress) : "Not configured")}</code>`,
     `↳ <b>Balance:</b> <code>n/a</code>`,
+    "",
+    portfolioSectionText(null),
   ].join("\n");
 }
 
@@ -2683,87 +2747,43 @@ async function sendTradeMenu(chatId = config.telegramChatId) {
   });
 }
 
-async function sendMainMenu(chatId = config.telegramChatId) {
+async function sendMainMenu(chatId = config.telegramChatId, state = loadState()) {
   return telegramRequest("sendMessage", {
     chat_id: chatId,
-    text: await mainPanelText(),
+    text: await mainPanelText({ state }),
     parse_mode: "HTML",
     disable_web_page_preview: "true",
     reply_markup: mainMenuKeyboard(),
   });
 }
 
-async function showPortfolio(chatId, state, { editCallback = null, announce = false } = {}) {
-  const wallet = getPortfolioWallet(state);
-  if (!wallet) {
-    const text = portfolioPanelText(null);
-    if (editCallback) {
-      await editTradeMessage(editCallback, text, portfolioKeyboard());
-      return null;
-    }
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: "true",
-      reply_markup: portfolioKeyboard(),
-    });
-    return null;
-  }
-
+async function showPortfolio(chatId, state, { editCallback = null, announce = false, forceRefresh = true } = {}) {
   if (announce) {
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text: `Đang cập nhật giá portfolio cho:\n<code>${escapeHtml(wallet)}</code>`,
-      parse_mode: "HTML",
-      disable_web_page_preview: "true",
-    });
-  }
-
-  try {
-    const portfolio = await buildPortfolio(wallet);
-    state.portfolioWallet = wallet;
-    state.portfolioCache = {
-      totalUsd: portfolio.totalUsd,
-      count: portfolio.items.length,
-      skipped: portfolio.skipped,
-      updatedAt: portfolio.updatedAt,
-    };
-    saveState(state);
-
-    const text = portfolioPanelText(portfolio);
-    if (editCallback) {
-      await editTradeMessage(editCallback, text, portfolioKeyboard());
-    } else {
+    const wallet = getPortfolioWallet(state);
+    if (wallet) {
       await telegramRequest("sendMessage", {
         chat_id: chatId,
-        text,
+        text: `Đang cập nhật giá portfolio cho:\n<code>${escapeHtml(wallet)}</code>`,
         parse_mode: "HTML",
         disable_web_page_preview: "true",
-        reply_markup: portfolioKeyboard(),
       });
     }
-    return portfolio;
-  } catch (error) {
-    const text = [
-      `<b>Portfolio</b>`,
-      `Wallet: <code>${escapeHtml(compactAddress(wallet))}</code>`,
-      `Không lấy được giá lúc này: ${escapeHtml(error.message)}`,
-      "Thử lại bằng nút Update Price.",
-    ].join("\n");
-    if (editCallback) {
-      await editTradeMessage(editCallback, text, portfolioKeyboard());
-    } else {
-      await telegramRequest("sendMessage", {
-        chat_id: chatId,
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: "true",
-        reply_markup: portfolioKeyboard(),
-      });
-    }
-    return null;
   }
+
+  const text = await mainPanelText({ state, refreshPortfolio: forceRefresh });
+  if (editCallback) {
+    await editTradeMessage(editCallback, text, mainMenuKeyboard());
+    return state.portfolioSnapshot || null;
+  }
+
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: "true",
+    reply_markup: mainMenuKeyboard(),
+  });
+  return state.portfolioSnapshot || null;
 }
 
 async function setPortfolioWallet(walletAddress, state, chatId) {
@@ -4457,7 +4477,7 @@ async function handleCallbackQuery(callbackQuery, state) {
   if (data === "menu") {
     await editTradeMessage(
       callbackQuery,
-      await mainPanelText(),
+      await mainPanelText({ state }),
       mainMenuKeyboard(),
     );
     return;
@@ -4537,7 +4557,10 @@ async function handleCallbackQuery(callbackQuery, state) {
   }
 
   if (data === "panel:portfolio" || data === "portfolio:refresh") {
-    await showPortfolio(chatId, state, { editCallback: callbackQuery });
+    await showPortfolio(chatId, state, {
+      editCallback: callbackQuery,
+      forceRefresh: data === "portfolio:refresh",
+    });
     return;
   }
 
@@ -4569,7 +4592,7 @@ async function handleCallbackQuery(callbackQuery, state) {
         `Portfolio wallet: <code>${escapeHtml(portfolioWallet ? compactAddress(portfolioWallet) : "Not set")}</code>`,
         "",
         "Gắn ví portfolio: <code>/wallet 0x...</code>",
-        "Xem giá: bấm Portfolio hoặc Update Price.",
+        "Xem giá: về Main Menu hoặc bấm Update Price.",
       ].join("\n"),
       portfolioKeyboard(),
     );
@@ -4663,7 +4686,7 @@ async function handleTelegramMessage(message, state) {
   }
 
   if (text === "/start" || text === "/menu") {
-    await sendMainMenu(chatId);
+    await sendMainMenu(chatId, state);
     return;
   }
 
