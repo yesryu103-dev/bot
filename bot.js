@@ -32,7 +32,7 @@ const config = {
   stateFile: process.env.STATE_FILE || "state.json",
   maxItems: Number(process.env.MAX_ITEMS || 50),
   minUsd: Number(process.env.MIN_USD || 0),
-  minQuoteAmount: Number(process.env.MIN_QUOTE_AMOUNT || 0),
+  minQuoteAmount: 1,
   dryRun: truthy(process.env.DRY_RUN),
   backfillOnStart: truthy(process.env.BACKFILL_ON_START),
   fetchTxDetails: truthy(process.env.FETCH_TX_DETAILS),
