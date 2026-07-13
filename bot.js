@@ -884,22 +884,15 @@ function alertTradeKeyboard() {
 function mainMenuKeyboard() {
   return {
     inline_keyboard: [
-      [
-        { text: "Buy & Sell", callback_data: "panel:trade" },
-        { text: "Sniper", callback_data: "panel:trade" },
-      ],
+      [{ text: "Buy & Sell", callback_data: "panel:trade" }],
       [
         { text: "Portfolio", callback_data: "panel:portfolio" },
         { text: "Update Price", callback_data: "portfolio:refresh" },
       ],
-      [
-        { text: "Limit Orders", callback_data: "soon:Limit Orders" },
-        { text: "Copy Trades", callback_data: "soon:Copy Trades" },
-      ],
+      [{ text: "Copy Trades", callback_data: "soon:Copy Trades" }],
       [
         { text: "Profile", callback_data: "panel:profile" },
         { text: "Wallets", callback_data: "panel:wallets" },
-        { text: "Trades", callback_data: "panel:trades" },
       ],
     ],
   };
@@ -1655,19 +1648,6 @@ async function handleCallbackQuery(callbackQuery, state) {
         "Xem giá: bấm Portfolio hoặc Update Price.",
       ].join("\n"),
       portfolioKeyboard(),
-    );
-    return;
-  }
-
-  if (data === "panel:trades") {
-    await editTradeMessage(
-      callbackQuery,
-      [
-        `<b>Trades</b>`,
-        `Live alerts are filtered at <b>${config.minQuoteAmount} ${escapeHtml(config.quoteSymbol)}</b> or above.`,
-        `Use Buy & Sell for quick actions.`,
-      ].join("\n"),
-      mainMenuKeyboard(),
     );
     return;
   }

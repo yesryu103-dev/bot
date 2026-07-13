@@ -142,12 +142,14 @@ test("main menu looks like a trading dashboard", () => {
 
   assert(text.includes(bot.config.botTitle));
   assert(labels.includes("Buy & Sell"));
-  assert(labels.includes("Sniper"));
-  assert(labels.includes("Limit Orders"));
+  assert(labels.includes("Portfolio"));
+  assert(labels.includes("Update Price"));
   assert(labels.includes("Copy Trades"));
   assert(labels.includes("Profile"));
   assert(labels.includes("Wallets"));
-  assert(labels.includes("Trades"));
+  assert.equal(labels.includes("Sniper"), false);
+  assert.equal(labels.includes("Limit Orders"), false);
+  assert.equal(labels.includes("Trades"), false);
 });
 
 test("expired Telegram callback errors are recognized", () => {
