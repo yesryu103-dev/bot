@@ -336,6 +336,10 @@ test("honeypot scorer keeps healthy token SAFE", () => {
     quoteOk: true,
     marketScore: 0,
     marketWarnings: [],
+    holderScore: 0,
+    holderWarnings: [],
+    contractScore: 0,
+    contractWarnings: [],
   });
 
   assert.equal(report.verdict, "SAFE");
@@ -350,6 +354,79 @@ test("dex market risk flags buy-only honeypot pattern", () => {
 
   assert.ok(risk.score >= 45);
   assert.ok(risk.warnings.some((item) => item.toLowerCase().includes("honeypot")));
+});
+
+test("dex market risk flags extreme pump and thin LP vs FDV", () => {
+  const risk = bot.analyzeDexMarketRisk({
+    liquidity: { usd: 1700 },
+    volume: { h24: 2100 },
+    fdv: 64000,
+    marketCap: 64000,
+    priceChange: { h1: 5, h6: 20, h24: 8569 },
+    txns: { h24: { buys: 8, sells: 13 } },
+    labels: ["v4"],
+    boosts: { active: 1000 },
+    pairCreatedAt: Date.now() - 3 * 3600_000,
+    info: { websites: [], socials: [{ url: "https://t.me/x", type: "telegram" }] },
+  });
+
+  assert.ok(risk.score >= 55);
+  assert.ok(risk.warnings.some((item) => item.toLowerCase().includes("pump")));
+});
+
+test("WSB-like multi-pool profile is not treated as SAFE", () => {
+  const market = bot.analyzePairsMarketRisk([
+    {
+      pairAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      liquidity: { usd: 47000 },
+      volume: { h24: 680000 },
+      fdv: 220000,
+      priceChange: { h24: 8569 },
+      txns: { h24: { buys: 5000, sells: 3000 } },
+      labels: ["v3"],
+      boosts: { active: 1000 },
+      info: { websites: [] },
+    },
+    {
+      pairAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      liquidity: { usd: 1700 },
+      volume: { h24: 2100 },
+      fdv: 64000,
+      priceChange: { h24: 167 },
+      txns: { h24: { buys: 8, sells: 13 } },
+      labels: ["v4"],
+      boosts: { active: 1000 },
+      info: { websites: [] },
+    },
+  ]);
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: true,
+    quoteOk: true,
+    marketScore: market.score,
+    marketWarnings: market.warnings,
+    holderScore: 10,
+    holderWarnings: ["Top wallet holds 5.0% supply"],
+    contractScore: 0,
+    contractWarnings: [],
+  });
+
+  assert.notEqual(report.verdict, "SAFE");
+  assert.ok(report.score >= 25);
+});
+
+test("holder concentration flags dominant wallet", () => {
+  const result = bot.analyzeHolderConcentration(
+    [
+      { address: { hash: "0x1111111111111111111111111111111111111111", is_contract: false }, value: "250000" },
+      { address: { hash: "0x2222222222222222222222222222222222222222", is_contract: false }, value: "10000" },
+    ],
+    "1000000",
+    [],
+  );
+  assert.ok(result.top1Pct >= 20);
+  assert.ok(result.score >= 40);
 });
 
 test("probe holder skips pool dead and contracts", () => {

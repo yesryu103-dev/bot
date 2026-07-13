@@ -354,18 +354,66 @@ function analyzeDexMarketRisk(pair) {
   const sells = Number(pair?.txns?.h24?.sells || 0);
   const liquidityUsd = Number(pair?.liquidity?.usd || 0);
   const volume24 = Number(pair?.volume?.h24 || 0);
+  const fdv = Number(pair?.fdv || pair?.marketCap || 0);
+  const priceChangeH1 = Number(pair?.priceChange?.h1 || 0);
+  const priceChangeH6 = Number(pair?.priceChange?.h6 || 0);
+  const priceChangeH24 = Number(pair?.priceChange?.h24 || 0);
+  const labels = (pair?.labels || []).map((label) => String(label).toLowerCase());
+  const createdAt = Number(pair?.pairCreatedAt || 0);
+  const ageHours = createdAt > 0 ? (Date.now() - createdAt) / 3_600_000 : null;
+  const boosts = Number(pair?.boosts?.active || 0);
+  const hasWebsite = Array.isArray(pair?.info?.websites) && pair.info.websites.length > 0;
   const warnings = [];
   let score = 0;
 
   if (!(liquidityUsd > 0)) {
     warnings.push("No withdrawable liquidity on Dexscreener");
     score += 60;
-  } else if (liquidityUsd < 50) {
-    warnings.push(`Very thin liquidity (${formatUsd(liquidityUsd)})`);
-    score += 35;
-  } else if (liquidityUsd < 500) {
+  } else if (liquidityUsd < 1000) {
+    warnings.push(`Dangerously thin liquidity (${formatUsd(liquidityUsd)})`);
+    score += 45;
+  } else if (liquidityUsd < 3000) {
+    warnings.push(`Very thin liquidity (${formatUsd(liquidityUsd)}) — hard to exit`);
+    score += 30;
+  } else if (liquidityUsd < 10000) {
     warnings.push(`Low liquidity (${formatUsd(liquidityUsd)})`);
     score += 15;
+  }
+
+  if (fdv > 0 && liquidityUsd > 0) {
+    const liqRatio = liquidityUsd / fdv;
+    if (liqRatio < 0.02) {
+      warnings.push(`LP/FDV only ${(liqRatio * 100).toFixed(2)}% — classic soft-rug profile`);
+      score += 45;
+    } else if (liqRatio < 0.05) {
+      warnings.push(`Thin LP vs FDV (${(liqRatio * 100).toFixed(1)}%)`);
+      score += 30;
+    } else if (liqRatio < 0.1) {
+      warnings.push(`LP covers just ${(liqRatio * 100).toFixed(1)}% of FDV`);
+      score += 15;
+    }
+  }
+
+  const absH24 = Math.abs(priceChangeH24);
+  const absH6 = Math.abs(priceChangeH6);
+  const absH1 = Math.abs(priceChangeH1);
+  if (absH24 >= 500) {
+    warnings.push(`Extreme 24h price move ${priceChangeH24}% — pump/dump signature`);
+    score += 45;
+  } else if (absH24 >= 200) {
+    warnings.push(`Violent 24h price move ${priceChangeH24}%`);
+    score += 30;
+  } else if (absH24 >= 100) {
+    warnings.push(`Large 24h price move ${priceChangeH24}%`);
+    score += 15;
+  }
+  if (absH6 >= 100) {
+    warnings.push(`Sharp 6h move ${priceChangeH6}%`);
+    score += 15;
+  }
+  if (absH1 >= 40) {
+    warnings.push(`Sharp 1h move ${priceChangeH1}%`);
+    score += 10;
   }
 
   if (buys >= 20 && sells === 0) {
@@ -378,16 +426,175 @@ function analyzeDexMarketRisk(pair) {
 
   if (volume24 <= 0 && liquidityUsd > 0) {
     warnings.push("No 24h volume");
+    score += 8;
+  } else if (liquidityUsd > 0 && volume24 > 0 && volume24 / liquidityUsd >= 20) {
+    warnings.push("Volume >> liquidity (wash / sniper churn risk)");
+    score += 15;
+  }
+
+  if (ageHours !== null) {
+    if (ageHours < 6) {
+      warnings.push(`Brand-new pair (${ageHours.toFixed(1)}h old)`);
+      score += 20;
+    } else if (ageHours < 24) {
+      warnings.push(`Very new pair (${ageHours.toFixed(1)}h old)`);
+      score += 10;
+    }
+  }
+
+  if (labels.includes("v4") && liquidityUsd > 0 && liquidityUsd < 5000) {
+    warnings.push("Thin Uniswap v4 pool — exit risk / chart bait");
+    score += 20;
+  }
+
+  if (boosts >= 100) {
+    warnings.push(`Heavy Dexscreener boosts (${boosts}) — paid hype common on scams`);
+    score += 12;
+  }
+
+  if (!hasWebsite) {
+    warnings.push("No project website on Dexscreener");
     score += 5;
   }
 
-  return { buys, sells, liquidityUsd, volume24, warnings, score };
+  return {
+    buys,
+    sells,
+    liquidityUsd,
+    volume24,
+    fdv,
+    priceChangeH24,
+    ageHours,
+    warnings,
+    score,
+    pairAddress: normalizeAddress(pair?.pairAddress || ""),
+    labels,
+  };
+}
+
+function analyzePairsMarketRisk(pairs) {
+  const list = (Array.isArray(pairs) ? pairs : []).filter(Boolean);
+  if (!list.length) {
+    return {
+      buys: 0,
+      sells: 0,
+      liquidityUsd: 0,
+      volume24: 0,
+      fdv: 0,
+      priceChangeH24: 0,
+      ageHours: null,
+      warnings: ["No Dexscreener pairs to audit"],
+      score: 40,
+      pairAddress: "",
+      labels: [],
+    };
+  }
+
+  let worst = analyzeDexMarketRisk(list[0]);
+  for (const pair of list.slice(1)) {
+    const risk = analyzeDexMarketRisk(pair);
+    if (risk.score > worst.score) worst = risk;
+  }
+
+  const thin = list.filter((pair) => Number(pair?.liquidity?.usd || 0) < 3000);
+  const deep = list.filter((pair) => Number(pair?.liquidity?.usd || 0) >= 20000);
+  if (thin.length && deep.length) {
+    worst = {
+      ...worst,
+      score: worst.score + 12,
+      warnings: [
+        ...worst.warnings,
+        "Multiple pools: thin pool can bait charts while liquidity sits elsewhere",
+      ],
+    };
+  }
+
+  return worst;
+}
+
+function analyzeHolderConcentration(holders, totalSupplyRaw, excludedAddresses = []) {
+  const warnings = [];
+  let score = 0;
+  const totalSupply = BigInt(totalSupplyRaw || "0");
+  if (totalSupply <= 0n) return { score, warnings, top1Pct: 0, top10Pct: 0 };
+
+  const excluded = new Set((excludedAddresses || []).map(normalizeAddress).filter(Boolean));
+  const eoaBalances = [];
+
+  for (const entry of holders || []) {
+    const address = normalizeAddress(entry?.address?.hash || entry?.address);
+    if (!isEvmAddress(address) || isDeadOrZeroAddress(address) || excluded.has(address)) continue;
+    if (entry?.address?.is_contract) continue;
+    const raw = BigInt(entry?.value || "0");
+    if (raw > 0n) eoaBalances.push(raw);
+  }
+
+  eoaBalances.sort((a, b) => (a === b ? 0 : a > b ? -1 : 1));
+  const top1 = eoaBalances[0] || 0n;
+  const top10 = eoaBalances.slice(0, 10).reduce((sum, value) => sum + value, 0n);
+  const top1Pct = Number((top1 * 10000n) / totalSupply) / 100;
+  const top10Pct = Number((top10 * 10000n) / totalSupply) / 100;
+
+  if (top1Pct >= 20) {
+    warnings.push(`Top wallet holds ${top1Pct.toFixed(1)}% supply — dump risk`);
+    score += 40;
+  } else if (top1Pct >= 10) {
+    warnings.push(`Top wallet holds ${top1Pct.toFixed(1)}% supply`);
+    score += 25;
+  } else if (top1Pct >= 5) {
+    warnings.push(`Top wallet holds ${top1Pct.toFixed(1)}% supply`);
+    score += 10;
+  }
+
+  if (top10Pct >= 50) {
+    warnings.push(`Top 10 wallets hold ${top10Pct.toFixed(1)}% supply`);
+    score += 30;
+  } else if (top10Pct >= 35) {
+    warnings.push(`Top 10 wallets hold ${top10Pct.toFixed(1)}% supply`);
+    score += 15;
+  }
+
+  return { score, warnings, top1Pct, top10Pct };
+}
+
+function analyzeContractBytecode(code) {
+  const warnings = [];
+  let score = 0;
+  const normalized = String(code || "").toLowerCase().replace(/^0x/, "");
+  if (!normalized || normalized === "0x") {
+    return { score: 100, warnings: ["No contract bytecode"], hasOwnerSelector: false, hasBlacklistSelector: false, hasPauseSelector: false, hasMintSelector: false };
+  }
+
+  const has = (selector) => normalized.includes(String(selector).toLowerCase().replace(/^0x/, ""));
+  const hasOwnerSelector = has("8da5cb5b") || has("893d20e8");
+  const hasBlacklistSelector = has("f9f92be4") || has("fe575a87") || has("e47d6060");
+  const hasPauseSelector = has("5c975abb") || has("8456cb59") || has("3f4ba83a");
+  const hasMintSelector = has("40c10f19") || has("a0712d68");
+
+  if (hasBlacklistSelector) {
+    warnings.push("Bytecode has blacklist-related selectors");
+    score += 35;
+  }
+  if (hasPauseSelector) {
+    warnings.push("Bytecode has pause/unpause selectors");
+    score += 20;
+  }
+  if (hasMintSelector) {
+    warnings.push("Bytecode has mint selector — supply can inflate");
+    score += 25;
+  }
+  if (hasOwnerSelector) {
+    warnings.push("Ownable-style owner selector present");
+    score += 8;
+  }
+
+  return { score, warnings, hasOwnerSelector, hasBlacklistSelector, hasPauseSelector, hasMintSelector };
 }
 
 function scoreHoneypotFindings(findings) {
-  let score = Number(findings.marketScore || 0);
+  let score = Number(findings.marketScore || 0) + Number(findings.holderScore || 0) + Number(findings.contractScore || 0);
   const dangers = [];
-  const cautions = [...(findings.marketWarnings || [])];
+  const notes = [...(findings.marketWarnings || []), ...(findings.holderWarnings || []), ...(findings.contractWarnings || [])];
 
   if (!findings.hasCode) {
     dangers.push("No contract bytecode at this address");
@@ -402,55 +609,64 @@ function scoreHoneypotFindings(findings) {
     score += 70;
   }
   if (findings.quoteOk === false) {
-    cautions.push(`Sell quote failed: ${findings.quoteError || "no route"}`);
+    notes.push(`V3 sell quote failed: ${findings.quoteError || "no route"}`);
+    score += 20;
+  }
+  if (findings.ownerActive) {
+    dangers.push(`Owner still active: ${findings.ownerAddress}`);
     score += 25;
   }
-  if (findings.transferOk === true) cautions.push("Transfer simulation passed");
-  if (findings.quoteOk === true) cautions.push("Sell quote passed");
+  if (findings.transferOk === true) {
+    notes.push("Transfer simulation passed — NOT proof of safety (soft rugs often pass this)");
+  }
+  if (findings.quoteOk === true) {
+    notes.push("V3 sell quote passed — market/rug risk can still exist");
+  }
 
   let verdict = "SAFE";
-  if (score >= 60 || dangers.some((item) => item.toLowerCase().includes("honeypot") || item.toLowerCase().includes("transfer"))) {
+  if (score >= 55 || findings.transferOk === false) {
     verdict = "DANGER";
   } else if (score >= 25) {
     verdict = "CAUTION";
   }
-
   if (dangers.length && verdict === "SAFE") verdict = "CAUTION";
-  if (findings.transferOk === false) verdict = "DANGER";
 
   return {
     verdict,
     score,
     dangers,
-    notes: cautions.filter((item) => !dangers.includes(item)),
+    notes: [...new Set(notes)],
   };
 }
 
 function formatHoneypotReport(report) {
-  if (!report) return "Honeypot check: unavailable";
+  if (!report) return "Security audit: unavailable";
 
   const icon = report.verdict === "SAFE" ? "✅" : report.verdict === "CAUTION" ? "⚠️" : "🚨";
   const lines = [
-    `<b>Honeypot check</b>: ${icon} <b>${escapeHtml(report.verdict)}</b> (score ${report.score})`,
+    `<b>Security audit</b>: ${icon} <b>${escapeHtml(report.verdict)}</b> (score ${report.score})`,
   ];
 
   for (const danger of report.dangers || []) {
     lines.push(`🚨 ${escapeHtml(danger)}`);
   }
-  for (const note of (report.notes || []).slice(0, 5)) {
+  for (const note of (report.notes || []).slice(0, 6)) {
     lines.push(`• ${escapeHtml(note)}`);
   }
 
   if (report.verdict === "DANGER") {
-    lines.push("<b>Cảnh báo: có dấu hiệu không bán được / scam. Theo dõi vẫn bật, nhưng đừng mua.</b>");
+    lines.push("<b>Cảnh báo: token rủi ro cao / có dấu hiệu scam. Theo dõi vẫn bật — đừng mua.</b>");
+  } else if (report.verdict === "CAUTION") {
+    lines.push("<b>Thận trọng: chưa đủ an toàn để ape. Kiểm tra LP/holder/chart trước khi mua.</b>");
   }
 
   return lines.join("\n");
 }
 
-async function checkTokenHoneypot(tokenAddress, pair = null) {
+async function checkTokenHoneypot(tokenAddress, pair = null, allPairs = null) {
   const { ethers } = require("ethers");
   const token = normalizeAddress(tokenAddress);
+  const pairs = Array.isArray(allPairs) && allPairs.length ? allPairs : pair ? [pair] : [];
   const tracked = pair ? trackedPairFromDexPair(pair, token) : null;
   const pairAddress = tracked?.pairAddress || normalizeAddress(pair?.pairAddress);
   const quoteToken = tracked?.quoteTokenAddress || config.quoteTokenAddress;
@@ -462,7 +678,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null) {
     500,
     100,
   ].filter((value, index, list) => Number.isFinite(value) && value > 0 && list.indexOf(value) === index);
-  const market = analyzeDexMarketRisk(pair);
+  const market = analyzePairsMarketRisk(pairs);
 
   const findings = {
     hasCode: false,
@@ -471,29 +687,74 @@ async function checkTokenHoneypot(tokenAddress, pair = null) {
     transferError: "",
     quoteOk: null,
     quoteError: "",
+    ownerActive: false,
+    ownerAddress: "",
     marketScore: market.score,
     marketWarnings: market.warnings,
+    holderScore: 0,
+    holderWarnings: [],
+    contractScore: 0,
+    contractWarnings: [],
   };
 
   try {
     const provider = new ethers.JsonRpcProvider(config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com");
     const code = await provider.getCode(token);
     findings.hasCode = Boolean(code && code !== "0x");
+    const bytecodeRisk = analyzeContractBytecode(code);
+    findings.contractScore = bytecodeRisk.score;
+    findings.contractWarnings = bytecodeRisk.warnings;
 
+    let totalSupplyRaw = "0";
     try {
       const tokenInfo = await fetchBlockscoutToken(token);
       findings.reputation = String(tokenInfo?.reputation || "").toLowerCase();
+      totalSupplyRaw = String(tokenInfo?.total_supply || "0");
     } catch (error) {
       findings.marketWarnings.push(`Blockscout token info unavailable: ${error.message}`);
     }
 
-    let probeAmount = 0n;
-    let probeFrom = "";
     try {
-      const holders = await fetchTokenHolders(token);
-      const probe = pickProbeHolder(holders, [pairAddress, token, quoteToken, config.swapRouterAddress]);
+      const tokenContract = new ethers.Contract(
+        token,
+        ["function owner() view returns (address)", "function getOwner() view returns (address)"],
+        provider,
+      );
+      let owner = "";
+      try {
+        owner = normalizeAddress(await tokenContract.owner());
+      } catch {
+        try {
+          owner = normalizeAddress(await tokenContract.getOwner());
+        } catch {
+          owner = "";
+        }
+      }
+      if (owner && !isDeadOrZeroAddress(owner)) {
+        findings.ownerActive = true;
+        findings.ownerAddress = owner;
+      }
+    } catch {
+      // ignore
+    }
+
+    let probeAmount = 0n;
+    let holders = [];
+    try {
+      holders = await fetchTokenHolders(token);
+      const excluded = [
+        pairAddress,
+        ...pairs.map((item) => normalizeAddress(item.pairAddress)),
+        token,
+        quoteToken,
+        config.swapRouterAddress,
+      ];
+      const concentration = analyzeHolderConcentration(holders, totalSupplyRaw, excluded);
+      findings.holderScore = concentration.score;
+      findings.holderWarnings = concentration.warnings;
+
+      const probe = pickProbeHolder(holders, excluded);
       if (probe) {
-        probeFrom = probe.address;
         probeAmount = probe.raw / 1000n || 1n;
         const erc20 = new ethers.Contract(
           token,
@@ -501,7 +762,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null) {
           provider,
         );
         await erc20.transfer.staticCall("0x1111111111111111111111111111111111111111", probeAmount, {
-          from: probeFrom,
+          from: probe.address,
         });
         findings.transferOk = true;
       } else {
@@ -549,7 +810,7 @@ async function checkTokenHoneypot(tokenAddress, pair = null) {
       }
     }
   } catch (error) {
-    findings.marketWarnings.push(`RPC honeypot check failed: ${error.message}`);
+    findings.marketWarnings.push(`RPC security check failed: ${error.message}`);
   }
 
   const scored = scoreHoneypotFindings(findings);
@@ -1231,7 +1492,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
   let honeypotReport = null;
   try {
-    honeypotReport = await checkTokenHoneypot(tokenAddress, pair);
+    honeypotReport = await checkTokenHoneypot(tokenAddress, pair, pairs);
   } catch (error) {
     console.warn(`Honeypot check failed for ${tokenAddress}: ${error.message}`);
   }
@@ -1909,7 +2170,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  analyzeContractBytecode,
   analyzeDexMarketRisk,
+  analyzeHolderConcentration,
+  analyzePairsMarketRisk,
   buildPortfolioFromBalances,
   classifyFromTransaction,
   classifyRestrictionError,
