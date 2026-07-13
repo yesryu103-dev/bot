@@ -2206,7 +2206,16 @@ function formatPriceUsd(value) {
 }
 
 function getPortfolioWallet(state = {}) {
-  return normalizeAddress(state.portfolioWallet || config.walletAddress || "");
+  const configured = normalizeAddress(state.portfolioWallet || config.walletAddress || "");
+  if (configured) return configured;
+  if (!config.walletPrivateKey) return "";
+
+  try {
+    const { ethers } = require("ethers");
+    return normalizeAddress(new ethers.Wallet(config.walletPrivateKey).address);
+  } catch {
+    return "";
+  }
 }
 
 function parseWalletBalanceEntry(entry) {
@@ -2327,7 +2336,7 @@ function portfolioSectionText(portfolio) {
       `<b>📦 Portfolio</b>`,
       `Wallet: <code>${escapeHtml(compactAddress(portfolio.wallet))}</code>`,
       `Không lấy được giá: ${escapeHtml(portfolio.error)}`,
-      "<i>Bấm Update Price để thử lại.</i>",
+      "<i>Tools → Update Price để thử lại.</i>",
     ].join("\n");
   }
 
@@ -2348,7 +2357,7 @@ function portfolioSectionText(portfolio) {
     }
   }
 
-  lines.push("<i>Update Price = quét lại ví.</i>");
+  lines.push("<i>Tools → Update Price để quét lại ví.</i>");
   return lines.join("\n");
 }
 
@@ -2559,10 +2568,9 @@ function mainMenuKeyboard() {
     inline_keyboard: [
       ...tradeActionRows(),
       [
-        { text: "Update Price", callback_data: "portfolio:refresh" },
         { text: "Chart", url: config.dexscreenPairUrl },
+        { text: "Tools", callback_data: "panel:tools" },
       ],
-      [{ text: "Tools", callback_data: "panel:tools" }],
     ],
   };
 }
@@ -4628,7 +4636,7 @@ async function handleCallbackQuery(callbackQuery, state) {
         `Portfolio wallet: <code>${escapeHtml(portfolioWallet ? compactAddress(portfolioWallet) : "Not set")}</code>`,
         "",
         "Gắn ví portfolio: <code>/wallet 0x...</code>",
-        "Xem giá: về Main Menu hoặc bấm Update Price.",
+        "Xem giá: Tools → Update Price hoặc /menu.",
       ].join("\n"),
       portfolioKeyboard(),
     );

@@ -195,7 +195,9 @@ test("main menu looks like a trading dashboard", () => {
   assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
   assert(callbacks.includes("qtrade:SELL:ALL"));
   assert(labels.includes("Tools"));
-  assert(labels.includes("Update Price"));
+  assert(labels.includes("Chart"));
+  assert.equal(labels.includes("Update Price"), false);
+  assert.equal(callbacks.includes("portfolio:refresh"), false);
   assert.equal(labels.includes("Buy & Sell"), false);
   assert.equal(labels.includes("Portfolio"), false);
   assert.equal(labels.includes("Honeypot"), false);
@@ -208,11 +210,14 @@ test("main menu looks like a trading dashboard", () => {
   assert.equal(labels.includes("Trades"), false);
 
   const tools = bot.toolsKeyboard().inline_keyboard.flat().map((button) => button.text);
+  const toolCallbacks = bot.toolsKeyboard().inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
   assert(tools.includes("Honeypot"));
   assert(tools.includes("Add LP"));
   assert(tools.includes("My LP"));
   assert(tools.includes("Profile"));
   assert(tools.includes("Wallets"));
+  assert(tools.includes("Update Price"));
+  assert(toolCallbacks.includes("portfolio:refresh"));
 });
 
 test("expired Telegram callback errors are recognized", () => {
@@ -417,11 +422,11 @@ test("portfolio keyboard exposes Update Price", () => {
   const keyboard = bot.portfolioKeyboard();
   assert.equal(keyboard.inline_keyboard[0][0].callback_data, "portfolio:refresh");
   assert.equal(
-    bot.mainMenuKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "panel:portfolio"),
+    bot.mainMenuKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "portfolio:refresh"),
     false,
   );
   assert.ok(
-    bot.mainMenuKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "portfolio:refresh"),
+    bot.toolsKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "portfolio:refresh"),
   );
 });
 
