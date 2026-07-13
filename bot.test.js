@@ -115,16 +115,16 @@ test("sniper keyboard exposes buy amounts and sell percents", () => {
   const buttons = keyboard.inline_keyboard.flat();
   const labels = buttons.map((button) => button.text);
   const callbacks = buttons.map((button) => button.callback_data).filter(Boolean);
-  const sellAllRow = keyboard.inline_keyboard.find(
-    (row) => row.length === 1 && row[0].callback_data === "qtrade:SELL:ALL",
+  const sellRow = keyboard.inline_keyboard.find((row) =>
+    row.some((button) => button.callback_data === "qtrade:SELL:ALL"),
   );
 
-  assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]} ${bot.config.quoteSymbol}`));
-  assert(labels.includes("Sell 25%"));
-  assert(labels.includes("Sell 50%"));
-  assert(labels.includes("Sell 70%"));
-  assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
-  assert.ok(sellAllRow, "Sell All should be its own full-width row");
+  assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]}`));
+  assert(labels.includes("25%"));
+  assert(labels.includes("50%"));
+  assert(labels.includes("70%"));
+  assert(labels.includes(`All ${bot.config.baseSymbol}`));
+  assert.ok(sellRow && sellRow.length === 4, "Sell percents + All should share one row");
   assert(callbacks.includes(`qtrade:BUY:${bot.config.buyAmountsQuote[0]}`));
   assert(callbacks.includes("qtrade:SELL:25%"));
   assert(callbacks.includes("qtrade:SELL:50%"));
@@ -204,11 +204,11 @@ test("main menu looks like a trading dashboard", () => {
 
   assert(text.includes(bot.config.botTitle));
   assert(text.includes("Portfolio"));
-  assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]} ${bot.config.quoteSymbol}`));
-  assert(labels.includes("Sell 25%"));
-  assert(labels.includes("Sell 50%"));
-  assert(labels.includes("Sell 70%"));
-  assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
+  assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]}`));
+  assert(labels.includes("25%"));
+  assert(labels.includes("50%"));
+  assert(labels.includes("70%"));
+  assert(labels.includes(`All ${bot.config.baseSymbol}`));
   assert(callbacks.includes("qtrade:SELL:ALL"));
   assert(labels.includes("Tools"));
   assert(labels.includes("Chart"));
@@ -250,14 +250,17 @@ test("main menu bag buttons open sell panel without changing sniper labels", () 
   const labels = keyboard.inline_keyboard.flat().map((button) => button.text);
   const callbacks = keyboard.inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
 
-  assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
+  assert(labels.includes(`All ${bot.config.baseSymbol}`));
   assert(labels.some((label) => label.startsWith("REPE ")));
   assert(labels.some((label) => label.startsWith("CASHCAT ")));
   assert(callbacks.includes(`bag:${repe}`));
   assert(callbacks.includes(`bag:${cash}`));
 
   const bagKeyboard = bot.bagSellKeyboard(portfolio.bagItems[0]);
+  const bagLabels = bagKeyboard.inline_keyboard.flat().map((button) => button.text);
   const bagCallbacks = bagKeyboard.inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
+  assert(bagLabels.includes("25%"));
+  assert(bagLabels.includes("All"));
   assert(bagCallbacks.includes(`bagsell:${repe}:25%`));
   assert(bagCallbacks.includes(`bagsell:${repe}:ALL`));
   assert(bagCallbacks.includes(`bagtrack:${repe}`));

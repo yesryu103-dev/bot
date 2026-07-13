@@ -2799,19 +2799,18 @@ function chunkButtons(buttons, size = 2) {
 
 function tradeActionRows() {
   const buyButtons = config.buyAmountsQuote.map((amount) => ({
-    text: `Buy ${amount} ${config.quoteSymbol}`,
+    text: `Buy ${amount}`,
     callback_data: `qtrade:BUY:${amount}`,
   }));
-  const sellButtons = [...(config.sellPercents || [25, 50, 70])].map((percent) => ({
-    text: `Sell ${percent}%`,
-    callback_data: `qtrade:SELL:${percent}%`,
-  }));
-
-  return [
-    ...chunkButtons(buyButtons, 2),
-    ...chunkButtons(sellButtons, 2),
-    [{ text: `Sell All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" }],
+  const sellButtons = [
+    ...(config.sellPercents || [25, 50, 70]).map((percent) => ({
+      text: `${percent}%`,
+      callback_data: `qtrade:SELL:${percent}%`,
+    })),
+    { text: `All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" },
   ];
+
+  return [...chunkButtons(buyButtons, 2), ...chunkButtons(sellButtons, 4)];
 }
 
 function sniperTradeKeyboard() {
@@ -2924,16 +2923,20 @@ function bagSellPanelText(item, extras = {}) {
 function bagSellKeyboard(item) {
   const token = normalizeAddress(item?.address);
   const symbol = item?.symbol || "TOKEN";
-  const sellButtons = [...(config.sellPercents || [25, 50, 70])].map((percent) => ({
-    text: `Sell ${percent}%`,
-    callback_data: `bagsell:${token}:${percent}%`,
-  }));
+  const sellButtons = [
+    ...(config.sellPercents || [25, 50, 70]).map((percent) => ({
+      text: `${percent}%`,
+      callback_data: `bagsell:${token}:${percent}%`,
+    })),
+    { text: `All`, callback_data: `bagsell:${token}:ALL` },
+  ];
   return {
     inline_keyboard: [
-      ...chunkButtons(sellButtons, 2),
-      [{ text: `Sell All ${symbol}`, callback_data: `bagsell:${token}:ALL` }],
-      [{ text: `Track ${symbol}`, callback_data: `bagtrack:${token}` }],
-      [{ text: "Main Menu", callback_data: "menu" }],
+      ...chunkButtons(sellButtons, 4),
+      [
+        { text: `Track ${symbol}`, callback_data: `bagtrack:${token}` },
+        { text: "Main Menu", callback_data: "menu" },
+      ],
     ],
   };
 }
@@ -2990,20 +2993,32 @@ async function getDisplayWallet() {
   }
 }
 
+const ethPriceCache = { at: 0, value: Number.NaN };
+let nativeBalanceCache = { at: 0, wallet: "", value: "" };
+
 async function getNativeBalance(walletAddress) {
   if (!config.rpcUrl || !walletAddress) return "";
+  const wallet = normalizeAddress(walletAddress);
+  if (nativeBalanceCache.wallet === wallet && Date.now() - nativeBalanceCache.at < 10_000) {
+    return nativeBalanceCache.value;
+  }
 
   try {
+    const provider = getRpcProvider();
+    const balance = await provider.getBalance(wallet);
     const { ethers } = require("ethers");
-    const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-    const balance = await provider.getBalance(walletAddress);
-    return ethers.formatEther(balance);
+    const value = ethers.formatEther(balance);
+    nativeBalanceCache = { at: Date.now(), wallet, value };
+    return value;
   } catch {
     return "";
   }
 }
 
 async function fetchEthPriceUsd() {
+  if (Date.now() - ethPriceCache.at < 30_000 && Number.isFinite(ethPriceCache.value)) {
+    return ethPriceCache.value;
+  }
   try {
     const weth = normalizeAddress(config.quoteTokenAddress || config.lpWethAddress);
     const pairs = await fetchTokenPairs(weth);
@@ -3019,7 +3034,11 @@ async function fetchEthPriceUsd() {
         return base === weth && (quoteSym.includes("USD") || quoteSym === "USDC" || quoteSym === "USDG");
       })
       .sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0))[0];
-    if (stable && Number(stable.priceUsd) > 0) return Number(stable.priceUsd);
+    if (stable && Number(stable.priceUsd) > 0) {
+      ethPriceCache.at = Date.now();
+      ethPriceCache.value = Number(stable.priceUsd);
+      return ethPriceCache.value;
+    }
 
     // Fallback: any liquid pair involving WETH — derive ETH from token USD / native.
     for (const pair of list.sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0))) {
@@ -3027,28 +3046,40 @@ async function fetchEthPriceUsd() {
       const priceNative = Number(pair.priceNative);
       const base = normalizeAddress(pair.baseToken?.address);
       const quote = normalizeAddress(pair.quoteToken?.address);
-      if (base === weth && priceUsd > 0) return priceUsd;
-      if (quote === weth && priceUsd > 0 && priceNative > 0) return priceUsd / priceNative;
+      if (base === weth && priceUsd > 0) {
+        ethPriceCache.at = Date.now();
+        ethPriceCache.value = priceUsd;
+        return priceUsd;
+      }
+      if (quote === weth && priceUsd > 0 && priceNative > 0) {
+        ethPriceCache.at = Date.now();
+        ethPriceCache.value = priceUsd / priceNative;
+        return ethPriceCache.value;
+      }
     }
   } catch {
     // ignore
   }
-  return Number.NaN;
+  return Number.isFinite(ethPriceCache.value) ? ethPriceCache.value : Number.NaN;
 }
 
 async function mainPanelText(options = {}) {
-  const ethUsd = await fetchEthPriceUsd();
-  const priceText = Number.isFinite(ethUsd) ? `$${ethUsd.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "n/a";
+  const portfolioPromise =
+    options.portfolio !== undefined
+      ? Promise.resolve(options.portfolio)
+      : options.state
+        ? resolveMenuPortfolio(options.state, { forceRefresh: Boolean(options.refreshPortfolio) })
+        : Promise.resolve(null);
+
   const wallet = await getDisplayWallet();
-  const balance = await getNativeBalance(wallet);
+  const [ethUsd, balance, portfolio] = await Promise.all([
+    fetchEthPriceUsd(),
+    getNativeBalance(wallet),
+    portfolioPromise,
+  ]);
+  const priceText = Number.isFinite(ethUsd) ? `$${ethUsd.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "n/a";
   const walletText = wallet ? compactAddress(wallet) : "Not configured";
   const balanceText = balance ? `${Number(balance).toPrecision(6)} ETH` : "n/a";
-  const portfolio =
-    options.portfolio !== undefined
-      ? options.portfolio
-      : options.state
-        ? await resolveMenuPortfolio(options.state, { forceRefresh: Boolean(options.refreshPortfolio) })
-        : null;
 
   return [
     `🚀 <b>${escapeHtml(config.botTitle)}</b>`,
@@ -3171,41 +3202,49 @@ async function sendTradeMenu(chatId = config.telegramChatId) {
 }
 
 async function sendMainMenu(chatId = config.telegramChatId, state = loadState()) {
-  let portfolio = state.portfolioSnapshot || null;
-  try {
-    portfolio = await withTimeout(
-      resolveMenuPortfolio(state, { forceRefresh: false }),
-      8_000,
-      "Menu portfolio",
-    );
-  } catch (error) {
-    console.warn(`sendMainMenu portfolio skipped: ${error.message}`);
-    if (!portfolio) {
-      portfolio = {
-        wallet: getPortfolioWallet(state),
-        items: [],
-        skipped: 0,
-        totalUsd: 0,
-        error: error.message,
-      };
-    }
-  }
+  const portfolio = state.portfolioSnapshot || {
+    wallet: getPortfolioWallet(state),
+    items: [],
+    bagItems: [],
+    skipped: 0,
+    totalUsd: 0,
+  };
 
   let text;
   try {
-    text = await withTimeout(mainPanelText({ state, portfolio }), 10_000, "Main panel");
+    text = await withTimeout(mainPanelText({ state, portfolio }), 3_500, "Main panel");
   } catch (error) {
     text = staticMainPanelText();
     text += `\n\n<i>Menu partial: ${escapeHtml(error.message)}</i>`;
   }
 
-  return telegramRequest("sendMessage", {
+  const sent = await telegramRequest("sendMessage", {
     chat_id: chatId,
     text,
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-    reply_markup: mainMenuKeyboard(portfolio || state.portfolioSnapshot),
+    reply_markup: mainMenuKeyboard(portfolio),
   });
+
+  // Soft-refresh prices in background without blocking /menu.
+  Promise.resolve()
+    .then(async () => {
+      const fresh = await resolveMenuPortfolio(state, { forceRefresh: true });
+      nativeBalanceCache.at = 0;
+      const refreshed = await mainPanelText({ state, portfolio: fresh });
+      if (!sent?.result?.message_id) return;
+      await telegramRequest("editMessageText", {
+        chat_id: chatId,
+        message_id: sent.result.message_id,
+        text: refreshed,
+        parse_mode: "HTML",
+        disable_web_page_preview: "true",
+        reply_markup: mainMenuKeyboard(fresh),
+      }).catch(() => {});
+    })
+    .catch((error) => console.warn(`sendMainMenu refresh skipped: ${error.message}`));
+
+  return sent;
 }
 
 async function showPortfolio(chatId, state, { editCallback = null, announce = false, forceRefresh = true } = {}) {
@@ -4748,19 +4787,37 @@ async function resolveSellContext(tokenAddress, state = {}) {
   if (!isEvmAddress(token)) throw new Error("Invalid bag token address.");
 
   const fromBag = findBagItem(state, token);
-  let pairAddress = normalizeAddress(fromBag?.pairAddress || "");
-  let baseSymbol = fromBag?.symbol || "TOKEN";
-  let pairUrl = fromBag?.pairUrl || "";
-  let priceNative = Number.NaN;
-  let priceUsd = Number(fromBag?.priceUsd);
-  let decimals = Number(fromBag?.decimals);
-  if (!Number.isFinite(decimals) || decimals < 0) decimals = 18;
-
-  let pair = pairAddress ? await fetchDexPairByAddress(pairAddress) : null;
-  if (!pair) {
-    const pairs = await fetchTokenPairs(token);
-    pair = chooseBestPairForToken(pairs, token);
+  if (fromBag?.pairAddress) {
+    let fee = config.uniswapV3Fee;
+    try {
+      const meta = await getPoolMeta(fromBag.pairAddress);
+      if (Number.isFinite(meta.fee) && meta.fee > 0) fee = meta.fee;
+    } catch {
+      // keep fee
+    }
+    return {
+      baseTokenAddress: token,
+      baseSymbol: fromBag.symbol || "TOKEN",
+      quoteTokenAddress: config.quoteTokenAddress,
+      quoteSymbol: config.quoteSymbol,
+      pairAddress: normalizeAddress(fromBag.pairAddress),
+      pairUrl: fromBag.pairUrl || `https://dexscreener.com/robinhood/${fromBag.pairAddress}`,
+      fee,
+      priceNative: Number.NaN,
+      priceUsd: Number(fromBag.priceUsd),
+      decimals: Number(fromBag.decimals) || 18,
+    };
   }
+
+  let pairAddress = "";
+  let baseSymbol = "TOKEN";
+  let pairUrl = "";
+  let priceNative = Number.NaN;
+  let priceUsd = Number.NaN;
+  let decimals = 18;
+
+  const pairs = await fetchTokenPairs(token);
+  const pair = chooseBestPairForToken(pairs, token);
   if (!pair?.pairAddress) {
     throw new Error(`Không tìm thấy pair WETH thanh khoản cho ${baseSymbol}.`);
   }
@@ -4768,7 +4825,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
   const tracked = trackedPairFromDexPair(pair, token);
   pairAddress = tracked.pairAddress;
   baseSymbol = tracked.baseSymbol || baseSymbol;
-  pairUrl = tracked.pairUrl || pairUrl || `https://dexscreener.com/robinhood/${pairAddress}`;
+  pairUrl = tracked.pairUrl || `https://dexscreener.com/robinhood/${pairAddress}`;
   priceNative = Number(pair.priceNative);
   priceUsd = Number(pair.priceUsd);
   const rawBase = normalizeAddress(pair.baseToken?.address);
@@ -4884,17 +4941,48 @@ async function sendTelegram(text, replyMarkup = null) {
   if (!payload.ok) throw new Error(`Telegram error: ${JSON.stringify(payload)}`);
 }
 
+async function renderMainMenuFast(callbackQuery, state, { backgroundRefresh = false } = {}) {
+  const portfolio = state.portfolioSnapshot || {
+    wallet: getPortfolioWallet(state),
+    items: [],
+    bagItems: [],
+    skipped: 0,
+    totalUsd: 0,
+  };
+  let text;
+  try {
+    text = await withTimeout(mainPanelText({ state, portfolio }), 3_500, "Main panel");
+  } catch {
+    text = staticMainPanelText();
+  }
+  await editTradeMessage(callbackQuery, text, mainMenuKeyboard(portfolio));
+
+  if (!backgroundRefresh) return;
+  refreshMainMenuBackground(callbackQuery, state).catch((error) => {
+    console.warn(`Background menu refresh failed: ${error.message}`);
+  });
+}
+
+async function refreshMainMenuBackground(callbackQuery, state) {
+  const portfolio = await resolveMenuPortfolio(state, { forceRefresh: true });
+  nativeBalanceCache.at = 0;
+  const text = await mainPanelText({ state, portfolio });
+  await editTradeMessage(callbackQuery, text, mainMenuKeyboard(portfolio));
+}
+
 async function runConfirmedTrade(callbackQuery, side, amount) {
   const inputSymbol = side === "BUY" ? config.quoteSymbol : config.baseSymbol;
-  await editTradeMessage(
+  const pending = editTradeMessage(
     callbackQuery,
     `<b>Sending ${escapeHtml(side)} ${escapeHtml(config.baseSymbol)}...</b>\nAmount: ${escapeHtml(amount)} ${escapeHtml(inputSymbol)}`,
-  );
+  ).catch(() => {});
 
   try {
     const result = await executeSwap(side, amount);
+    await pending;
     const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
     const state = loadState();
+    nativeBalanceCache.at = 0;
     await editTradeMessage(
       callbackQuery,
       [
@@ -4909,6 +4997,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
       mainMenuKeyboard(state.portfolioSnapshot),
     );
   } catch (error) {
+    await pending;
     const state = loadState();
     await editTradeMessage(
       callbackQuery,
@@ -4931,14 +5020,16 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
     return;
   }
 
-  await editTradeMessage(
+  const pending = editTradeMessage(
     callbackQuery,
     `<b>Sending SELL ${escapeHtml(ctx.baseSymbol)}...</b>\nAmount: ${escapeHtml(amount)} ${escapeHtml(ctx.baseSymbol)}`,
-  );
+  ).catch(() => {});
 
   try {
     const result = await executeSwap("SELL", amount, ctx);
+    await pending;
     const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    nativeBalanceCache.at = 0;
     await editTradeMessage(
       callbackQuery,
       [
@@ -4951,6 +5042,7 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
       mainMenuKeyboard(state.portfolioSnapshot),
     );
   } catch (error) {
+    await pending;
     const item = findBagItem(state, tokenAddress) || {
       address: ctx.baseTokenAddress,
       symbol: ctx.baseSymbol,
@@ -4973,26 +5065,17 @@ async function handleCallbackQuery(callbackQuery, state) {
   }
 
   const data = String(callbackQuery.data || "");
-  await answerCallback(callbackQuery);
+  const toast = data.startsWith("qtrade:") || data.startsWith("bagsell:") || data.startsWith("bagconfirm:")
+    ? "Sending…"
+    : data === "portfolio:refresh"
+      ? "Updating…"
+      : data.startsWith("bag:")
+        ? "Bag…"
+        : "";
+  await answerCallback(callbackQuery, toast);
 
   if (data === "menu") {
-    let portfolio = state.portfolioSnapshot || null;
-    try {
-      portfolio = await withTimeout(
-        resolveMenuPortfolio(state, { forceRefresh: false }),
-        8_000,
-        "Menu portfolio",
-      );
-    } catch (error) {
-      console.warn(`menu portfolio skipped: ${error.message}`);
-    }
-    let text;
-    try {
-      text = await withTimeout(mainPanelText({ state, portfolio }), 10_000, "Main panel");
-    } catch {
-      text = staticMainPanelText();
-    }
-    await editTradeMessage(callbackQuery, text, mainMenuKeyboard(portfolio || state.portfolioSnapshot));
+    await renderMainMenuFast(callbackQuery, state, { backgroundRefresh: true });
     return;
   }
 
@@ -5016,6 +5099,13 @@ async function handleCallbackQuery(callbackQuery, state) {
   }
 
   if (data === "panel:portfolio" || data === "portfolio:refresh") {
+    if (data === "portfolio:refresh") {
+      await editTradeMessage(
+        callbackQuery,
+        `${staticMainPanelText()}\n\n<i>Đang cập nhật portfolio…</i>`,
+        mainMenuKeyboard(state.portfolioSnapshot),
+      ).catch(() => {});
+    }
     await showPortfolio(chatId, state, {
       editCallback: callbackQuery,
       forceRefresh: data === "portfolio:refresh",
@@ -5066,11 +5156,7 @@ async function handleCallbackQuery(callbackQuery, state) {
 
   if (data.startsWith("bag:")) {
     const token = normalizeAddress(data.slice("bag:".length));
-    let item = findBagItem(state, token);
-    if (!item) {
-      await resolveMenuPortfolio(state, { forceRefresh: true });
-      item = findBagItem(state, token);
-    }
+    const item = findBagItem(state, token);
     if (!item) {
       await editTradeMessage(
         callbackQuery,
