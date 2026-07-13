@@ -139,8 +139,8 @@ test("slippage default is two percent", () => {
 test("sell all trades immediately even when one-tap mode is off", () => {
   assert.equal(bot.config.oneTapTrade, false);
   assert.equal(bot.shouldTradeImmediately("SELL", "ALL"), true);
-  assert.equal(bot.shouldTradeImmediately("SELL", "25%"), false);
-  assert.equal(bot.shouldTradeImmediately("BUY", "0.01"), false);
+  assert.equal(bot.shouldTradeImmediately("SELL", "25%"), true);
+  assert.equal(bot.shouldTradeImmediately("BUY", "0.01"), true);
 });
 
 test("sell percent parser and balance math", () => {

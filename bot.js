@@ -209,10 +209,16 @@ async function fetchTokenTransfers() {
 }
 
 const poolMetaCache = new Map();
+let cachedRpcProvider = null;
 
 function getRpcProvider() {
   const { ethers } = require("ethers");
-  return new ethers.JsonRpcProvider(config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com");
+  const url = config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com";
+  if (!cachedRpcProvider || cachedRpcProvider._walletRpcUrl !== url) {
+    cachedRpcProvider = new ethers.JsonRpcProvider(url);
+    cachedRpcProvider._walletRpcUrl = url;
+  }
+  return cachedRpcProvider;
 }
 
 async function getPoolMeta(pairAddress, provider = null) {
@@ -574,7 +580,198 @@ function isEvmAddress(value) {
 }
 
 function shouldTradeImmediately(side, amount) {
-  return config.oneTapTrade || (side === "SELL" && String(amount).toUpperCase() === "ALL");
+  // One-tap for every inline trade button — confirm step was the main perceived delay.
+  return true;
+}
+
+async function quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, preferredFee) {
+  const { ethers } = require("ethers");
+  const quoter = new ethers.Contract(
+    config.quoterAddress,
+    [
+      "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
+    ],
+    provider,
+  );
+  const feeCandidates = [preferredFee, config.uniswapV3Fee, 10000, 3000, 500, 100].filter(
+    (value, index, list) => Number.isFinite(value) && value > 0 && list.indexOf(value) === index,
+  );
+  let lastError = "";
+  for (const fee of feeCandidates) {
+    try {
+      const result = await quoter.quoteExactInputSingle.staticCall({
+        tokenIn,
+        tokenOut,
+        amountIn,
+        fee,
+        sqrtPriceLimitX96: 0,
+      });
+      const amountOut = BigInt(result.amountOut ?? result[0]);
+      if (amountOut > 0n) return { amountOut, fee };
+      lastError = "zero amount out";
+    } catch (error) {
+      lastError = error.shortMessage || error.message || String(error);
+    }
+  }
+  throw new Error(lastError || "quoter failed");
+}
+
+async function ensureWethForBuy(wallet, wethAddress, amountIn) {
+  const { ethers } = require("ethers");
+  const weth = new ethers.Contract(
+    wethAddress,
+    [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function deposit() payable",
+    ],
+    wallet,
+  );
+  let balance = await weth.balanceOf(wallet.address);
+  if (balance >= amountIn) {
+    return { wrapped: 0n, balance };
+  }
+
+  const shortfall = amountIn - balance;
+  const nativeBalance = await wallet.provider.getBalance(wallet.address);
+  const gasReserve = ethers.parseEther("0.003");
+  if (nativeBalance < shortfall + gasReserve) {
+    throw new Error(
+      [
+        `Not enough ETH/WETH for buy.`,
+        `Need ${ethers.formatEther(amountIn)} WETH.`,
+        `Have ${ethers.formatEther(balance)} WETH + ${ethers.formatEther(nativeBalance)} ETH.`,
+        `Keep ~0.003 ETH for gas.`,
+      ].join(" "),
+    );
+  }
+
+  const depositTx = await weth.deposit({ value: shortfall });
+  await depositTx.wait(1);
+  balance = await weth.balanceOf(wallet.address);
+  if (balance < amountIn) {
+    throw new Error(
+      `Wrap ETH→WETH failed. Still have ${ethers.formatEther(balance)} WETH after deposit.`,
+    );
+  }
+  return { wrapped: shortfall, balance };
+}
+
+async function executeSwap(side, amountText, overrides = {}) {
+  if (!config.tradeEnabled) {
+    throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 sau khi cấu hình RPC_URL và WALLET_PRIVATE_KEY.");
+  }
+
+  if (!config.rpcUrl || !config.walletPrivateKey) {
+    throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
+  }
+
+  const baseTokenAddress = normalizeAddress(overrides.baseTokenAddress || config.baseTokenAddress);
+  const baseSymbol = overrides.baseSymbol || config.baseSymbol;
+  const quoteTokenAddress = normalizeAddress(overrides.quoteTokenAddress || config.quoteTokenAddress);
+  const quoteSymbol = overrides.quoteSymbol || config.quoteSymbol;
+  let swapFee = Number(overrides.fee || config.uniswapV3Fee);
+  const decimalsIn = Number.isFinite(Number(overrides.decimals)) ? Number(overrides.decimals) : 18;
+  const decimalsOut = 18;
+
+  const { ethers } = require("ethers");
+  const provider = getRpcProvider();
+  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
+  const tokenIn = side === "BUY" ? quoteTokenAddress : baseTokenAddress;
+  const tokenOut = side === "BUY" ? baseTokenAddress : quoteTokenAddress;
+  const tokenInSymbol = side === "BUY" ? quoteSymbol : baseSymbol;
+  const tokenOutSymbol = side === "BUY" ? baseSymbol : quoteSymbol;
+
+  const erc20Abi = [
+    "function allowance(address owner,address spender) view returns (uint256)",
+    "function approve(address spender,uint256 amount) returns (bool)",
+    "function balanceOf(address owner) view returns (uint256)",
+  ];
+  const routerAbi = [
+    "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
+  ];
+  const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
+  const pairAddress = normalizeAddress(overrides.pairAddress || config.pairAddress || "");
+
+  let amountIn;
+  const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
+  if (side === "SELL" && sellPercent !== null) {
+    const balance = await inputToken.balanceOf(wallet.address);
+    amountIn = balancePercent(balance, sellPercent);
+    if (amountIn <= 0n) throw new Error(`No ${baseSymbol} balance to sell.`);
+    amountText = ethers.formatUnits(amountIn, decimalsIn);
+  } else {
+    amountIn = ethers.parseUnits(String(amountText), decimalsIn);
+  }
+
+  // Resolve fee + quote minOut + read allowance in parallel (skip slow Dexscreener).
+  const metaPromise = isEvmAddress(pairAddress)
+    ? getPoolMeta(pairAddress, provider).catch(() => null)
+    : Promise.resolve(null);
+  const allowancePromise = inputToken.allowance(wallet.address, config.swapRouterAddress);
+
+  const meta = await metaPromise;
+  if (meta) {
+    const matches =
+      (meta.token0 === tokenIn && meta.token1 === tokenOut) ||
+      (meta.token0 === tokenOut && meta.token1 === tokenIn);
+    if (matches && Number.isFinite(meta.fee) && meta.fee > 0) swapFee = meta.fee;
+  }
+
+  // Wrap ETH before quoting spends? Quote doesn't need WETH balance. Wrap in parallel with quote when needed.
+  let wrappedEth = 0n;
+  const needsWrapCheck =
+    side === "BUY" && tokenIn === normalizeAddress(config.quoteTokenAddress || config.lpWethAddress);
+
+  const [quoted, allowance, wrapResult] = await Promise.all([
+    quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, swapFee),
+    allowancePromise,
+    needsWrapCheck ? ensureWethForBuy(wallet, tokenIn, amountIn) : Promise.resolve(null),
+  ]);
+
+  swapFee = quoted.fee;
+  const minOut = (quoted.amountOut * BigInt(10000 - config.slippageBps)) / 10000n;
+  if (wrapResult) wrappedEth = wrapResult.wrapped;
+
+  const balance = await inputToken.balanceOf(wallet.address);
+  if (balance < amountIn) {
+    const nativeBalance = await provider.getBalance(wallet.address);
+    throw new Error(
+      [
+        `Not enough ${tokenInSymbol}. Need ${amountText}, wallet has ${ethers.formatUnits(balance, decimalsIn)} ${tokenInSymbol}`,
+        side === "BUY" ? `+ ${ethers.formatEther(nativeBalance)} ETH native` : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
+    );
+  }
+
+  if (allowance < amountIn) {
+    // Max approve once so later trades skip this extra confirmation.
+    const approveTx = await inputToken.approve(config.swapRouterAddress, ethers.MaxUint256);
+    await approveTx.wait(1);
+  }
+
+  const router = new ethers.Contract(config.swapRouterAddress, routerAbi, wallet);
+  const tx = await router.exactInputSingle({
+    tokenIn,
+    tokenOut,
+    fee: swapFee,
+    recipient: wallet.address,
+    amountIn,
+    amountOutMinimum: minOut,
+    sqrtPriceLimitX96: 0,
+  });
+  // Don't block Telegram on full receipt — hash is enough for the alert UI.
+  tx.wait(1).catch((error) => console.warn(`Swap receipt wait failed: ${error.message}`));
+
+  return {
+    hash: tx.hash,
+    wallet: wallet.address,
+    tokenInSymbol,
+    tokenOutSymbol,
+    minOut: ethers.formatUnits(minOut, decimalsOut),
+    wrappedEth: wrappedEth > 0n ? ethers.formatEther(wrappedEth) : "",
+  };
 }
 
 function parseSellPercent(amountText) {
@@ -4654,210 +4851,6 @@ async function estimateMinimumOut(side, amountText, overrides = {}) {
     sellPercent: side === "SELL" ? parseSellPercent(amountText) : null,
     baseSymbol,
     quoteSymbol: overrides.quoteSymbol || config.quoteSymbol,
-  };
-}
-
-async function ensureWethForBuy(wallet, wethAddress, amountIn) {
-  const { ethers } = require("ethers");
-  const weth = new ethers.Contract(
-    wethAddress,
-    [
-      "function balanceOf(address owner) view returns (uint256)",
-      "function deposit() payable",
-    ],
-    wallet,
-  );
-  let balance = await weth.balanceOf(wallet.address);
-  if (balance >= amountIn) {
-    return { wrapped: 0n, balance };
-  }
-
-  const shortfall = amountIn - balance;
-  const nativeBalance = await wallet.provider.getBalance(wallet.address);
-  const gasReserve = ethers.parseEther("0.003");
-  if (nativeBalance < shortfall + gasReserve) {
-    throw new Error(
-      [
-        `Not enough ETH/WETH for buy.`,
-        `Need ${ethers.formatEther(amountIn)} WETH.`,
-        `Have ${ethers.formatEther(balance)} WETH + ${ethers.formatEther(nativeBalance)} ETH.`,
-        `Keep ~0.003 ETH for gas.`,
-      ].join(" "),
-    );
-  }
-
-  const depositTx = await weth.deposit({ value: shortfall });
-  await depositTx.wait();
-  balance = await weth.balanceOf(wallet.address);
-  if (balance < amountIn) {
-    throw new Error(
-      `Wrap ETH→WETH failed. Still have ${ethers.formatEther(balance)} WETH after deposit.`,
-    );
-  }
-  return { wrapped: shortfall, balance };
-}
-
-async function executeSwap(side, amountText, overrides = {}) {
-  if (!config.tradeEnabled) {
-    throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 sau khi cấu hình RPC_URL và WALLET_PRIVATE_KEY.");
-  }
-
-  if (!config.rpcUrl || !config.walletPrivateKey) {
-    throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
-  }
-
-  const baseTokenAddress = normalizeAddress(overrides.baseTokenAddress || config.baseTokenAddress);
-  const baseSymbol = overrides.baseSymbol || config.baseSymbol;
-  const quoteTokenAddress = normalizeAddress(overrides.quoteTokenAddress || config.quoteTokenAddress);
-  const quoteSymbol = overrides.quoteSymbol || config.quoteSymbol;
-  const fee = Number(overrides.fee || config.uniswapV3Fee);
-  const decimalsIn = Number.isFinite(Number(overrides.decimals)) ? Number(overrides.decimals) : 18;
-  const decimalsOut = 18;
-
-  const { ethers } = require("ethers");
-  const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
-  const tokenIn = side === "BUY" ? quoteTokenAddress : baseTokenAddress;
-  const tokenOut = side === "BUY" ? baseTokenAddress : quoteTokenAddress;
-  const tokenInSymbol = side === "BUY" ? quoteSymbol : baseSymbol;
-  const tokenOutSymbol = side === "BUY" ? baseSymbol : quoteSymbol;
-  let amountIn;
-  const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
-  if (side === "SELL" && sellPercent !== null) {
-    const tokenBalance = await getWalletTokenBalance(baseTokenAddress);
-    amountIn = balancePercent(tokenBalance.balance, sellPercent);
-    if (amountIn <= 0n) throw new Error(`No ${baseSymbol} balance to sell.`);
-    amountText = ethers.formatUnits(amountIn, decimalsIn);
-  } else {
-    amountIn = ethers.parseUnits(amountText, decimalsIn);
-  }
-  const quote = await estimateMinimumOut(side, amountText, {
-    ...overrides,
-    baseTokenAddress,
-    baseSymbol,
-    quoteTokenAddress,
-    quoteSymbol,
-    decimals: decimalsIn,
-  });
-  const amountOutMinimum = ethers.parseUnits(numberToDecimalString(quote.minOut, decimalsOut), decimalsOut);
-
-  // Buys spend WETH. If wallet only has native ETH, wrap the shortfall first.
-  let wrappedEth = 0n;
-  if (side === "BUY" && tokenIn === normalizeAddress(config.quoteTokenAddress || config.lpWethAddress)) {
-    const ensured = await ensureWethForBuy(wallet, tokenIn, amountIn);
-    wrappedEth = ensured.wrapped;
-  }
-
-  const erc20Abi = [
-    "function allowance(address owner,address spender) view returns (uint256)",
-    "function approve(address spender,uint256 amount) returns (bool)",
-    "function balanceOf(address owner) view returns (uint256)",
-  ];
-  // Robinhood uses Uniswap SwapRouter02 (no deadline field).
-  const routerAbi = [
-    "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
-  ];
-
-  const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
-  const balance = await inputToken.balanceOf(wallet.address);
-  if (balance < amountIn) {
-    const nativeBalance = await provider.getBalance(wallet.address);
-    throw new Error(
-      [
-        `Not enough ${tokenInSymbol}. Need ${amountText}, wallet has ${ethers.formatUnits(balance, decimalsIn)} ${tokenInSymbol}`,
-        side === "BUY" ? `+ ${ethers.formatEther(nativeBalance)} ETH native` : "",
-      ]
-        .filter(Boolean)
-        .join(" "),
-    );
-  }
-
-  const allowance = await inputToken.allowance(wallet.address, config.swapRouterAddress);
-  if (allowance < amountIn) {
-    const approveTx = await inputToken.approve(config.swapRouterAddress, amountIn);
-    await approveTx.wait();
-  }
-
-  // Prefer live pool fee + quoter minOut when possible.
-  let swapFee = fee;
-  const pairAddress = normalizeAddress(overrides.pairAddress || config.pairAddress || "");
-  if (isEvmAddress(pairAddress)) {
-    try {
-      const meta = await getPoolMeta(pairAddress, provider);
-      const matches =
-        (meta.token0 === tokenIn && meta.token1 === tokenOut) ||
-        (meta.token0 === tokenOut && meta.token1 === tokenIn);
-      if (matches && Number.isFinite(meta.fee) && meta.fee > 0) swapFee = meta.fee;
-    } catch {
-      // keep fee
-    }
-  }
-
-  let minOut = amountOutMinimum;
-  try {
-    const quoter = new ethers.Contract(
-      config.quoterAddress,
-      [
-        "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
-      ],
-      provider,
-    );
-    const feeCandidates = [swapFee, 10000, 3000, 500, 100].filter(
-      (value, index, list) => Number.isFinite(value) && value > 0 && list.indexOf(value) === index,
-    );
-    let quoted = 0n;
-    let usedFee = swapFee;
-    let lastQuoteError = "";
-    for (const tryFee of feeCandidates) {
-      try {
-        const result = await quoter.quoteExactInputSingle.staticCall({
-          tokenIn,
-          tokenOut,
-          amountIn,
-          fee: tryFee,
-          sqrtPriceLimitX96: 0,
-        });
-        const amountOut = BigInt(result.amountOut ?? result[0]);
-        if (amountOut <= 0n) {
-          lastQuoteError = "zero amount out";
-          continue;
-        }
-        quoted = amountOut;
-        usedFee = tryFee;
-        break;
-      } catch (error) {
-        lastQuoteError = error.shortMessage || error.message || String(error);
-      }
-    }
-    if (quoted <= 0n) {
-      throw new Error(`Quoter failed for ${tokenInSymbol}->${tokenOutSymbol}: ${lastQuoteError}`);
-    }
-    swapFee = usedFee;
-    minOut = (quoted * BigInt(10000 - config.slippageBps)) / 10000n;
-  } catch (error) {
-    if (String(error.message || "").startsWith("Quoter failed")) throw error;
-    console.warn(`Quoter unavailable, using Dex estimate minOut: ${error.message}`);
-  }
-
-  const router = new ethers.Contract(config.swapRouterAddress, routerAbi, wallet);
-  const params = {
-    tokenIn,
-    tokenOut,
-    fee: swapFee,
-    recipient: wallet.address,
-    amountIn,
-    amountOutMinimum: minOut,
-    sqrtPriceLimitX96: 0,
-  };
-
-  const tx = await router.exactInputSingle(params);
-  return {
-    hash: tx.hash,
-    wallet: wallet.address,
-    tokenInSymbol,
-    tokenOutSymbol,
-    minOut: numberToDecimalString(Number(ethers.formatUnits(minOut, decimalsOut)), 8),
-    wrappedEth: wrappedEth > 0n ? ethers.formatEther(wrappedEth) : "",
   };
 }
 
