@@ -39,7 +39,8 @@ const config = {
   buyWhenBaseLeavesPool:
     process.env.BUY_WHEN_BASE_LEAVES_POOL === undefined ? true : truthy(process.env.BUY_WHEN_BASE_LEAVES_POOL),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
-  telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
+  telegramChatIds: parseTelegramChatIds(process.env.TELEGRAM_CHAT_ID || ""),
+  telegramChatId: parseTelegramChatIds(process.env.TELEGRAM_CHAT_ID || "")[0] || "",
   botTitle: process.env.BOT_TITLE || "REPETradingBot",
   botTagline: process.env.BOT_TAGLINE || "Your Gateway to Robinhood DeFi",
   telegramUrl: process.env.PROJECT_TELEGRAM_URL || "",
@@ -68,6 +69,13 @@ function parseAmountOptions(value) {
     .filter(Boolean);
 }
 
+function parseTelegramChatIds(value) {
+  return String(value || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
 function normalizeAddress(value) {
   return String(value || "").toLowerCase();
 }
@@ -77,21 +85,44 @@ function addressOf(value) {
   return normalizeAddress(value);
 }
 
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      "user-agent": "robinhood-uniswap-telegram-bot/1.0",
-      ...(options.headers || {}),
-    },
-  });
+async function fetchJson(url, options = {}, retries = 3) {
+  let lastError;
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP ${response.status} ${response.statusText}: ${text.slice(0, 200)}`);
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          "user-agent": "robinhood-uniswap-telegram-bot/1.0",
+          ...(options.headers || {}),
+        },
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        const error = new Error(`HTTP ${response.status} ${response.statusText}: ${text.slice(0, 200)}`);
+        if (response.status >= 500 && attempt < retries) {
+          lastError = error;
+          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+          continue;
+        }
+        throw error;
+      }
+
+      return response.json();
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || "");
+      const retryable = message.includes("500") || message.includes("502") || message.includes("503") || message.includes("504");
+      if (retryable && attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+      throw error;
+    }
   }
 
-  return response.json();
+  throw lastError;
 }
 
 async function fetchTokenTransfers() {
@@ -285,7 +316,33 @@ function telegramUrl(method) {
 }
 
 function isAuthorizedChat(chatId) {
-  return String(chatId) === String(config.telegramChatId);
+  if (chatId === undefined || chatId === null) return false;
+  return config.telegramChatIds.includes(String(chatId));
+}
+
+const unauthorizedReplyCache = new Set();
+
+async function notifyUnauthorizedChat(chatId) {
+  const key = String(chatId);
+  if (unauthorizedReplyCache.has(key)) return;
+  unauthorizedReplyCache.add(key);
+
+  try {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: [
+        "Chat này chưa được phép dùng bot.",
+        `Chat ID của bạn: <code>${escapeHtml(key)}</code>`,
+        "Thêm ID này vào TELEGRAM_CHAT_ID trên Render (có thể nối nhiều ID bằng dấu phẩy).",
+        `Bot hiện chỉ chấp nhận: <code>${escapeHtml(config.telegramChatIds.join(", ") || "(chưa cấu hình)")}</code>`,
+      ].join("\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+    });
+    console.warn(`Ignored unauthorized chat ${key}; sent setup hint once.`);
+  } catch (error) {
+    console.warn(`Ignored unauthorized chat ${key}; could not send setup hint: ${error.message}`);
+  }
 }
 
 function chunkButtons(buttons, size = 2) {
@@ -478,6 +535,30 @@ function maskToken(token) {
   return `${botId}:${secret.slice(0, 4)}...${secret.slice(-4)}`;
 }
 
+function isPollingConflictError(error) {
+  const message = String(error?.message || "");
+  return message.includes("409") || message.includes("Conflict") || message.includes("terminated by other getUpdates");
+}
+
+async function prepareTelegramPolling() {
+  try {
+    const info = await telegramRequest("getWebhookInfo", {});
+    const webhookUrl = info.result?.url || "";
+    if (webhookUrl) {
+      console.log(`Telegram webhook was set (${webhookUrl}); removing it so polling can receive updates.`);
+    }
+  } catch (error) {
+    console.warn(`Could not read Telegram webhook info: ${error.message}`);
+  }
+
+  try {
+    await telegramRequest("deleteWebhook", { drop_pending_updates: false });
+    console.log("Telegram polling ready (webhook cleared).");
+  } catch (error) {
+    console.warn(`Could not clear Telegram webhook: ${error.message}`);
+  }
+}
+
 async function validateTelegramConfig() {
   if (config.dryRun) return;
   if (isPlaceholderTelegramToken(config.telegramBotToken)) {
@@ -485,12 +566,13 @@ async function validateTelegramConfig() {
       "Invalid TELEGRAM_BOT_TOKEN: value is empty or still uses 123456:replace_me. Set the real BotFather token in Render Environment.",
     );
   }
-  if (!config.telegramChatId) throw new Error("Missing TELEGRAM_CHAT_ID.");
+  if (!config.telegramChatIds.length) throw new Error("Missing TELEGRAM_CHAT_ID.");
 
   try {
     const payload = await telegramRequest("getMe", {});
     const username = payload.result?.username ? `@${payload.result.username}` : payload.result?.first_name || "unknown bot";
     console.log(`Telegram token OK for ${username}; token ${maskToken(config.telegramBotToken)}.`);
+    console.log(`Telegram commands/alerts limited to chat ID(s): ${config.telegramChatIds.join(", ")}`);
   } catch (error) {
     if (String(error.message).includes("401") || String(error.message).includes("Unauthorized")) {
       throw new Error(
@@ -499,6 +581,8 @@ async function validateTelegramConfig() {
     }
     throw error;
   }
+
+  await prepareTelegramPolling();
 }
 
 async function sendTradeMenu(chatId = config.telegramChatId) {
@@ -901,7 +985,8 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
 async function handleCallbackQuery(callbackQuery) {
   const chatId = callbackQuery.message?.chat?.id;
   if (!isAuthorizedChat(chatId)) {
-    await answerCallback(callbackQuery, "Unauthorized chat.");
+    await answerCallback(callbackQuery, `Unauthorized chat ${chatId}. Add it to TELEGRAM_CHAT_ID.`);
+    await notifyUnauthorizedChat(chatId);
     return;
   }
 
@@ -1012,9 +1097,13 @@ async function handleCallbackQuery(callbackQuery) {
 
 async function handleTelegramMessage(message, state) {
   const chatId = message.chat?.id;
-  if (!isAuthorizedChat(chatId)) return;
+  if (!isAuthorizedChat(chatId)) {
+    await notifyUnauthorizedChat(chatId);
+    return;
+  }
 
   const text = String(message.text || "").trim();
+  console.log(`Telegram message from chat ${chatId}: ${text.slice(0, 80) || "(no text)"}`);
   if (isEvmAddress(text)) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
@@ -1051,15 +1140,19 @@ async function handleTelegramMessage(message, state) {
 }
 
 async function processTelegramUpdates(state) {
-  if (!config.telegramBotToken || !config.telegramChatId || config.dryRun) return;
+  if (!config.telegramBotToken || !config.telegramChatIds.length || config.dryRun) return;
 
   const payload = await telegramRequest("getUpdates", {
     offset: Number(state.telegramOffset || 0),
-    timeout: 0,
+    timeout: 25,
     allowed_updates: ["message", "callback_query"],
   });
+  const updates = payload.result || [];
+  if (updates.length > 0) {
+    console.log(`Received ${updates.length} Telegram update(s).`);
+  }
 
-  for (const update of payload.result || []) {
+  for (const update of updates) {
     state.telegramOffset = update.update_id + 1;
     try {
       if (update.message) await handleTelegramMessage(update.message, state);
@@ -1100,18 +1193,25 @@ async function handleNewGroups(groups, state) {
 }
 
 async function bootState(state) {
-  const groups = groupTransfers(await fetchTokenTransfers());
-  if (config.backfillOnStart) {
-    await handleNewGroups(groups, state);
-    return;
-  }
+  try {
+    const groups = groupTransfers(await fetchTokenTransfers());
+    if (config.backfillOnStart) {
+      await handleNewGroups(groups, state);
+      return;
+    }
 
-  addSeen(
-    state,
-    groups.map((group) => group.hash),
-  );
-  saveState(state);
-  console.log(`Booted. Marked ${groups.length} existing transactions as seen.`);
+    addSeen(
+      state,
+      groups.map((group) => group.hash),
+    );
+    saveState(state);
+    console.log(`Booted. Marked ${groups.length} existing transactions as seen.`);
+  } catch (error) {
+    if (!state.seen) state.seen = [];
+    saveState(state);
+    console.warn(`Blockscout unavailable during boot: ${error.message}`);
+    console.warn("Telegram commands still work. Swap alerts will resume when Blockscout responds.");
+  }
 }
 
 async function main() {
@@ -1134,7 +1234,11 @@ async function main() {
   const once = process.argv.includes("--once");
 
   if (!state.seen?.length) {
-    await bootState(state);
+    try {
+      await bootState(state);
+    } catch (error) {
+      console.error(`Boot failed: ${error.message}`);
+    }
     if (once) return;
   }
 
@@ -1144,7 +1248,14 @@ async function main() {
       const groups = groupTransfers(await fetchTokenTransfers());
       await handleNewGroups(groups, state);
     } catch (error) {
-      console.error(`Poll error: ${error.message}`);
+      if (isPollingConflictError(error)) {
+        console.error(
+          "Telegram polling conflict: another instance is already using getUpdates. Stop local npm start or any other deployment using the same bot token.",
+        );
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+      } else {
+        console.error(`Poll error: ${error.message}`);
+      }
     }
 
     if (once) return;
@@ -1165,13 +1276,16 @@ module.exports = {
   formatUnits,
   groupHashes,
   groupTransfers,
+  isAuthorizedChat,
   isExpiredCallbackError,
   isEvmAddress,
   isMessageNotModifiedError,
+  isPollingConflictError,
   normalizeAddress,
   mainMenuKeyboard,
   mainPanelText,
   chooseBestPairForToken,
+  parseTelegramChatIds,
   shouldTradeImmediately,
   sniperTradeKeyboard,
   staticMainPanelText,

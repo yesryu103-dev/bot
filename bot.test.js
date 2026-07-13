@@ -166,6 +166,27 @@ test("Telegram message-not-modified errors are recognized", () => {
   assert.equal(bot.isMessageNotModifiedError(error), true);
 });
 
+test("Telegram polling conflict errors are recognized", () => {
+  const error = new Error(
+    'HTTP 409 Conflict: {"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request; make sure that only one bot instance is running"}',
+  );
+
+  assert.equal(bot.isPollingConflictError(error), true);
+});
+
+test("authorized chat IDs support comma-separated values", () => {
+  const ids = bot.parseTelegramChatIds("123456789, -1001234567890");
+  assert.deepEqual(ids, ["123456789", "-1001234567890"]);
+  assert.equal(bot.isAuthorizedChat("123456789"), false);
+
+  const original = bot.config.telegramChatIds;
+  bot.config.telegramChatIds = ids;
+  assert.equal(bot.isAuthorizedChat("123456789"), true);
+  assert.equal(bot.isAuthorizedChat("-1001234567890"), true);
+  assert.equal(bot.isAuthorizedChat("999"), false);
+  bot.config.telegramChatIds = original;
+});
+
 test("EVM token address input is recognized", () => {
   assert.equal(bot.isEvmAddress("0x5266eeaff092d6136ab63d18b975a60a0cc0c8f7"), true);
   assert.equal(bot.isEvmAddress("hello"), false);
