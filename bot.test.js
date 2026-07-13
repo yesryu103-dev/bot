@@ -385,6 +385,7 @@ test("WSB-like multi-pool profile is not treated as SAFE", () => {
       priceChange: { h24: 8569 },
       txns: { h24: { buys: 5000, sells: 3000 } },
       labels: ["v3"],
+      quoteToken: { symbol: "WETH" },
       boosts: { active: 1000 },
       info: { websites: [] },
     },
@@ -396,6 +397,7 @@ test("WSB-like multi-pool profile is not treated as SAFE", () => {
       priceChange: { h24: 167 },
       txns: { h24: { buys: 8, sells: 13 } },
       labels: ["v4"],
+      quoteToken: { symbol: "USDG" },
       boosts: { active: 1000 },
       info: { websites: [] },
     },
@@ -415,6 +417,52 @@ test("WSB-like multi-pool profile is not treated as SAFE", () => {
 
   assert.notEqual(report.verdict, "SAFE");
   assert.ok(report.score >= 25);
+  assert.ok(market.warnings.some((item) => item.includes("Primary pool")));
+  assert.ok(market.liquidityUsd >= 40000);
+});
+
+test("CashDog-like token is scored on main v3 pool not tiny v4", () => {
+  const market = bot.analyzePairsMarketRisk([
+    {
+      pairAddress: "0xb95956e052653fd5ab039babd71f108728859af5",
+      liquidity: { usd: 125000 },
+      volume: { h24: 2000000 },
+      fdv: 900000,
+      priceChange: { h24: -44 },
+      txns: { h24: { buys: 4950, sells: 3650 } },
+      labels: ["v3"],
+      quoteToken: { symbol: "WETH" },
+      info: { websites: [] },
+    },
+    {
+      pairAddress: "0xbe326c075973fbb4d6537d5e291a88fce8dbb7ef4fdd5950698408afa7ad3753",
+      liquidity: { usd: 306.27 },
+      volume: { h24: 4200 },
+      fdv: 1659576,
+      priceChange: { h24: 3.4 },
+      txns: { h24: { buys: 84, sells: 62 } },
+      labels: ["v4"],
+      quoteToken: { symbol: "USDG" },
+      info: { websites: [] },
+    },
+  ]);
+
+  assert.ok(market.liquidityUsd >= 100000);
+  assert.equal(market.warnings.some((item) => item.includes("Dangerously thin liquidity")), false);
+  assert.ok(market.warnings.some((item) => item.toLowerCase().includes("thin secondary")));
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: true,
+    quoteOk: true,
+    marketScore: market.score,
+    marketWarnings: market.warnings,
+    holderScore: 0,
+    holderWarnings: [],
+    contractScore: 0,
+    contractWarnings: [],
+  });
+  assert.notEqual(report.verdict, "DANGER");
 });
 
 test("holder concentration flags dominant wallet", () => {

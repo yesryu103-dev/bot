@@ -485,6 +485,33 @@ function analyzeDexMarketRisk(pair) {
   };
 }
 
+function pairLiquidityUsd(pair) {
+  return Number(pair?.liquidity?.usd || 0);
+}
+
+function isV3Pair(pair) {
+  const labels = (pair?.labels || []).map((label) => String(label).toLowerCase());
+  if (labels.includes("v4") && !labels.includes("v3")) return false;
+  return true;
+}
+
+function choosePrimaryDexPair(pairs) {
+  const list = (Array.isArray(pairs) ? pairs : []).filter(Boolean);
+  if (!list.length) return null;
+
+  const ranked = [...list].sort((a, b) => {
+    const aV3 = isV3Pair(a) ? 1 : 0;
+    const bV3 = isV3Pair(b) ? 1 : 0;
+    if (aV3 !== bV3) return bV3 - aV3;
+    const aWeth = String(a.quoteToken?.symbol || "").toUpperCase() === "WETH" || String(a.quoteToken?.symbol || "").toUpperCase() === "ETH";
+    const bWeth = String(b.quoteToken?.symbol || "").toUpperCase() === "WETH" || String(b.quoteToken?.symbol || "").toUpperCase() === "ETH";
+    if (aWeth !== bWeth) return aWeth ? -1 : 1;
+    return pairLiquidityUsd(b) - pairLiquidityUsd(a);
+  });
+
+  return ranked[0];
+}
+
 function analyzePairsMarketRisk(pairs) {
   const list = (Array.isArray(pairs) ? pairs : []).filter(Boolean);
   if (!list.length) {
@@ -503,26 +530,37 @@ function analyzePairsMarketRisk(pairs) {
     };
   }
 
-  let worst = analyzeDexMarketRisk(list[0]);
-  for (const pair of list.slice(1)) {
-    const risk = analyzeDexMarketRisk(pair);
-    if (risk.score > worst.score) worst = risk;
+  // Score the MAIN pool users actually trade (highest liq, prefer v3/WETH).
+  // Do NOT let a tiny secondary v4 pool override the headline liquidity/FDV numbers.
+  const primary = choosePrimaryDexPair(list);
+  const primaryRisk = analyzeDexMarketRisk(primary);
+  const warnings = [
+    `Primary pool: ${isV3Pair(primary) ? "v3" : "v4"} ${formatUsd(primaryRisk.liquidityUsd)} liq` +
+      (primaryRisk.fdv > 0 ? ` · LP/FDV ${((primaryRisk.liquidityUsd / primaryRisk.fdv) * 100).toFixed(1)}%` : ""),
+    ...primaryRisk.warnings,
+  ];
+  let score = primaryRisk.score;
+
+  const thinSecondaries = list.filter((pair) => {
+    if (normalizeAddress(pair.pairAddress) === normalizeAddress(primary.pairAddress)) return false;
+    return pairLiquidityUsd(pair) > 0 && pairLiquidityUsd(pair) < 3000;
+  });
+  if (thinSecondaries.length && primaryRisk.liquidityUsd >= 20000) {
+    warnings.push(
+      `Also has ${thinSecondaries.length} thin secondary pool(s) (min ${formatUsd(Math.min(...thinSecondaries.map(pairLiquidityUsd)))}) — ignore those charts`,
+    );
+    score += 8;
+  } else if (thinSecondaries.length && primaryRisk.liquidityUsd < 20000) {
+    warnings.push("Multiple thin pools — fragmented liquidity / chart bait risk");
+    score += 12;
   }
 
-  const thin = list.filter((pair) => Number(pair?.liquidity?.usd || 0) < 3000);
-  const deep = list.filter((pair) => Number(pair?.liquidity?.usd || 0) >= 20000);
-  if (thin.length && deep.length) {
-    worst = {
-      ...worst,
-      score: worst.score + 12,
-      warnings: [
-        ...worst.warnings,
-        "Multiple pools: thin pool can bait charts while liquidity sits elsewhere",
-      ],
-    };
-  }
-
-  return worst;
+  return {
+    ...primaryRisk,
+    score,
+    warnings,
+    primary: true,
+  };
 }
 
 function analyzeHolderConcentration(holders, totalSupplyRaw, excludedAddresses = []) {
