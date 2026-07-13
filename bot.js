@@ -4615,6 +4615,46 @@ async function estimateMinimumOut(side, amountText, overrides = {}) {
   };
 }
 
+async function ensureWethForBuy(wallet, wethAddress, amountIn) {
+  const { ethers } = require("ethers");
+  const weth = new ethers.Contract(
+    wethAddress,
+    [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function deposit() payable",
+    ],
+    wallet,
+  );
+  let balance = await weth.balanceOf(wallet.address);
+  if (balance >= amountIn) {
+    return { wrapped: 0n, balance };
+  }
+
+  const shortfall = amountIn - balance;
+  const nativeBalance = await wallet.provider.getBalance(wallet.address);
+  const gasReserve = ethers.parseEther("0.003");
+  if (nativeBalance < shortfall + gasReserve) {
+    throw new Error(
+      [
+        `Not enough ETH/WETH for buy.`,
+        `Need ${ethers.formatEther(amountIn)} WETH.`,
+        `Have ${ethers.formatEther(balance)} WETH + ${ethers.formatEther(nativeBalance)} ETH.`,
+        `Keep ~0.003 ETH for gas.`,
+      ].join(" "),
+    );
+  }
+
+  const depositTx = await weth.deposit({ value: shortfall });
+  await depositTx.wait();
+  balance = await weth.balanceOf(wallet.address);
+  if (balance < amountIn) {
+    throw new Error(
+      `Wrap ETH→WETH failed. Still have ${ethers.formatEther(balance)} WETH after deposit.`,
+    );
+  }
+  return { wrapped: shortfall, balance };
+}
+
 async function executeSwap(side, amountText, overrides = {}) {
   if (!config.tradeEnabled) {
     throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 sau khi cấu hình RPC_URL và WALLET_PRIVATE_KEY.");
@@ -4669,10 +4709,25 @@ async function executeSwap(side, amountText, overrides = {}) {
     "function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96) params) payable returns (uint256 amountOut)",
   ];
 
+  // Buys spend WETH. If wallet only has native ETH, wrap the shortfall first.
+  let wrappedEth = 0n;
+  if (side === "BUY" && tokenIn === normalizeAddress(config.quoteTokenAddress || config.lpWethAddress)) {
+    const ensured = await ensureWethForBuy(wallet, tokenIn, amountIn);
+    wrappedEth = ensured.wrapped;
+  }
+
   const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
   const balance = await inputToken.balanceOf(wallet.address);
   if (balance < amountIn) {
-    throw new Error(`Not enough ${tokenInSymbol}. Need ${amountText}, wallet has ${ethers.formatUnits(balance, decimalsIn)}.`);
+    const nativeBalance = await provider.getBalance(wallet.address);
+    throw new Error(
+      [
+        `Not enough ${tokenInSymbol}. Need ${amountText}, wallet has ${ethers.formatUnits(balance, decimalsIn)} ${tokenInSymbol}`,
+        side === "BUY" ? `+ ${ethers.formatEther(nativeBalance)} ETH native` : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
+    );
   }
 
   const allowance = await inputToken.allowance(wallet.address, config.swapRouterAddress);
@@ -4700,6 +4755,7 @@ async function executeSwap(side, amountText, overrides = {}) {
     tokenInSymbol,
     tokenOutSymbol,
     minOut: numberToDecimalString(quote.minOut, 8),
+    wrappedEth: wrappedEth > 0n ? ethers.formatEther(wrappedEth) : "",
   };
 }
 
@@ -4748,10 +4804,13 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
       callbackQuery,
       [
         `<b>${escapeHtml(side)} sent</b>`,
+        result.wrappedEth ? `Wrapped: <b>${escapeHtml(result.wrappedEth)} ETH → WETH</b>` : "",
         `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
         `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
         `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
-      ].join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
       mainMenuKeyboard(state.portfolioSnapshot),
     );
   } catch (error) {
