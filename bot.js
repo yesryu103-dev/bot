@@ -144,8 +144,19 @@ async function fetchJson(url, options = {}, retries = 3) {
 
 async function fetchTokenTransfers() {
   const url = `${config.blockscoutBaseUrl}/api/v2/addresses/${config.pairAddress}/token-transfers`;
-  const payload = await fetchJson(url);
+  const payload = await fetchJson(url, {}, 2);
   return (payload.items || []).slice(0, config.maxItems);
+}
+
+function isTransientHttpError(error) {
+  const message = String(error?.message || "");
+  return (
+    message.includes("timed out") ||
+    message.includes("HTTP 500") ||
+    message.includes("HTTP 502") ||
+    message.includes("HTTP 503") ||
+    message.includes("HTTP 504")
+  );
 }
 
 async function fetchTransaction(txHash) {
@@ -1874,11 +1885,10 @@ async function main() {
   }
 
   console.log("Entering poll loop.");
+  let lastBlockscoutWarnAt = 0;
   while (true) {
     try {
       await processTelegramUpdates(state);
-      const groups = groupTransfers(await fetchTokenTransfers());
-      await handleNewGroups(groups, state);
     } catch (error) {
       if (isPollingConflictError(error)) {
         console.error(
@@ -1886,7 +1896,23 @@ async function main() {
         );
         await new Promise((resolve) => setTimeout(resolve, 10000));
       } else {
-        console.error(`Poll error: ${error.message}`);
+        console.error(`Telegram poll error: ${error.message || error}`);
+      }
+    }
+
+    try {
+      const groups = groupTransfers(await fetchTokenTransfers());
+      await handleNewGroups(groups, state);
+    } catch (error) {
+      const now = Date.now();
+      if (isTransientHttpError(error)) {
+        if (now - lastBlockscoutWarnAt > 60_000) {
+          console.warn(`Blockscout temporarily unavailable: ${error.message || error}`);
+          console.warn("Telegram commands still work; swap alerts paused until Blockscout recovers.");
+          lastBlockscoutWarnAt = now;
+        }
+      } else {
+        console.error(`Swap poll error: ${error.message || error}`);
       }
     }
 
