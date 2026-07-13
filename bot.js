@@ -1049,7 +1049,7 @@ async function analyzeV2LpBurn(provider, tokenAddress) {
   return { hasV2: true, burnedPct, notes: [`V2 LP mostly unburned (~${burnedPct.toFixed(1)}% burned)`], score: 18 };
 }
 
-async function sumMatchingV3Positions(provider, holder, token0, token1, fee, maxNfts = 80) {
+async function sumMatchingV3Positions(provider, holder, token0, token1, fee, maxNfts = 24) {
   const { ethers } = require("ethers");
   const npmAbi = [
     "function balanceOf(address owner) view returns (uint256)",
@@ -1198,8 +1198,10 @@ async function analyzeV3LpBurnAndLock(provider, primaryPair, extraHolders = []) 
 
   const dead = "0x000000000000000000000000000000000000dead";
   const nearDead = "0x0000000000000000000000000000000000000001";
-  const deadA = await sumMatchingV3Positions(provider, dead, token0, token1, fee);
-  const deadB = await sumMatchingV3Positions(provider, nearDead, token0, token1, fee);
+  const [deadA, deadB] = await Promise.all([
+    sumMatchingV3Positions(provider, dead, token0, token1, fee),
+    sumMatchingV3Positions(provider, nearDead, token0, token1, fee),
+  ]);
   const burnedLiq = deadA.liquidity + deadB.liquidity;
   const burnedPositions = [...deadA.positions, ...deadB.positions];
   const burnedApprovals = [...deadA.approvals, ...deadB.approvals];
@@ -1307,7 +1309,7 @@ async function analyzeV3LpBurnAndLock(provider, primaryPair, extraHolders = []) 
 }
 
 // keep old name used elsewhere
-async function sumMatchingV3Liquidity(provider, holder, token0, token1, fee, maxNfts = 80) {
+async function sumMatchingV3Liquidity(provider, holder, token0, token1, fee, maxNfts = 24) {
   const stats = await sumMatchingV3Positions(provider, holder, token0, token1, fee, maxNfts);
   return stats.liquidity;
 }
@@ -2462,6 +2464,20 @@ async function setPortfolioWallet(walletAddress, state, chatId) {
   await showPortfolio(chatId, state);
 }
 
+async function withTimeout(promise, timeoutMs, label = "operation") {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function followTokenAddress(tokenAddress, state, chatId) {
   const pairs = await fetchTokenPairs(tokenAddress);
   const pair = chooseBestPairForToken(pairs, tokenAddress);
@@ -2508,13 +2524,23 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
   let honeypotReport = null;
   try {
-    honeypotReport = await checkTokenHoneypot(tokenAddress, pair, pairs);
+    honeypotReport = await withTimeout(
+      checkTokenHoneypot(tokenAddress, pair, pairs),
+      45000,
+      "Security audit",
+    );
   } catch (error) {
     console.warn(`Honeypot check failed for ${tokenAddress}: ${error.message}`);
+    honeypotReport = {
+      verdict: "CAUTION",
+      score: 25,
+      dangers: [],
+      notes: [`Audit chưa xong đủ: ${error.message}`],
+    };
   }
 
   try {
-    await prepareLpFromToken(tokenAddress, state);
+    await withTimeout(prepareLpFromToken(tokenAddress, state), 20000, "LP prepare");
   } catch (error) {
     console.warn(`LP pool prepare failed for ${tokenAddress}: ${error.message}`);
   }
@@ -2538,6 +2564,37 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     disable_web_page_preview: "true",
     reply_markup: afterTrackKeyboard(),
   });
+}
+
+const trackJobs = [];
+let trackWorkerRunning = false;
+
+async function enqueueFollowToken(tokenAddress, state, chatId) {
+  trackJobs.push({ tokenAddress, state, chatId });
+  if (trackWorkerRunning) return;
+  trackWorkerRunning = true;
+  try {
+    while (trackJobs.length) {
+      const job = trackJobs.shift();
+      try {
+        await followTokenAddress(job.tokenAddress, job.state, job.chatId);
+      } catch (error) {
+        console.error(`followTokenAddress failed: ${error.message}`);
+        try {
+          await telegramRequest("sendMessage", {
+            chat_id: job.chatId,
+            text: `Không theo dõi được token:\n<code>${escapeHtml(job.tokenAddress)}</code>\n${escapeHtml(error.message)}`,
+            parse_mode: "HTML",
+            disable_web_page_preview: "true",
+          });
+        } catch {
+          // ignore
+        }
+      }
+    }
+  } finally {
+    trackWorkerRunning = false;
+  }
 }
 
 async function editTradeMessage(callbackQuery, text, replyMarkup = null) {
@@ -4176,7 +4233,10 @@ async function handleTelegramMessage(message, state) {
       parse_mode: "HTML",
       disable_web_page_preview: "true",
     });
-    await followTokenAddress(text, state, chatId);
+    // Don't block Telegram polling while audit/LP discovery runs.
+    enqueueFollowToken(text, state, chatId).catch((error) => {
+      console.error(`enqueueFollowToken failed: ${error.message}`);
+    });
     return;
   }
 
