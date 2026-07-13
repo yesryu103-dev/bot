@@ -56,6 +56,9 @@ const config = {
   slippageBps: Number(process.env.SLIPPAGE_BPS || 200),
   oneTapTrade: truthy(process.env.ONE_TAP_TRADE),
   buyAmountsQuote: parseAmountOptions(process.env.BUY_AMOUNTS_QUOTE || "0.01,0.05,0.1,0.25"),
+  sellPercents: parseAmountOptions(process.env.SELL_PERCENTS || "25,50,70")
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0 && value < 100),
   sellAmountsBase: parseAmountOptions(process.env.SELL_AMOUNTS_BASE || "1000,5000,10000,25000"),
   minPortfolioLiquidityUsd: Number(process.env.MIN_PORTFOLIO_LIQUIDITY_USD || 50),
   minPortfolioValueUsd: Number(process.env.MIN_PORTFOLIO_VALUE_USD || 3),
@@ -306,7 +309,24 @@ function isEvmAddress(value) {
 }
 
 function shouldTradeImmediately(side, amount) {
-  return config.oneTapTrade || (side === "SELL" && amount === "ALL");
+  return config.oneTapTrade || (side === "SELL" && String(amount).toUpperCase() === "ALL");
+}
+
+function parseSellPercent(amountText) {
+  const value = String(amountText || "").trim().toUpperCase();
+  if (value === "ALL" || value === "100%") return 100;
+  const match = value.match(/^(\d{1,3})%$/);
+  if (!match) return null;
+  const percent = Number(match[1]);
+  if (!Number.isFinite(percent) || percent <= 0 || percent > 100) return null;
+  return percent;
+}
+
+function balancePercent(balance, percent) {
+  const pct = BigInt(Math.floor(Number(percent)));
+  if (pct <= 0n) return 0n;
+  if (pct >= 100n) return BigInt(balance);
+  return (BigInt(balance) * pct) / 100n;
 }
 
 function chooseBestPairForToken(pairs, tokenAddress) {
@@ -2202,16 +2222,18 @@ function sniperTradeKeyboard() {
     text: `Buy ${amount} ${config.quoteSymbol}`,
     callback_data: `qtrade:BUY:${amount}`,
   }));
-  const sellButtons = config.sellAmountsBase.map((amount) => ({
-    text: `Sell ${amount} ${config.baseSymbol}`,
-    callback_data: `qtrade:SELL:${amount}`,
-  }));
+  const sellButtons = [...(config.sellPercents || [25, 50, 70]), 100].map((percent) => {
+    const amount = percent >= 100 ? "ALL" : `${percent}%`;
+    return {
+      text: percent >= 100 ? `Sell All ${config.baseSymbol}` : `Sell ${percent}%`,
+      callback_data: `qtrade:SELL:${amount}`,
+    };
+  });
 
   return {
     inline_keyboard: [
       ...chunkButtons(buyButtons, 2),
       ...chunkButtons(sellButtons, 2),
-      [{ text: `Sell All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" }],
       [
         { text: "Refresh", callback_data: "menu" },
         { text: "Chart", url: config.dexscreenPairUrl },
@@ -2222,7 +2244,13 @@ function sniperTradeKeyboard() {
 
 function confirmKeyboard(side, amount) {
   const inputSymbol = side === "BUY" ? config.quoteSymbol : config.baseSymbol;
-  const amountLabel = amount === "ALL" ? `ALL ${inputSymbol}` : `${amount} ${inputSymbol}`;
+  const sellPct = side === "SELL" ? parseSellPercent(amount) : null;
+  const amountLabel =
+    sellPct !== null
+      ? sellPct >= 100
+        ? `ALL ${inputSymbol}`
+        : `${sellPct}% ${inputSymbol}`
+      : `${amount} ${inputSymbol}`;
   return {
     inline_keyboard: [
       [{ text: `Confirm ${side} ${amountLabel}`, callback_data: `confirm:${side}:${amount}` }],
@@ -2261,7 +2289,8 @@ function mainMenuKeyboard() {
 function tradePanelText(title = `${config.baseSymbol} Sniper`) {
   return [
     `<b>${escapeHtml(title)}</b>`,
-    `Buy uses <b>${escapeHtml(config.quoteSymbol)}</b>. Sell uses <b>${escapeHtml(config.baseSymbol)}</b>.`,
+    `Đang theo dõi: <b>${escapeHtml(config.baseSymbol)}</b>`,
+    `Buy: số ${escapeHtml(config.quoteSymbol)}. Sell: <b>25% / 50% / 70% / All</b> bag.`,
     `One-tap: <b>${config.oneTapTrade ? "ON" : "OFF"}</b> | Trading: <b>${config.tradeEnabled ? "ON" : "OFF"}</b>`,
     `Slippage: <b>${config.slippageBps / 100}%</b>`,
   ].join("\n");
@@ -2641,6 +2670,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     chat_id: chatId,
     text: [
       `<b>Now tracking ${escapeHtml(trackedPair.baseSymbol)}</b>`,
+      `Chỉ theo dõi token này (đổi token = paste CA khác).`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
       `Quote: <b>${escapeHtml(trackedPair.quoteSymbol)}</b>`,
       `Alert min: <b>${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}</b>`,
@@ -3998,8 +4028,16 @@ async function getWalletTokenBalance(tokenAddress) {
 }
 
 async function estimateMinimumOut(side, amountText) {
-  if (amountText === "ALL") {
-    throw new Error("Estimate for Sell All needs wallet balance and runs at confirmation.");
+  let resolvedAmountText = amountText;
+  if (side === "SELL") {
+    const percent = parseSellPercent(amountText);
+    if (percent !== null) {
+      const { ethers } = require("ethers");
+      const tokenBalance = await getWalletTokenBalance(config.baseTokenAddress);
+      const amountIn = balancePercent(tokenBalance.balance, percent);
+      if (amountIn <= 0n) throw new Error(`No ${config.baseSymbol} balance to sell.`);
+      resolvedAmountText = ethers.formatUnits(amountIn, 18);
+    }
   }
 
   const pair = await fetchDexPair();
@@ -4008,16 +4046,18 @@ async function estimateMinimumOut(side, amountText) {
     throw new Error("Cannot read current price from Dexscreener.");
   }
 
-  const amount = Number(amountText);
+  const amount = Number(resolvedAmountText);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid amount.");
 
   const expectedOut = side === "BUY" ? amount / priceNative : amount * priceNative;
-  const minOut = expectedOut * (10000 - config.slippageBps) / 10000;
+  const minOut = (expectedOut * (10000 - config.slippageBps)) / 10000;
   return {
     expectedOut,
     minOut,
     priceNative,
     priceUsd: Number(pair?.priceUsd),
+    resolvedAmountText,
+    sellPercent: side === "SELL" ? parseSellPercent(amountText) : null,
   };
 }
 
@@ -4040,9 +4080,10 @@ async function executeSwap(side, amountText) {
   const decimalsIn = 18;
   const decimalsOut = 18;
   let amountIn;
-  if (side === "SELL" && amountText === "ALL") {
+  const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
+  if (side === "SELL" && sellPercent !== null) {
     const tokenBalance = await getWalletTokenBalance(config.baseTokenAddress);
-    amountIn = tokenBalance.balance;
+    amountIn = balancePercent(tokenBalance.balance, sellPercent);
     if (amountIn <= 0n) throw new Error(`No ${config.baseSymbol} balance to sell.`);
     amountText = ethers.formatUnits(amountIn, decimalsIn);
   } else {
@@ -4297,14 +4338,26 @@ async function handleCallbackQuery(callbackQuery, state) {
 
     const inputSymbol = side === "BUY" ? config.quoteSymbol : config.baseSymbol;
     const outputSymbol = side === "BUY" ? config.baseSymbol : config.quoteSymbol;
+    const sellPercent = side === "SELL" ? parseSellPercent(amount) : null;
+    const spendLabel =
+      sellPercent !== null
+        ? sellPercent >= 100
+          ? `ALL ${inputSymbol}`
+          : `${sellPercent}% bag ${inputSymbol}`
+        : `${amount} ${inputSymbol}`;
     let estimateText = "";
     try {
       const quote = await estimateMinimumOut(side, amount);
       estimateText = [
+        sellPercent !== null && quote.resolvedAmountText
+          ? `Sell qty: ~<b>${escapeHtml(numberToDecimalString(Number(quote.resolvedAmountText), 6))} ${escapeHtml(inputSymbol)}</b>`
+          : "",
         `Expected out: ~<b>${escapeHtml(numberToDecimalString(quote.expectedOut, 6))} ${escapeHtml(outputSymbol)}</b>`,
         `Min out: <b>${escapeHtml(numberToDecimalString(quote.minOut, 6))} ${escapeHtml(outputSymbol)}</b>`,
         `Slippage: <b>${config.slippageBps / 100}%</b>`,
-      ].join("\n");
+      ]
+        .filter(Boolean)
+        .join("\n");
     } catch (error) {
       estimateText = `Estimate unavailable: ${escapeHtml(error.message)}`;
     }
@@ -4313,7 +4366,7 @@ async function handleCallbackQuery(callbackQuery, state) {
       callbackQuery,
       [
         `<b>Confirm ${escapeHtml(side)} ${escapeHtml(config.baseSymbol)}</b>`,
-        `Spend: <b>${escapeHtml(amount)} ${escapeHtml(inputSymbol)}</b>`,
+        `Spend: <b>${escapeHtml(spendLabel)}</b>`,
         estimateText,
         `Trading: <b>${config.tradeEnabled ? "ON" : "OFF"}</b>`,
       ].join("\n"),
@@ -4622,6 +4675,8 @@ module.exports = {
   analyzePairsMarketRisk,
   amountsForExactEth,
   amountsForEthLiquidity: amountsForExactEth,
+  balancePercent,
+  parseSellPercent,
   buildLpPreview,
   buildPortfolioFromBalances,
   classifyFromTransaction,

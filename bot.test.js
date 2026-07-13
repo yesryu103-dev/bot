@@ -110,17 +110,21 @@ test("pasted token becomes tracked token even when it is quote side of pair", ()
   assert.equal(tracked.quoteSymbol, "WETH");
 });
 
-test("sniper keyboard exposes direct buy and sell amount buttons", () => {
+test("sniper keyboard exposes buy amounts and sell percents", () => {
   const keyboard = bot.sniperTradeKeyboard();
   const buttons = keyboard.inline_keyboard.flat();
   const labels = buttons.map((button) => button.text);
   const callbacks = buttons.map((button) => button.callback_data).filter(Boolean);
 
   assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]} ${bot.config.quoteSymbol}`));
-  assert(labels.includes(`Sell ${bot.config.sellAmountsBase[0]} ${bot.config.baseSymbol}`));
+  assert(labels.includes("Sell 25%"));
+  assert(labels.includes("Sell 50%"));
+  assert(labels.includes("Sell 70%"));
   assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
   assert(callbacks.includes(`qtrade:BUY:${bot.config.buyAmountsQuote[0]}`));
-  assert(callbacks.includes(`qtrade:SELL:${bot.config.sellAmountsBase[0]}`));
+  assert(callbacks.includes("qtrade:SELL:25%"));
+  assert(callbacks.includes("qtrade:SELL:50%"));
+  assert(callbacks.includes("qtrade:SELL:70%"));
   assert(callbacks.includes("qtrade:SELL:ALL"));
 });
 
@@ -131,8 +135,17 @@ test("slippage default is two percent", () => {
 test("sell all trades immediately even when one-tap mode is off", () => {
   assert.equal(bot.config.oneTapTrade, false);
   assert.equal(bot.shouldTradeImmediately("SELL", "ALL"), true);
-  assert.equal(bot.shouldTradeImmediately("SELL", "1000"), false);
+  assert.equal(bot.shouldTradeImmediately("SELL", "25%"), false);
   assert.equal(bot.shouldTradeImmediately("BUY", "0.01"), false);
+});
+
+test("sell percent parser and balance math", () => {
+  assert.equal(bot.parseSellPercent("25%"), 25);
+  assert.equal(bot.parseSellPercent("ALL"), 100);
+  assert.equal(bot.parseSellPercent("100%"), 100);
+  assert.equal(bot.parseSellPercent("0.01"), null);
+  assert.equal(bot.balancePercent(1000n, 25), 250n);
+  assert.equal(bot.balancePercent(1000n, 100), 1000n);
 });
 
 test("main menu looks like a trading dashboard", () => {
