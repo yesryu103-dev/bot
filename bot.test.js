@@ -255,6 +255,43 @@ test("near-threshold 1 ETH buy is still alerted", () => {
   assert.ok(trade.quoteAmount >= 0.95);
 });
 
+test("watch pair list keeps primary and extra WETH pools", () => {
+  const token = "0x020bfc650a365f8bb26819deaabf3e21291018b4";
+  const watched = bot.chooseWatchPairAddresses(
+    [
+      {
+        chainId: "robinhood",
+        pairAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        liquidity: { usd: 100000 },
+        labels: ["v3"],
+        baseToken: { address: token, symbol: "CASHCAT" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        pairAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        liquidity: { usd: 400000 },
+        labels: ["v3"],
+        baseToken: { address: token, symbol: "CASHCAT" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        pairAddress: "0xcccccccccccccccccccccccccccccccccccccccc",
+        liquidity: { usd: 800000 },
+        labels: ["v4"],
+        baseToken: { address: token, symbol: "CASHCAT" },
+        quoteToken: { address: "0x1111111111111111111111111111111111111111", symbol: "USDG" },
+      },
+    ],
+    token,
+    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  );
+  assert.ok(watched.includes("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+  assert.ok(watched.includes("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+  assert.equal(watched.some((item) => item.startsWith("0xccc")), false);
+});
+
 test("portfolio keeps liquid tokens and hides junk", () => {
   const goodToken = "0x1111111111111111111111111111111111111111";
   const junkToken = "0x2222222222222222222222222222222222222222";

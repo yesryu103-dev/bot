@@ -160,14 +160,16 @@ async function fetchJson(url, options = {}, retries = 3) {
   throw lastError;
 }
 
-async function fetchTokenTransfers() {
+async function fetchTokenTransfersForPair(pairAddress) {
+  const pair = normalizeAddress(pairAddress);
+  if (!pair) return [];
   const maxItems = Math.max(50, Number(config.maxItems || 200));
   const maxPages = Math.max(1, Number(process.env.TRANSFER_MAX_PAGES || 6));
   const collected = [];
   let query = "";
 
   for (let page = 0; page < maxPages && collected.length < maxItems; page += 1) {
-    const url = `${config.blockscoutBaseUrl}/api/v2/addresses/${config.pairAddress}/token-transfers${query}`;
+    const url = `${config.blockscoutBaseUrl}/api/v2/addresses/${pair}/token-transfers${query}`;
     const payload = await fetchJson(url, {}, 2);
     const items = payload.items || [];
     if (!items.length) break;
@@ -179,6 +181,24 @@ async function fetchTokenTransfers() {
   }
 
   return collected.slice(0, maxItems);
+}
+
+async function fetchTokenTransfers() {
+  const pairs = [...watchedPairSet()];
+  if (!pairs.length) return fetchTokenTransfersForPair(config.pairAddress);
+
+  const chunks = await Promise.all(pairs.map((pair) => fetchTokenTransfersForPair(pair)));
+  const merged = [];
+  const seenKey = new Set();
+  for (const items of chunks) {
+    for (const item of items) {
+      const key = `${item.transaction_hash}:${item.log_index}:${addressOf(item.from)}:${addressOf(item.to)}`;
+      if (seenKey.has(key)) continue;
+      seenKey.add(key);
+      merged.push(item);
+    }
+  }
+  return merged;
 }
 
 function isTransientHttpError(error) {
@@ -324,7 +344,47 @@ function trackedPairFromDexPair(pair, tokenAddress = pair?.baseToken?.address) {
     baseSymbol: baseToken?.symbol || "TOKEN",
     quoteTokenAddress: normalizeAddress(quoteToken?.address),
     quoteSymbol: quoteToken?.symbol || "QUOTE",
+    watchPairAddresses: [],
   };
+}
+
+function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") {
+  const token = normalizeAddress(tokenAddress);
+  const primary = normalizeAddress(primaryPairAddress);
+  const watched = [];
+  if (primary) watched.push(primary);
+
+  const ranked = (Array.isArray(pairs) ? pairs : [])
+    .filter((pair) => normalizeAddress(pair.chainId) === "robinhood")
+    .filter((pair) => {
+      const base = normalizeAddress(pair.baseToken?.address);
+      const quote = normalizeAddress(pair.quoteToken?.address);
+      if (!(base === token || quote === token)) return false;
+      const quoteSym = String(pair.quoteToken?.symbol || "").toUpperCase();
+      const baseSym = String(pair.baseToken?.symbol || "").toUpperCase();
+      const isWeth =
+        quoteSym === "WETH" ||
+        quoteSym === "ETH" ||
+        baseSym === "WETH" ||
+        baseSym === "ETH" ||
+        quote === config.quoteTokenAddress ||
+        base === config.quoteTokenAddress;
+      return isWeth && isV3Pair(pair) && Number(pair.liquidity?.usd || 0) >= 1000;
+    })
+    .sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
+
+  for (const pair of ranked.slice(0, 4)) {
+    const address = normalizeAddress(pair.pairAddress);
+    if (address && !watched.includes(address)) watched.push(address);
+  }
+  return watched;
+}
+
+function watchedPairSet(settings = config) {
+  const list = settings.watchPairAddresses?.length
+    ? settings.watchPairAddresses
+    : [settings.pairAddress];
+  return new Set((list || []).map(normalizeAddress).filter(Boolean));
 }
 
 function applyTrackedPair(trackedPair) {
@@ -336,6 +396,12 @@ function applyTrackedPair(trackedPair) {
   config.baseSymbol = trackedPair.baseSymbol || config.baseSymbol;
   config.quoteTokenAddress = normalizeAddress(trackedPair.quoteTokenAddress);
   config.quoteSymbol = trackedPair.quoteSymbol || config.quoteSymbol;
+  config.watchPairAddresses = (trackedPair.watchPairAddresses || [])
+    .map(normalizeAddress)
+    .filter(Boolean);
+  if (!config.watchPairAddresses.includes(config.pairAddress)) {
+    config.watchPairAddresses = [config.pairAddress, ...config.watchPairAddresses];
+  }
 }
 
 function applyStateConfig(state) {
@@ -2521,16 +2587,27 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   }
 
   const trackedPair = trackedPairFromDexPair(pair, tokenAddress);
+  trackedPair.watchPairAddresses = chooseWatchPairAddresses(pairs, tokenAddress, trackedPair.pairAddress);
   applyTrackedPair(trackedPair);
   state.trackedPair = trackedPair;
   state.seen = [];
+  let catchupGroups = [];
 
   try {
     const groups = groupTransfers(await fetchTokenTransfers());
-    addSeen(
-      state,
-      groups.map((group) => group.hash),
-    );
+    const catchupMs = Number(process.env.ALERT_CATCHUP_MS || 5 * 60 * 1000);
+    const now = Date.now();
+    const olderHashes = [];
+    for (const group of groups) {
+      const timestamp = Date.parse(String(group.transfers?.[0]?.timestamp || ""));
+      const trade = classifyFromTransaction(transactionFromTransferGroup(group));
+      if (trade && Number.isFinite(timestamp) && now - timestamp <= catchupMs) {
+        catchupGroups.push(group);
+      } else {
+        olderHashes.push(group.hash);
+      }
+    }
+    addSeen(state, olderHashes);
   } catch (error) {
     console.warn(`Could not warm seen transactions for ${trackedPair.baseSymbol}: ${error.message}`);
   }
@@ -2567,6 +2644,9 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
       `Quote: <b>${escapeHtml(trackedPair.quoteSymbol)}</b>`,
       `Alert min: <b>${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}</b>`,
+      trackedPair.watchPairAddresses?.length > 1
+        ? `Watching <b>${trackedPair.watchPairAddresses.length}</b> WETH pools`
+        : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
       "",
       formatHoneypotReport(honeypotReport),
@@ -2574,11 +2654,17 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       state.lp?.poolAddress
         ? `LP pool sẵn sàng (fee ${state.lp.fee / 10000}%). Bấm <b>Add LP</b> để chọn range.`
         : "Chưa có Uniswap v3 pool TOKEN/WETH để Add LP.",
-    ].join("\n"),
+    ]
+      .filter(Boolean)
+      .join("\n"),
     parse_mode: "HTML",
     disable_web_page_preview: "true",
     reply_markup: afterTrackKeyboard(),
   });
+
+  if (catchupGroups.length) {
+    await handleNewGroups(catchupGroups, state);
+  }
 }
 
 const trackJobs = [];
@@ -2657,6 +2743,7 @@ function isMessageNotModifiedError(error) {
 
 function classifyFromTransaction(tx, overrides = {}) {
   const settings = { ...config, ...overrides };
+  const pairs = watchedPairSet(settings);
   let baseNet = 0n;
   let quoteNet = 0n;
   let baseDecimals = 18;
@@ -2671,8 +2758,8 @@ function classifyFromTransaction(tx, overrides = {}) {
     const src = addressOf(transfer.from);
     const dst = addressOf(transfer.to);
     let direction = 0n;
-    if (dst === settings.pairAddress) direction += 1n;
-    if (src === settings.pairAddress) direction -= 1n;
+    if (pairs.has(dst)) direction += 1n;
+    if (pairs.has(src)) direction -= 1n;
     if (direction === 0n) continue;
 
     const amount = transferAmount(transfer);
@@ -2731,20 +2818,21 @@ function classifyFromTransaction(tx, overrides = {}) {
 }
 
 function guessTrader(transfers, settings = config) {
+  const pairs = watchedPairSet(settings);
   for (const transfer of transfers) {
     if (transferTokenAddress(transfer) !== settings.baseTokenAddress) continue;
     const src = addressOf(transfer.from);
     const dst = addressOf(transfer.to);
 
-    if (dst === settings.pairAddress && src !== settings.pairAddress) return src;
-    if (src === settings.pairAddress && dst !== settings.pairAddress) return dst;
+    if (pairs.has(dst) && !pairs.has(src)) return src;
+    if (pairs.has(src) && !pairs.has(dst)) return dst;
   }
 
   for (const transfer of transfers) {
     const src = addressOf(transfer.from);
     const dst = addressOf(transfer.to);
-    if (src && src !== settings.pairAddress) return src;
-    if (dst && dst !== settings.pairAddress) return dst;
+    if (src && !pairs.has(src)) return src;
+    if (dst && !pairs.has(dst)) return dst;
   }
 
   return "";
@@ -4412,12 +4500,32 @@ async function bootState(state) {
       return;
     }
 
-    addSeen(
-      state,
-      groups.map((group) => group.hash),
-    );
+    // After Render sleep/restart, still alert recent large swaps instead of silently marking seen.
+    const catchupMs = Number(process.env.ALERT_CATCHUP_MS || 5 * 60 * 1000);
+    const now = Date.now();
+    const catchupGroups = [];
+    const olderHashes = [];
+
+    for (const group of groups) {
+      const timestamp = Date.parse(String(group.transfers?.[0]?.timestamp || ""));
+      const tx = transactionFromTransferGroup(group);
+      const trade = classifyFromTransaction(tx);
+      const isRecent = Number.isFinite(timestamp) && now - timestamp <= catchupMs;
+      if (trade && isRecent) {
+        catchupGroups.push(group);
+      } else {
+        olderHashes.push(group.hash);
+      }
+    }
+
+    addSeen(state, olderHashes);
     saveState(state);
-    console.log(`Booted. Marked ${groups.length} existing transactions as seen.`);
+    console.log(
+      `Booted. Marked ${olderHashes.length} older txs seen; catch-up alerts=${catchupGroups.length} (last ${Math.round(catchupMs / 60000)}m).`,
+    );
+    if (catchupGroups.length) {
+      await handleNewGroups(catchupGroups, state);
+    }
   } catch (error) {
     if (!state.seen) state.seen = [];
     saveState(state);
@@ -4539,6 +4647,7 @@ module.exports = {
   mainMenuKeyboard,
   mainPanelText,
   chooseBestPairForToken,
+  chooseWatchPairAddresses,
   parseTelegramChatIds,
   parseWalletBalanceEntry,
   pickProbeHolder,
