@@ -2468,17 +2468,18 @@ function mainMenuKeyboard() {
     inline_keyboard: [
       [{ text: "Buy & Sell", callback_data: "panel:trade" }],
       [
+        { text: "Honeypot", callback_data: "panel:honeypot" },
         { text: "Add LP", callback_data: "panel:lp" },
+      ],
+      [
         { text: "My LP", callback_data: "panel:mylp" },
-      ],
-      [
         { text: "Portfolio", callback_data: "panel:portfolio" },
-        { text: "Update Price", callback_data: "portfolio:refresh" },
       ],
       [
+        { text: "Update Price", callback_data: "portfolio:refresh" },
         { text: "Profile", callback_data: "panel:profile" },
-        { text: "Wallets", callback_data: "panel:wallets" },
       ],
+      [{ text: "Wallets", callback_data: "panel:wallets" }],
     ],
   };
 }
@@ -2490,6 +2491,8 @@ function tradePanelText(title = `${config.baseSymbol} Sniper`) {
     `Buy: số ${escapeHtml(config.quoteSymbol)}. Sell: <b>25% / 50% / 70% / All</b> bag.`,
     `One-tap: <b>${config.oneTapTrade ? "ON" : "OFF"}</b> | Trading: <b>${config.tradeEnabled ? "ON" : "OFF"}</b>`,
     `Slippage: <b>${config.slippageBps / 100}%</b>`,
+    "",
+    `Honeypot / Add LP: bấm nút riêng khi cần (không chạy lúc paste CA).`,
   ].join("\n");
 }
 
@@ -2817,6 +2820,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   applyTrackedPair(trackedPair);
   state.trackedPair = trackedPair;
   state.seen = [];
+  state.lp = null;
 
   try {
     // Mark current history as seen — do NOT backfill old buys/sells.
@@ -2844,47 +2848,18 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
   saveState(state);
 
-  let honeypotReport = null;
-  try {
-    honeypotReport = await withTimeout(
-      checkTokenHoneypot(tokenAddress, pair, pairs),
-      45000,
-      "Security audit",
-    );
-  } catch (error) {
-    console.warn(`Honeypot check failed for ${tokenAddress}: ${error.message}`);
-    honeypotReport = {
-      verdict: "CAUTION",
-      score: 25,
-      dangers: [],
-      notes: [`Audit chưa xong đủ: ${error.message}`],
-    };
-  }
-
-  try {
-    await withTimeout(prepareLpFromToken(tokenAddress, state), 20000, "LP prepare");
-  } catch (error) {
-    console.warn(`LP pool prepare failed for ${tokenAddress}: ${error.message}`);
-  }
-
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
-      `<b>Now tracking ${escapeHtml(trackedPair.baseSymbol)}</b>`,
-      `Chỉ theo dõi token này (đổi token = paste CA khác).`,
+      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b>`,
+      `Chỉ theo dõi buy/sell realtime (≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}).`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
-      `Quote: <b>${escapeHtml(trackedPair.quoteSymbol)}</b>`,
-      `Alert min: <b>${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}</b>`,
       trackedPair.watchPairAddresses?.length > 1
         ? `Watching <b>${trackedPair.watchPairAddresses.length}</b> WETH pools`
         : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
       "",
-      formatHoneypotReport(honeypotReport),
-      "",
-      state.lp?.poolAddress
-        ? `LP pool sẵn sàng (fee ${state.lp.fee / 10000}%). Bấm <b>Add LP</b> để chọn range.`
-        : "Chưa có Uniswap v3 pool TOKEN/WETH để Add LP.",
+      `Honeypot / Add LP: bấm nút bên dưới khi cần.`,
     ]
       .filter(Boolean)
       .join("\n"),
@@ -2892,6 +2867,67 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     disable_web_page_preview: "true",
     reply_markup: afterTrackKeyboard(),
   });
+}
+
+async function runHoneypotOnDemand(state, chatId, editCallback = null) {
+  const token = normalizeAddress(state.trackedPair?.baseTokenAddress || config.baseTokenAddress);
+  if (!isEvmAddress(token)) {
+    const text = `<b>Honeypot</b>\nPaste contract token trước để track, rồi bấm Honeypot.`;
+    if (editCallback) await editTradeMessage(editCallback, text, mainMenuKeyboard());
+    else {
+      await telegramRequest("sendMessage", {
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: "true",
+        reply_markup: mainMenuKeyboard(),
+      });
+    }
+    return;
+  }
+
+  const pending = `Đang audit honeypot cho <b>${escapeHtml(config.baseSymbol)}</b>...\n<code>${escapeHtml(token)}</code>`;
+  if (editCallback) await editTradeMessage(editCallback, pending, afterTrackKeyboard());
+  else {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: pending,
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+    });
+  }
+
+  let honeypotReport = null;
+  try {
+    const pairs = await fetchTokenPairs(token);
+    const pair = chooseBestPairForToken(pairs, token);
+    honeypotReport = await withTimeout(checkTokenHoneypot(token, pair, pairs), 45000, "Security audit");
+  } catch (error) {
+    honeypotReport = {
+      verdict: "CAUTION",
+      score: 25,
+      dangers: [],
+      notes: [`Audit lỗi: ${error.message}`],
+    };
+  }
+
+  const text = [
+    `<b>Honeypot · ${escapeHtml(config.baseSymbol)}</b>`,
+    `<code>${escapeHtml(token)}</code>`,
+    "",
+    formatHoneypotReport(honeypotReport),
+  ].join("\n");
+
+  if (editCallback) await editTradeMessage(editCallback, text, afterTrackKeyboard());
+  else {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: afterTrackKeyboard(),
+    });
+  }
 }
 
 const trackJobs = [];
@@ -3351,10 +3387,10 @@ function lpConfirmKeyboard(ethAmount) {
 function afterTrackKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: "➕ Add LP", callback_data: "lp:ranges" }],
+      [{ text: "Buy & Sell", callback_data: "panel:trade" }],
       [
-        { text: "Buy & Sell", callback_data: "panel:trade" },
-        { text: "Portfolio", callback_data: "panel:portfolio" },
+        { text: "Honeypot", callback_data: "panel:honeypot" },
+        { text: "Add LP", callback_data: "panel:lp" },
       ],
       [{ text: "Main Menu", callback_data: "menu" }],
     ],
@@ -4417,6 +4453,11 @@ async function handleCallbackQuery(callbackQuery, state) {
     return;
   }
 
+  if (data === "panel:honeypot") {
+    await runHoneypotOnDemand(state, chatId, callbackQuery);
+    return;
+  }
+
   if (data === "panel:lp") {
     await showLpPanel(callbackQuery, state);
     return;
@@ -4590,11 +4631,10 @@ async function handleTelegramMessage(message, state) {
   if (isEvmAddress(text)) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text: `Đang kiểm tra pool + honeypot cho:\n<code>${escapeHtml(text)}</code>`,
+      text: `Đang track buy/sell cho:\n<code>${escapeHtml(text)}</code>`,
       parse_mode: "HTML",
       disable_web_page_preview: "true",
     });
-    // Don't block Telegram polling while audit/LP discovery runs.
     enqueueFollowToken(text, state, chatId).catch((error) => {
       console.error(`enqueueFollowToken failed: ${error.message}`);
     });
