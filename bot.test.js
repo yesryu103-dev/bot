@@ -309,3 +309,57 @@ test("portfolio wallet prefers state over config", () => {
   );
   bot.config.walletAddress = original;
 });
+
+test("honeypot scorer marks failed transfer as DANGER", () => {
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: false,
+    transferError: "transfer restricted",
+    quoteOk: false,
+    quoteError: "no route",
+    marketScore: 0,
+    marketWarnings: [],
+  });
+
+  assert.equal(report.verdict, "DANGER");
+  assert.ok(report.score >= 60);
+});
+
+test("honeypot scorer keeps healthy token SAFE", () => {
+  const report = bot.scoreHoneypotFindings({
+    hasCode: true,
+    reputation: "ok",
+    transferOk: true,
+    quoteOk: true,
+    marketScore: 0,
+    marketWarnings: [],
+  });
+
+  assert.equal(report.verdict, "SAFE");
+});
+
+test("dex market risk flags buy-only honeypot pattern", () => {
+  const risk = bot.analyzeDexMarketRisk({
+    liquidity: { usd: 1000 },
+    volume: { h24: 5000 },
+    txns: { h24: { buys: 80, sells: 0 } },
+  });
+
+  assert.ok(risk.score >= 45);
+  assert.ok(risk.warnings.some((item) => item.toLowerCase().includes("honeypot")));
+});
+
+test("probe holder skips pool dead and contracts", () => {
+  const pair = "0xb541c2936982dd5c4090783d8f395d3e613c8016";
+  const probe = bot.pickProbeHolder(
+    [
+      { address: { hash: "0x000000000000000000000000000000000000dEaD", is_contract: false }, value: "100" },
+      { address: { hash: pair, is_contract: true }, value: "1000" },
+      { address: { hash: "0x2a7c37742C7DD2E24143BE825a1970284B47E6F6", is_contract: false }, value: "500" },
+    ],
+    [pair],
+  );
+
+  assert.equal(probe.address, "0x2a7c37742c7dd2e24143be825a1970284b47e6f6");
+});

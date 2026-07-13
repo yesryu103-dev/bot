@@ -47,10 +47,11 @@ const config = {
   twitterUrl: process.env.PROJECT_TWITTER_URL || "",
   websiteUrl: process.env.PROJECT_WEBSITE_URL || "",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
-  rpcUrl: process.env.RPC_URL || "",
+  rpcUrl: process.env.RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
   walletPrivateKey: process.env.WALLET_PRIVATE_KEY || "",
   walletAddress: process.env.WALLET_ADDRESS || "",
   swapRouterAddress: process.env.SWAP_ROUTER_ADDRESS || "0xCaf681a66D020601342297493863E78C959E5cb2",
+  quoterAddress: process.env.QUOTER_ADDRESS || "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
   uniswapV3Fee: Number(process.env.UNISWAP_V3_FEE || 10000),
   slippageBps: Number(process.env.SLIPPAGE_BPS || 200),
   oneTapTrade: truthy(process.env.ONE_TAP_TRADE),
@@ -167,6 +168,15 @@ async function fetchDexTokens(tokenAddresses) {
   return pairs;
 }
 
+async function fetchBlockscoutToken(tokenAddress) {
+  return fetchJson(`${config.blockscoutBaseUrl}/api/v2/tokens/${tokenAddress}`);
+}
+
+async function fetchTokenHolders(tokenAddress) {
+  const payload = await fetchJson(`${config.blockscoutBaseUrl}/api/v2/tokens/${tokenAddress}/holders`);
+  return payload.items || [];
+}
+
 function loadState() {
   if (!fs.existsSync(config.stateFile)) return { seen: [] };
 
@@ -264,6 +274,264 @@ function applyTrackedPair(trackedPair) {
 
 function applyStateConfig(state) {
   applyTrackedPair(state.trackedPair);
+}
+
+function isDeadOrZeroAddress(address) {
+  const value = normalizeAddress(address);
+  return (
+    !value ||
+    value === "0x0000000000000000000000000000000000000000" ||
+    value.endsWith("dead") ||
+    value === "0x0000000000000000000000000000000000000001"
+  );
+}
+
+function pickProbeHolder(holders, excludedAddresses = []) {
+  const excluded = new Set((excludedAddresses || []).map(normalizeAddress).filter(Boolean));
+  for (const entry of holders || []) {
+    const address = normalizeAddress(entry?.address?.hash || entry?.address);
+    if (!isEvmAddress(address) || isDeadOrZeroAddress(address) || excluded.has(address)) continue;
+    if (entry?.address?.is_contract) continue;
+    const raw = BigInt(entry?.value || "0");
+    if (raw <= 0n) continue;
+    return { address, raw };
+  }
+  return null;
+}
+
+function classifyRestrictionError(error) {
+  const message = String(error?.shortMessage || error?.reason || error?.message || "").toLowerCase();
+  if (!message) return "unknown revert";
+  if (message.includes("insufficient") || message.includes("transfer amount exceeds balance")) {
+    return "insufficient balance";
+  }
+  if (
+    message.includes("blacklist") ||
+    message.includes("blacklisted") ||
+    message.includes("paused") ||
+    message.includes("trading") ||
+    message.includes("forbidden") ||
+    message.includes("not allowed") ||
+    message.includes("restricted") ||
+    message.includes("honeypot")
+  ) {
+    return "transfer restricted";
+  }
+  return message.slice(0, 120);
+}
+
+function analyzeDexMarketRisk(pair) {
+  const buys = Number(pair?.txns?.h24?.buys || 0);
+  const sells = Number(pair?.txns?.h24?.sells || 0);
+  const liquidityUsd = Number(pair?.liquidity?.usd || 0);
+  const volume24 = Number(pair?.volume?.h24 || 0);
+  const warnings = [];
+  let score = 0;
+
+  if (!(liquidityUsd > 0)) {
+    warnings.push("No withdrawable liquidity on Dexscreener");
+    score += 60;
+  } else if (liquidityUsd < 50) {
+    warnings.push(`Very thin liquidity (${formatUsd(liquidityUsd)})`);
+    score += 35;
+  } else if (liquidityUsd < 500) {
+    warnings.push(`Low liquidity (${formatUsd(liquidityUsd)})`);
+    score += 15;
+  }
+
+  if (buys >= 20 && sells === 0) {
+    warnings.push("24h buys with zero sells (classic honeypot pattern)");
+    score += 45;
+  } else if (buys >= 20 && sells > 0 && buys / sells >= 20) {
+    warnings.push(`Extreme buy/sell skew (${buys}/${sells} in 24h)`);
+    score += 25;
+  }
+
+  if (volume24 <= 0 && liquidityUsd > 0) {
+    warnings.push("No 24h volume");
+    score += 5;
+  }
+
+  return { buys, sells, liquidityUsd, volume24, warnings, score };
+}
+
+function scoreHoneypotFindings(findings) {
+  let score = Number(findings.marketScore || 0);
+  const dangers = [];
+  const cautions = [...(findings.marketWarnings || [])];
+
+  if (!findings.hasCode) {
+    dangers.push("No contract bytecode at this address");
+    score += 100;
+  }
+  if (findings.reputation && findings.reputation !== "ok") {
+    dangers.push(`Blockscout reputation: ${findings.reputation}`);
+    score += 40;
+  }
+  if (findings.transferOk === false) {
+    dangers.push(`Sell/transfer simulation failed: ${findings.transferError || "restricted"}`);
+    score += 70;
+  }
+  if (findings.quoteOk === false) {
+    cautions.push(`Sell quote failed: ${findings.quoteError || "no route"}`);
+    score += 25;
+  }
+  if (findings.transferOk === true) cautions.push("Transfer simulation passed");
+  if (findings.quoteOk === true) cautions.push("Sell quote passed");
+
+  let verdict = "SAFE";
+  if (score >= 60 || dangers.some((item) => item.toLowerCase().includes("honeypot") || item.toLowerCase().includes("transfer"))) {
+    verdict = "DANGER";
+  } else if (score >= 25) {
+    verdict = "CAUTION";
+  }
+
+  if (dangers.length && verdict === "SAFE") verdict = "CAUTION";
+  if (findings.transferOk === false) verdict = "DANGER";
+
+  return {
+    verdict,
+    score,
+    dangers,
+    notes: cautions.filter((item) => !dangers.includes(item)),
+  };
+}
+
+function formatHoneypotReport(report) {
+  if (!report) return "Honeypot check: unavailable";
+
+  const icon = report.verdict === "SAFE" ? "✅" : report.verdict === "CAUTION" ? "⚠️" : "🚨";
+  const lines = [
+    `<b>Honeypot check</b>: ${icon} <b>${escapeHtml(report.verdict)}</b> (score ${report.score})`,
+  ];
+
+  for (const danger of report.dangers || []) {
+    lines.push(`🚨 ${escapeHtml(danger)}`);
+  }
+  for (const note of (report.notes || []).slice(0, 5)) {
+    lines.push(`• ${escapeHtml(note)}`);
+  }
+
+  if (report.verdict === "DANGER") {
+    lines.push("<b>Cảnh báo: có dấu hiệu không bán được / scam. Theo dõi vẫn bật, nhưng đừng mua.</b>");
+  }
+
+  return lines.join("\n");
+}
+
+async function checkTokenHoneypot(tokenAddress, pair = null) {
+  const { ethers } = require("ethers");
+  const token = normalizeAddress(tokenAddress);
+  const tracked = pair ? trackedPairFromDexPair(pair, token) : null;
+  const pairAddress = tracked?.pairAddress || normalizeAddress(pair?.pairAddress);
+  const quoteToken = tracked?.quoteTokenAddress || config.quoteTokenAddress;
+  const feeCandidates = [
+    Number(pair?.fee),
+    config.uniswapV3Fee,
+    10000,
+    3000,
+    500,
+    100,
+  ].filter((value, index, list) => Number.isFinite(value) && value > 0 && list.indexOf(value) === index);
+  const market = analyzeDexMarketRisk(pair);
+
+  const findings = {
+    hasCode: false,
+    reputation: "",
+    transferOk: null,
+    transferError: "",
+    quoteOk: null,
+    quoteError: "",
+    marketScore: market.score,
+    marketWarnings: market.warnings,
+  };
+
+  try {
+    const provider = new ethers.JsonRpcProvider(config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com");
+    const code = await provider.getCode(token);
+    findings.hasCode = Boolean(code && code !== "0x");
+
+    try {
+      const tokenInfo = await fetchBlockscoutToken(token);
+      findings.reputation = String(tokenInfo?.reputation || "").toLowerCase();
+    } catch (error) {
+      findings.marketWarnings.push(`Blockscout token info unavailable: ${error.message}`);
+    }
+
+    let probeAmount = 0n;
+    let probeFrom = "";
+    try {
+      const holders = await fetchTokenHolders(token);
+      const probe = pickProbeHolder(holders, [pairAddress, token, quoteToken, config.swapRouterAddress]);
+      if (probe) {
+        probeFrom = probe.address;
+        probeAmount = probe.raw / 1000n || 1n;
+        const erc20 = new ethers.Contract(
+          token,
+          ["function transfer(address to,uint256 amount) returns (bool)"],
+          provider,
+        );
+        await erc20.transfer.staticCall("0x1111111111111111111111111111111111111111", probeAmount, {
+          from: probeFrom,
+        });
+        findings.transferOk = true;
+      } else {
+        findings.transferOk = null;
+        findings.marketWarnings.push("No EOA holder found to simulate transfer");
+      }
+    } catch (error) {
+      findings.transferOk = false;
+      findings.transferError = classifyRestrictionError(error);
+    }
+
+    if (probeAmount > 0n && quoteToken) {
+      let quoted = false;
+      let lastQuoteError = "";
+      for (const fee of feeCandidates) {
+        try {
+          const quoter = new ethers.Contract(
+            config.quoterAddress,
+            [
+              "function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)",
+            ],
+            provider,
+          );
+          const result = await quoter.quoteExactInputSingle.staticCall({
+            tokenIn: token,
+            tokenOut: quoteToken,
+            amountIn: probeAmount,
+            fee,
+            sqrtPriceLimitX96: 0,
+          });
+          findings.quoteOk = BigInt(result.amountOut ?? result[0]) > 0n;
+          if (!findings.quoteOk) {
+            lastQuoteError = "zero amount out";
+            continue;
+          }
+          quoted = true;
+          break;
+        } catch (error) {
+          lastQuoteError = classifyRestrictionError(error);
+        }
+      }
+      if (!quoted) {
+        findings.quoteOk = false;
+        findings.quoteError = lastQuoteError || "no route";
+      }
+    }
+  } catch (error) {
+    findings.marketWarnings.push(`RPC honeypot check failed: ${error.message}`);
+  }
+
+  const scored = scoreHoneypotFindings(findings);
+  return {
+    token,
+    pairAddress,
+    ...findings,
+    ...scored,
+    market,
+    quoteOk: findings.quoteOk,
+  };
 }
 
 function groupHashes(transfers) {
@@ -939,6 +1207,13 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
   saveState(state);
 
+  let honeypotReport = null;
+  try {
+    honeypotReport = await checkTokenHoneypot(tokenAddress, pair);
+  } catch (error) {
+    console.warn(`Honeypot check failed for ${tokenAddress}: ${error.message}`);
+  }
+
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
@@ -947,6 +1222,8 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       `Quote: <b>${escapeHtml(trackedPair.quoteSymbol)}</b>`,
       `Alert min: <b>${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}</b>`,
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
+      "",
+      formatHoneypotReport(honeypotReport),
       "",
       "Muốn xem cả ví? Gửi <code>/portfolio</code> hoặc paste địa chỉ ví.",
     ].join("\n"),
@@ -1424,7 +1701,7 @@ async function handleTelegramMessage(message, state) {
   if (isEvmAddress(text)) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text: `Đang kiểm tra địa chỉ:\n<code>${escapeHtml(text)}</code>`,
+      text: `Đang kiểm tra pool + honeypot cho:\n<code>${escapeHtml(text)}</code>`,
       parse_mode: "HTML",
       disable_web_page_preview: "true",
     });
@@ -1599,9 +1876,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  analyzeDexMarketRisk,
   buildPortfolioFromBalances,
   classifyFromTransaction,
+  classifyRestrictionError,
   config,
+  formatHoneypotReport,
   formatUnits,
   getPortfolioWallet,
   groupHashes,
@@ -1618,8 +1898,10 @@ module.exports = {
   chooseBestPairForToken,
   parseTelegramChatIds,
   parseWalletBalanceEntry,
+  pickProbeHolder,
   portfolioKeyboard,
   portfolioPanelText,
+  scoreHoneypotFindings,
   shouldTradeImmediately,
   sniperTradeKeyboard,
   staticMainPanelText,
