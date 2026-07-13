@@ -236,6 +236,33 @@ test("main menu looks like a trading dashboard", () => {
   assert(toolCallbacks.includes("portfolio:refresh"));
 });
 
+test("main menu bag buttons open sell panel without changing sniper labels", () => {
+  const repe = "0x5266eeaff092d6136ab63d18b975a60a0cc0c8f7";
+  const cash = "0x020bfc650a365f8bb26819deaabf3e21291018b4";
+  const portfolio = {
+    items: [
+      { address: repe, symbol: "REPE", valueUsd: 12.5 },
+      { address: cash, symbol: "CASHCAT", valueUsd: 40 },
+    ],
+  };
+  const keyboard = bot.mainMenuKeyboard(portfolio);
+  const labels = keyboard.inline_keyboard.flat().map((button) => button.text);
+  const callbacks = keyboard.inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
+
+  assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
+  assert(labels.some((label) => label.startsWith("REPE ")));
+  assert(labels.some((label) => label.startsWith("CASHCAT ")));
+  assert(callbacks.includes(`bag:${repe}`));
+  assert(callbacks.includes(`bag:${cash}`));
+
+  const bagKeyboard = bot.bagSellKeyboard(portfolio.items[0]);
+  const bagCallbacks = bagKeyboard.inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
+  assert(bagCallbacks.includes(`bagsell:${repe}:25%`));
+  assert(bagCallbacks.includes(`bagsell:${repe}:ALL`));
+  assert(bagCallbacks.includes(`bagtrack:${repe}`));
+  assert.equal(bot.formatBagButtonLabel(portfolio.items[0]), "REPE $12.50");
+});
+
 test("expired Telegram callback errors are recognized", () => {
   const error = new Error(
     'HTTP 400 Bad Request: {"ok":false,"description":"Bad Request: query is too old and response timeout expired or query ID is invalid"}',

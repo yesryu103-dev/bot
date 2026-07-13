@@ -419,7 +419,13 @@ async function fetchTransaction(txHash) {
 }
 
 async function fetchDexPair() {
-  const url = `https://api.dexscreener.com/latest/dex/pairs/robinhood/${config.pairAddress}`;
+  return fetchDexPairByAddress(config.pairAddress);
+}
+
+async function fetchDexPairByAddress(pairAddress) {
+  const pair = normalizeAddress(pairAddress);
+  if (!isEvmAddress(pair)) return null;
+  const url = `https://api.dexscreener.com/latest/dex/pairs/robinhood/${pair}`;
   const payload = await fetchJson(url);
   return payload.pair || payload.pairs?.[0] || null;
 }
@@ -2415,7 +2421,7 @@ function portfolioSectionText(portfolio) {
     }
   }
 
-  lines.push("<i>Tools → Update Price để quét lại ví.</i>");
+  lines.push("<i>Bấm token bên dưới để Sell bag · Tools → Update Price để quét lại.</i>");
   return lines.join("\n");
 }
 
@@ -2621,7 +2627,80 @@ function toolsPanelText() {
   ].join("\n");
 }
 
-function mainMenuKeyboard() {
+function formatBagButtonLabel(item) {
+  const sym = String(item?.symbol || "TOKEN").slice(0, 10);
+  const value = Number(item?.valueUsd);
+  if (!Number.isFinite(value)) return sym;
+  if (value >= 100) return `${sym} $${Math.round(value)}`;
+  if (value >= 1) return `${sym} $${value.toFixed(2)}`;
+  return `${sym} $${Number(value.toPrecision(3))}`;
+}
+
+function bagButtonRows(portfolio, maxTokens = 6) {
+  const items = (Array.isArray(portfolio?.items) ? portfolio.items : [])
+    .filter((item) => isEvmAddress(item?.address))
+    .slice(0, maxTokens);
+  const buttons = items.map((item) => ({
+    text: formatBagButtonLabel(item),
+    callback_data: `bag:${normalizeAddress(item.address)}`,
+  }));
+  return chunkButtons(buttons, 2);
+}
+
+function findBagItem(state, tokenAddress) {
+  const token = normalizeAddress(tokenAddress);
+  return (state?.portfolioSnapshot?.items || []).find((item) => normalizeAddress(item.address) === token) || null;
+}
+
+function bagSellPanelText(item, extras = {}) {
+  if (!item?.address) {
+    return [`<b>Sell bag</b>`, "Token không còn trong portfolio. Bấm Update Price rồi thử lại."].join("\n");
+  }
+  const chart = item.pairUrl ? `<a href="${escapeHtml(item.pairUrl)}">Dexscreener</a>` : "";
+  return [
+    `<b>Sell ${escapeHtml(item.symbol || "TOKEN")}</b>`,
+    `Balance: <b>${escapeHtml(formatTokenAmount(item.amount))}</b> · Value: <b>${escapeHtml(formatUsd(item.valueUsd))}</b>`,
+    `Price: <b>${escapeHtml(formatPriceUsd(item.priceUsd))}</b>`,
+    chart ? `Pair: ${chart}` : "",
+    extras.note || "",
+    "",
+    `Sniper đang track: <b>${escapeHtml(config.baseSymbol)}</b> (bán bag không đổi track).`,
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
+function bagSellKeyboard(item) {
+  const token = normalizeAddress(item?.address);
+  const symbol = item?.symbol || "TOKEN";
+  const sellButtons = [...(config.sellPercents || [25, 50, 70])].map((percent) => ({
+    text: `Sell ${percent}%`,
+    callback_data: `bagsell:${token}:${percent}%`,
+  }));
+  return {
+    inline_keyboard: [
+      ...chunkButtons(sellButtons, 2),
+      [{ text: `Sell All ${symbol}`, callback_data: `bagsell:${token}:ALL` }],
+      [{ text: `Track ${symbol}`, callback_data: `bagtrack:${token}` }],
+      [{ text: "Main Menu", callback_data: "menu" }],
+    ],
+  };
+}
+
+function bagConfirmKeyboard(tokenAddress, amount) {
+  const token = normalizeAddress(tokenAddress);
+  return {
+    inline_keyboard: [
+      [{ text: `Confirm SELL ${amount}`, callback_data: `bagconfirm:${token}:${amount}` }],
+      [
+        { text: "Cancel", callback_data: `bag:${token}` },
+        { text: "Main Menu", callback_data: "menu" },
+      ],
+    ],
+  };
+}
+
+function mainMenuKeyboard(portfolio = null) {
   return {
     inline_keyboard: [
       ...tradeActionRows(),
@@ -2629,6 +2708,7 @@ function mainMenuKeyboard() {
         { text: "Chart", url: config.dexscreenPairUrl },
         { text: "Tools", callback_data: "panel:tools" },
       ],
+      ...bagButtonRows(portfolio),
     ],
   };
 }
@@ -2842,12 +2922,13 @@ async function sendTradeMenu(chatId = config.telegramChatId) {
 }
 
 async function sendMainMenu(chatId = config.telegramChatId, state = loadState()) {
+  const text = await mainPanelText({ state });
   return telegramRequest("sendMessage", {
     chat_id: chatId,
-    text: await mainPanelText({ state }),
+    text,
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-    reply_markup: mainMenuKeyboard(),
+    reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
   });
 }
 
@@ -2866,7 +2947,7 @@ async function showPortfolio(chatId, state, { editCallback = null, announce = fa
 
   const text = await mainPanelText({ state, refreshPortfolio: forceRefresh });
   if (editCallback) {
-    await editTradeMessage(editCallback, text, mainMenuKeyboard());
+    await editTradeMessage(editCallback, text, mainMenuKeyboard(state.portfolioSnapshot));
     return state.portfolioSnapshot || null;
   }
 
@@ -2875,7 +2956,7 @@ async function showPortfolio(chatId, state, { editCallback = null, announce = fa
     text,
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-    reply_markup: mainMenuKeyboard(),
+    reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
   });
   return state.portfolioSnapshot || null;
 }
@@ -4392,21 +4473,96 @@ async function getWalletTokenBalance(tokenAddress) {
   };
 }
 
-async function estimateMinimumOut(side, amountText) {
+async function resolveSellContext(tokenAddress, state = {}) {
+  const token = normalizeAddress(tokenAddress);
+  if (!isEvmAddress(token)) throw new Error("Invalid bag token address.");
+
+  const fromBag = findBagItem(state, token);
+  let pairAddress = normalizeAddress(fromBag?.pairAddress || "");
+  let baseSymbol = fromBag?.symbol || "TOKEN";
+  let pairUrl = fromBag?.pairUrl || "";
+  let priceNative = Number.NaN;
+  let priceUsd = Number(fromBag?.priceUsd);
+  let decimals = Number(fromBag?.decimals);
+  if (!Number.isFinite(decimals) || decimals < 0) decimals = 18;
+
+  let pair = pairAddress ? await fetchDexPairByAddress(pairAddress) : null;
+  if (!pair) {
+    const pairs = await fetchTokenPairs(token);
+    pair = chooseBestPairForToken(pairs, token);
+  }
+  if (!pair?.pairAddress) {
+    throw new Error(`Không tìm thấy pair WETH thanh khoản cho ${baseSymbol}.`);
+  }
+
+  const tracked = trackedPairFromDexPair(pair, token);
+  pairAddress = tracked.pairAddress;
+  baseSymbol = tracked.baseSymbol || baseSymbol;
+  pairUrl = tracked.pairUrl || pairUrl || `https://dexscreener.com/robinhood/${pairAddress}`;
+  priceNative = Number(pair.priceNative);
+  priceUsd = Number(pair.priceUsd);
+  const rawBase = normalizeAddress(pair.baseToken?.address);
+  if (rawBase !== token && Number.isFinite(priceNative) && priceNative > 0) {
+    priceNative = 1 / priceNative;
+  }
+  if (!Number.isFinite(priceNative) || priceNative <= 0) {
+    throw new Error(`Cannot read priceNative for ${baseSymbol} from Dexscreener.`);
+  }
+
+  let fee = config.uniswapV3Fee;
+  try {
+    const meta = await getPoolMeta(pairAddress);
+    if (Number.isFinite(meta.fee) && meta.fee > 0) fee = meta.fee;
+  } catch {
+    // keep current fee
+  }
+
+  return {
+    baseTokenAddress: token,
+    baseSymbol,
+    quoteTokenAddress: config.quoteTokenAddress,
+    quoteSymbol: config.quoteSymbol,
+    pairAddress,
+    pairUrl,
+    fee,
+    priceNative,
+    priceUsd,
+    decimals,
+  };
+}
+
+async function estimateMinimumOut(side, amountText, overrides = {}) {
+  const baseTokenAddress = normalizeAddress(overrides.baseTokenAddress || config.baseTokenAddress);
+  const baseSymbol = overrides.baseSymbol || config.baseSymbol;
+  const decimals = Number.isFinite(Number(overrides.decimals)) ? Number(overrides.decimals) : 18;
   let resolvedAmountText = amountText;
   if (side === "SELL") {
     const percent = parseSellPercent(amountText);
     if (percent !== null) {
       const { ethers } = require("ethers");
-      const tokenBalance = await getWalletTokenBalance(config.baseTokenAddress);
+      const tokenBalance = await getWalletTokenBalance(baseTokenAddress);
       const amountIn = balancePercent(tokenBalance.balance, percent);
-      if (amountIn <= 0n) throw new Error(`No ${config.baseSymbol} balance to sell.`);
-      resolvedAmountText = ethers.formatUnits(amountIn, 18);
+      if (amountIn <= 0n) throw new Error(`No ${baseSymbol} balance to sell.`);
+      resolvedAmountText = ethers.formatUnits(amountIn, decimals);
     }
   }
 
-  const pair = await fetchDexPair();
-  const priceNative = Number(pair?.priceNative);
+  let priceNative = Number(overrides.priceNative);
+  let priceUsd = Number(overrides.priceUsd);
+  if (!Number.isFinite(priceNative) || priceNative <= 0) {
+    const pair = overrides.pairAddress
+      ? await fetchDexPairByAddress(overrides.pairAddress)
+      : await fetchDexPair();
+    priceNative = Number(pair?.priceNative);
+    priceUsd = Number(pair?.priceUsd);
+    if (overrides.baseTokenAddress) {
+      const rawBase = normalizeAddress(pair?.baseToken?.address);
+      const token = normalizeAddress(overrides.baseTokenAddress);
+      if (rawBase && token && rawBase !== token && Number.isFinite(priceNative) && priceNative > 0) {
+        priceNative = 1 / priceNative;
+      }
+    }
+  }
   if (!Number.isFinite(priceNative) || priceNative <= 0) {
     throw new Error("Cannot read current price from Dexscreener.");
   }
@@ -4420,13 +4576,15 @@ async function estimateMinimumOut(side, amountText) {
     expectedOut,
     minOut,
     priceNative,
-    priceUsd: Number(pair?.priceUsd),
+    priceUsd,
     resolvedAmountText,
     sellPercent: side === "SELL" ? parseSellPercent(amountText) : null,
+    baseSymbol,
+    quoteSymbol: overrides.quoteSymbol || config.quoteSymbol,
   };
 }
 
-async function executeSwap(side, amountText) {
+async function executeSwap(side, amountText, overrides = {}) {
   if (!config.tradeEnabled) {
     throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 sau khi cấu hình RPC_URL và WALLET_PRIVATE_KEY.");
   }
@@ -4435,26 +4593,39 @@ async function executeSwap(side, amountText) {
     throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
   }
 
+  const baseTokenAddress = normalizeAddress(overrides.baseTokenAddress || config.baseTokenAddress);
+  const baseSymbol = overrides.baseSymbol || config.baseSymbol;
+  const quoteTokenAddress = normalizeAddress(overrides.quoteTokenAddress || config.quoteTokenAddress);
+  const quoteSymbol = overrides.quoteSymbol || config.quoteSymbol;
+  const fee = Number(overrides.fee || config.uniswapV3Fee);
+  const decimalsIn = Number.isFinite(Number(overrides.decimals)) ? Number(overrides.decimals) : 18;
+  const decimalsOut = 18;
+
   const { ethers } = require("ethers");
   const provider = new ethers.JsonRpcProvider(config.rpcUrl);
   const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
-  const tokenIn = side === "BUY" ? config.quoteTokenAddress : config.baseTokenAddress;
-  const tokenOut = side === "BUY" ? config.baseTokenAddress : config.quoteTokenAddress;
-  const tokenInSymbol = side === "BUY" ? config.quoteSymbol : config.baseSymbol;
-  const tokenOutSymbol = side === "BUY" ? config.baseSymbol : config.quoteSymbol;
-  const decimalsIn = 18;
-  const decimalsOut = 18;
+  const tokenIn = side === "BUY" ? quoteTokenAddress : baseTokenAddress;
+  const tokenOut = side === "BUY" ? baseTokenAddress : quoteTokenAddress;
+  const tokenInSymbol = side === "BUY" ? quoteSymbol : baseSymbol;
+  const tokenOutSymbol = side === "BUY" ? baseSymbol : quoteSymbol;
   let amountIn;
   const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
   if (side === "SELL" && sellPercent !== null) {
-    const tokenBalance = await getWalletTokenBalance(config.baseTokenAddress);
+    const tokenBalance = await getWalletTokenBalance(baseTokenAddress);
     amountIn = balancePercent(tokenBalance.balance, sellPercent);
-    if (amountIn <= 0n) throw new Error(`No ${config.baseSymbol} balance to sell.`);
+    if (amountIn <= 0n) throw new Error(`No ${baseSymbol} balance to sell.`);
     amountText = ethers.formatUnits(amountIn, decimalsIn);
   } else {
     amountIn = ethers.parseUnits(amountText, decimalsIn);
   }
-  const quote = await estimateMinimumOut(side, amountText);
+  const quote = await estimateMinimumOut(side, amountText, {
+    ...overrides,
+    baseTokenAddress,
+    baseSymbol,
+    quoteTokenAddress,
+    quoteSymbol,
+    decimals: decimalsIn,
+  });
   const amountOutMinimum = ethers.parseUnits(numberToDecimalString(quote.minOut, decimalsOut), decimalsOut);
   const deadline = Math.floor(Date.now() / 1000) + 60 * 5;
 
@@ -4483,7 +4654,7 @@ async function executeSwap(side, amountText) {
   const params = {
     tokenIn,
     tokenOut,
-    fee: config.uniswapV3Fee,
+    fee,
     recipient: wallet.address,
     deadline,
     amountIn,
@@ -4541,6 +4712,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
   try {
     const result = await executeSwap(side, amount);
     const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    const state = loadState();
     await editTradeMessage(
       callbackQuery,
       [
@@ -4549,13 +4721,60 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
         `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
         `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
       ].join("\n"),
-      mainMenuKeyboard(),
+      mainMenuKeyboard(state.portfolioSnapshot),
     );
   } catch (error) {
+    const state = loadState();
     await editTradeMessage(
       callbackQuery,
       `<b>Trade not sent</b>\n${escapeHtml(error.message)}`,
-      mainMenuKeyboard(),
+      mainMenuKeyboard(state.portfolioSnapshot),
+    );
+  }
+}
+
+async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
+  let ctx;
+  try {
+    ctx = await resolveSellContext(tokenAddress, state);
+  } catch (error) {
+    await editTradeMessage(
+      callbackQuery,
+      `<b>Bag sell failed</b>\n${escapeHtml(error.message)}`,
+      mainMenuKeyboard(state.portfolioSnapshot),
+    );
+    return;
+  }
+
+  await editTradeMessage(
+    callbackQuery,
+    `<b>Sending SELL ${escapeHtml(ctx.baseSymbol)}...</b>\nAmount: ${escapeHtml(amount)} ${escapeHtml(ctx.baseSymbol)}`,
+  );
+
+  try {
+    const result = await executeSwap("SELL", amount, ctx);
+    const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>SELL ${escapeHtml(ctx.baseSymbol)} sent</b>`,
+        `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+        `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
+        `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
+        `Track alerts vẫn: <b>${escapeHtml(config.baseSymbol)}</b>`,
+      ].join("\n"),
+      mainMenuKeyboard(state.portfolioSnapshot),
+    );
+  } catch (error) {
+    const item = findBagItem(state, tokenAddress) || {
+      address: ctx.baseTokenAddress,
+      symbol: ctx.baseSymbol,
+      pairUrl: ctx.pairUrl,
+    };
+    await editTradeMessage(
+      callbackQuery,
+      `<b>Bag sell not sent</b>\n${escapeHtml(error.message)}`,
+      bagSellKeyboard(item),
     );
   }
 }
@@ -4575,7 +4794,7 @@ async function handleCallbackQuery(callbackQuery, state) {
     await editTradeMessage(
       callbackQuery,
       await mainPanelText({ state }),
-      mainMenuKeyboard(),
+      mainMenuKeyboard(state.portfolioSnapshot),
     );
     return;
   }
@@ -4676,7 +4895,7 @@ async function handleCallbackQuery(callbackQuery, state) {
         `Alert min: <b>${config.minQuoteAmount} ${escapeHtml(config.quoteSymbol)}</b>`,
         `Portfolio wallet: <code>${escapeHtml(getPortfolioWallet(state) ? compactAddress(getPortfolioWallet(state)) : "Not set")}</code>`,
       ].join("\n"),
-      mainMenuKeyboard(),
+      mainMenuKeyboard(state.portfolioSnapshot),
     );
     return;
   }
@@ -4704,6 +4923,131 @@ async function handleCallbackQuery(callbackQuery, state) {
   if (data.startsWith("soon:")) {
     const feature = data.slice("soon:".length);
     await answerCallback(callbackQuery, `${feature} coming soon.`);
+    return;
+  }
+
+  if (data.startsWith("bag:")) {
+    const token = normalizeAddress(data.slice("bag:".length));
+    let item = findBagItem(state, token);
+    if (!item) {
+      await resolveMenuPortfolio(state, { forceRefresh: true });
+      item = findBagItem(state, token);
+    }
+    if (!item) {
+      await editTradeMessage(
+        callbackQuery,
+        bagSellPanelText(null),
+        mainMenuKeyboard(state.portfolioSnapshot),
+      );
+      return;
+    }
+    await editTradeMessage(callbackQuery, bagSellPanelText(item), bagSellKeyboard(item));
+    return;
+  }
+
+  if (data.startsWith("bagtrack:")) {
+    const token = normalizeAddress(data.slice("bagtrack:".length));
+    if (!isEvmAddress(token)) {
+      await editTradeMessage(
+        callbackQuery,
+        "Token address không hợp lệ.",
+        mainMenuKeyboard(state.portfolioSnapshot),
+      );
+      return;
+    }
+    await editTradeMessage(
+      callbackQuery,
+      `Đang chuyển track sang:\n<code>${escapeHtml(token)}</code>`,
+      mainMenuKeyboard(state.portfolioSnapshot),
+    );
+    enqueueFollowToken(token, state, chatId).catch((error) => {
+      console.error(`bagtrack follow failed: ${error.message}`);
+    });
+    return;
+  }
+
+  if (data.startsWith("bagsell:")) {
+    const parts = data.split(":");
+    const token = normalizeAddress(parts[1] || "");
+    const amount = parts.slice(2).join(":") || "";
+    if (!isEvmAddress(token) || !amount) {
+      await editTradeMessage(
+        callbackQuery,
+        "Bag sell callback không hợp lệ.",
+        mainMenuKeyboard(state.portfolioSnapshot),
+      );
+      return;
+    }
+
+    if (shouldTradeImmediately("SELL", amount)) {
+      await runConfirmedBagSell(callbackQuery, token, amount, state);
+      return;
+    }
+
+    let ctx;
+    try {
+      ctx = await resolveSellContext(token, state);
+    } catch (error) {
+      const item = findBagItem(state, token);
+      await editTradeMessage(
+        callbackQuery,
+        `<b>Confirm SELL failed</b>\n${escapeHtml(error.message)}`,
+        item ? bagSellKeyboard(item) : mainMenuKeyboard(state.portfolioSnapshot),
+      );
+      return;
+    }
+
+    const sellPercent = parseSellPercent(amount);
+    const spendLabel =
+      sellPercent !== null
+        ? sellPercent >= 100
+          ? `ALL ${ctx.baseSymbol}`
+          : `${sellPercent}% bag ${ctx.baseSymbol}`
+        : `${amount} ${ctx.baseSymbol}`;
+    let estimateText = "";
+    try {
+      const quote = await estimateMinimumOut("SELL", amount, ctx);
+      estimateText = [
+        sellPercent !== null && quote.resolvedAmountText
+          ? `Sell qty: ~<b>${escapeHtml(numberToDecimalString(Number(quote.resolvedAmountText), 6))} ${escapeHtml(ctx.baseSymbol)}</b>`
+          : "",
+        `Expected out: ~<b>${escapeHtml(numberToDecimalString(quote.expectedOut, 6))} ${escapeHtml(ctx.quoteSymbol)}</b>`,
+        `Min out: <b>${escapeHtml(numberToDecimalString(quote.minOut, 6))} ${escapeHtml(ctx.quoteSymbol)}</b>`,
+        `Slippage: <b>${config.slippageBps / 100}%</b>`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    } catch (error) {
+      estimateText = `Estimate unavailable: ${escapeHtml(error.message)}`;
+    }
+
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>Confirm SELL ${escapeHtml(ctx.baseSymbol)}</b>`,
+        `Spend: <b>${escapeHtml(spendLabel)}</b>`,
+        estimateText,
+        `Trading: <b>${config.tradeEnabled ? "ON" : "OFF"}</b>`,
+        `Alerts vẫn track: <b>${escapeHtml(config.baseSymbol)}</b>`,
+      ].join("\n"),
+      bagConfirmKeyboard(token, amount),
+    );
+    return;
+  }
+
+  if (data.startsWith("bagconfirm:")) {
+    const parts = data.split(":");
+    const token = normalizeAddress(parts[1] || "");
+    const amount = parts.slice(2).join(":") || "";
+    if (!isEvmAddress(token) || !amount) {
+      await editTradeMessage(
+        callbackQuery,
+        "Bag confirm callback không hợp lệ.",
+        mainMenuKeyboard(state.portfolioSnapshot),
+      );
+      return;
+    }
+    await runConfirmedBagSell(callbackQuery, token, amount, state);
     return;
   }
 
@@ -5112,6 +5456,9 @@ module.exports = {
   normalizeAddress,
   mainMenuKeyboard,
   toolsKeyboard,
+  bagButtonRows,
+  bagSellKeyboard,
+  formatBagButtonLabel,
   mainPanelText,
   chooseBestPairForToken,
   chooseWatchPairAddresses,
