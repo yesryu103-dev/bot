@@ -183,6 +183,7 @@ test("main menu looks like a trading dashboard", () => {
 
   assert(text.includes(bot.config.botTitle));
   assert(labels.includes("Buy & Sell"));
+  assert(labels.includes("Honeypot"));
   assert(labels.includes("Add LP"));
   assert(labels.includes("My LP"));
   assert(labels.includes("Portfolio"));
