@@ -44,11 +44,12 @@ const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
   telegramChatIds: parseTelegramChatIds(process.env.TELEGRAM_CHAT_ID || ""),
   telegramChatId: parseTelegramChatIds(process.env.TELEGRAM_CHAT_ID || "")[0] || "",
-  botTitle: process.env.BOT_TITLE || "REPETradingBot",
-  botTagline: process.env.BOT_TAGLINE || "Your Gateway to Robinhood DeFi",
-  telegramUrl: process.env.PROJECT_TELEGRAM_URL || "",
-  twitterUrl: process.env.PROJECT_TWITTER_URL || "",
-  websiteUrl: process.env.PROJECT_WEBSITE_URL || "",
+  // Hardcoded brand — ignore stale Render BOT_TITLE env if set to old names.
+  botTitle: "Treasure_tradingbot",
+  botTagline: "",
+  telegramUrl: "",
+  twitterUrl: "",
+  websiteUrl: "",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
   rpcUrl: process.env.RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
   walletPrivateKey: process.env.WALLET_PRIVATE_KEY || "",
@@ -2497,15 +2498,7 @@ function tradePanelText(title = `${config.baseSymbol} Sniper`) {
 }
 
 function linkLine() {
-  const links = [
-    ["Telegram", config.telegramUrl],
-    ["Twitter", config.twitterUrl],
-    ["Website", config.websiteUrl],
-  ]
-    .filter(([, url]) => url)
-    .map(([label, url]) => `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`);
-
-  return links.length > 0 ? links.join(" | ") : `<a href="${escapeHtml(config.dexscreenPairUrl)}">Dexscreener</a>`;
+  return "";
 }
 
 async function getDisplayWallet() {
@@ -2533,45 +2526,67 @@ async function getNativeBalance(walletAddress) {
   }
 }
 
-async function mainPanelText() {
-  let pair = null;
+async function fetchEthPriceUsd() {
   try {
-    pair = await fetchDexPair();
-  } catch {
-    pair = null;
-  }
+    const weth = normalizeAddress(config.quoteTokenAddress || config.lpWethAddress);
+    const pairs = await fetchTokenPairs(weth);
+    const list = (Array.isArray(pairs) ? pairs : []).filter(
+      (pair) => normalizeAddress(pair.chainId) === "robinhood" && Number(pair.liquidity?.usd || 0) > 0,
+    );
 
-  const priceUsd = Number(pair?.priceUsd);
-  const priceText = Number.isFinite(priceUsd) ? `$${priceUsd.toPrecision(4)}` : "n/a";
+    // Prefer WETH priced against a stable quote.
+    const stable = list
+      .filter((pair) => {
+        const base = normalizeAddress(pair.baseToken?.address);
+        const quoteSym = String(pair.quoteToken?.symbol || "").toUpperCase();
+        return base === weth && (quoteSym.includes("USD") || quoteSym === "USDC" || quoteSym === "USDG");
+      })
+      .sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0))[0];
+    if (stable && Number(stable.priceUsd) > 0) return Number(stable.priceUsd);
+
+    // Fallback: any liquid pair involving WETH — derive ETH from token USD / native.
+    for (const pair of list.sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0))) {
+      const priceUsd = Number(pair.priceUsd);
+      const priceNative = Number(pair.priceNative);
+      const base = normalizeAddress(pair.baseToken?.address);
+      const quote = normalizeAddress(pair.quoteToken?.address);
+      if (base === weth && priceUsd > 0) return priceUsd;
+      if (quote === weth && priceUsd > 0 && priceNative > 0) return priceUsd / priceNative;
+    }
+  } catch {
+    // ignore
+  }
+  return Number.NaN;
+}
+
+async function mainPanelText() {
+  const ethUsd = await fetchEthPriceUsd();
+  const priceText = Number.isFinite(ethUsd) ? `$${ethUsd.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "n/a";
   const wallet = await getDisplayWallet();
   const balance = await getNativeBalance(wallet);
   const walletText = wallet ? compactAddress(wallet) : "Not configured";
   const balanceText = balance ? `${Number(balance).toPrecision(6)} ETH` : "n/a";
 
   return [
-    `🚀 <b>${escapeHtml(config.botTitle)}: ${escapeHtml(config.botTagline)}</b>`,
+    `🚀 <b>${escapeHtml(config.botTitle)}</b>`,
     "",
-    `💰 <b>${escapeHtml(config.baseSymbol)} Price:</b> <code>${escapeHtml(priceText)}</code>`,
+    `💰 <b>ETH Price:</b> <code>${escapeHtml(priceText)}</code>`,
     "",
-    `💳 <b>Your First Wallet</b>`,
+    `💳 <b>Your Wallet</b>`,
     `↳ <code>${escapeHtml(walletText)}</code>`,
     `↳ <b>Balance:</b> <code>${escapeHtml(balanceText)}</code>`,
-    "",
-    linkLine(),
   ].join("\n");
 }
 
 function staticMainPanelText() {
   return [
-    `🚀 <b>${escapeHtml(config.botTitle)}: ${escapeHtml(config.botTagline)}</b>`,
+    `🚀 <b>${escapeHtml(config.botTitle)}</b>`,
     "",
-    `💰 <b>${escapeHtml(config.baseSymbol)} Price:</b> <code>n/a</code>`,
+    `💰 <b>ETH Price:</b> <code>n/a</code>`,
     "",
-    `💳 <b>Your First Wallet</b>`,
+    `💳 <b>Your Wallet</b>`,
     `↳ <code>${escapeHtml(config.walletAddress ? compactAddress(config.walletAddress) : "Not configured")}</code>`,
     `↳ <b>Balance:</b> <code>n/a</code>`,
-    "",
-    linkLine(),
   ].join("\n");
 }
 
