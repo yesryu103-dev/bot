@@ -237,6 +237,7 @@ test("trade smaller than minimum quote amount is ignored", () => {
 test("portfolio keeps liquid tokens and hides junk", () => {
   const goodToken = "0x1111111111111111111111111111111111111111";
   const junkToken = "0x2222222222222222222222222222222222222222";
+  const dustyToken = "0x3333333333333333333333333333333333333333";
   const balances = [
     {
       value: "1000000000000000000000",
@@ -245,6 +246,10 @@ test("portfolio keeps liquid tokens and hides junk", () => {
     {
       value: "5000000000000000000000",
       token: { address_hash: junkToken, symbol: "SCAM", decimals: "18", type: "ERC-20" },
+    },
+    {
+      value: "45000000000000000000",
+      token: { address_hash: dustyToken, symbol: "DUST", decimals: "18", type: "ERC-20" },
     },
   ];
   const pairs = [
@@ -265,15 +270,27 @@ test("portfolio keeps liquid tokens and hides junk", () => {
       priceUsd: "0.02",
       liquidity: { usd: 5 },
     },
+    {
+      chainId: "robinhood",
+      pairAddress: "0xcccccccccccccccccccccccccccccccccccccccc",
+      baseToken: { address: dustyToken, symbol: "DUST" },
+      quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      priceUsd: "0.001",
+      liquidity: { usd: 500 },
+    },
   ];
 
-  const portfolio = bot.buildPortfolioFromBalances(balances, pairs, { minLiquidityUsd: 50, maxTokens: 10 });
+  const portfolio = bot.buildPortfolioFromBalances(balances, pairs, {
+    minLiquidityUsd: 50,
+    minValueUsd: 3,
+    maxTokens: 10,
+  });
 
   assert.equal(portfolio.items.length, 1);
   assert.equal(portfolio.items[0].symbol, "GOOD");
-  assert.equal(portfolio.skipped, 1);
+  assert.equal(portfolio.skipped, 2);
   assert.ok(portfolio.totalUsd > 0);
-  assert.equal(bot.isTradeablePortfolioItem(portfolio.items[0], 50), true);
+  assert.equal(bot.isTradeablePortfolioItem(portfolio.items[0], { minLiquidityUsd: 50, minValueUsd: 3 }), true);
 });
 
 test("portfolio keyboard exposes Update Price", () => {

@@ -57,6 +57,7 @@ const config = {
   buyAmountsQuote: parseAmountOptions(process.env.BUY_AMOUNTS_QUOTE || "0.01,0.05,0.1,0.25"),
   sellAmountsBase: parseAmountOptions(process.env.SELL_AMOUNTS_BASE || "1000,5000,10000,25000"),
   minPortfolioLiquidityUsd: Number(process.env.MIN_PORTFOLIO_LIQUIDITY_USD || 50),
+  minPortfolioValueUsd: Number(process.env.MIN_PORTFOLIO_VALUE_USD || 3),
   portfolioMaxTokens: Number(process.env.PORTFOLIO_MAX_TOKENS || 25),
 };
 
@@ -368,17 +369,22 @@ function bestPairMapForTokens(pairs, tokenAddresses) {
   return bestByToken;
 }
 
-function isTradeablePortfolioItem(item, minLiquidityUsd = config.minPortfolioLiquidityUsd) {
+function isTradeablePortfolioItem(item, options = {}) {
+  const minLiquidityUsd = Number(options.minLiquidityUsd ?? config.minPortfolioLiquidityUsd);
+  const minValueUsd = Number(options.minValueUsd ?? config.minPortfolioValueUsd);
   if (!item) return false;
   if (!(item.amount > 0)) return false;
   if (!Number.isFinite(item.priceUsd) || item.priceUsd <= 0) return false;
   if (!Number.isFinite(item.liquidityUsd) || item.liquidityUsd < minLiquidityUsd) return false;
+  if (!Number.isFinite(item.valueUsd) || item.valueUsd < minValueUsd) return false;
   return true;
 }
 
 function buildPortfolioFromBalances(balances, pairs, options = {}) {
   const minLiquidityUsd = Number(options.minLiquidityUsd ?? config.minPortfolioLiquidityUsd);
+  const minValueUsd = Number(options.minValueUsd ?? config.minPortfolioValueUsd);
   const maxTokens = Number(options.maxTokens ?? config.portfolioMaxTokens);
+  const filterOptions = { minLiquidityUsd, minValueUsd };
   const parsed = (balances || [])
     .map(parseWalletBalanceEntry)
     .filter((item) => item.address && item.type.includes("ERC-20") && item.amount > 0);
@@ -401,7 +407,7 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
       pairUrl: pair?.url || (pair?.pairAddress ? `https://dexscreener.com/robinhood/${pair.pairAddress}` : ""),
     };
 
-    if (isTradeablePortfolioItem(enriched, minLiquidityUsd)) {
+    if (isTradeablePortfolioItem(enriched, filterOptions)) {
       tradeable.push(enriched);
     } else {
       skipped += 1;
@@ -451,12 +457,12 @@ function portfolioPanelText(portfolio) {
     `Wallet: <code>${escapeHtml(compactAddress(portfolio.wallet))}</code>`,
     `Total: <b>${escapeHtml(formatUsd(portfolio.totalUsd))}</b>`,
     `Tradeable: <b>${portfolio.items.length}</b> | Hidden junk: <b>${portfolio.skipped}</b>`,
-    `Min liquidity: <b>${escapeHtml(formatUsd(config.minPortfolioLiquidityUsd))}</b>`,
+    `Min value: <b>${escapeHtml(formatUsd(config.minPortfolioValueUsd))}</b> | Min liquidity: <b>${escapeHtml(formatUsd(config.minPortfolioLiquidityUsd))}</b>`,
     "",
   ];
 
   if (!portfolio.items.length) {
-    lines.push("Không còn token nào có giá + thanh khoản hợp lệ.");
+    lines.push(`Không còn token nào có balance ≥ ${escapeHtml(formatUsd(config.minPortfolioValueUsd))} và thanh khoản hợp lệ.`);
   } else {
     for (const item of portfolio.items) {
       const chart = item.pairUrl ? ` <a href="${escapeHtml(item.pairUrl)}">chart</a>` : "";
