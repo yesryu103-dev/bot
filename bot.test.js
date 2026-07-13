@@ -152,6 +152,22 @@ test("sell percent parser and balance math", () => {
   assert.equal(bot.balancePercent(1000n, 100), 1000n);
 });
 
+test("trade USD enrichment prefers Dexscreener spot price", () => {
+  const trade = {
+    side: "BUY",
+    quoteAmount: 7.5,
+    baseAmount: 83073.3186,
+    quoteUsdValue: Number.NaN,
+    priceUsd: Number.NaN,
+  };
+  const priced = bot.applyTradeUsd(trade, { priceUsd: 0.1597, ethUsd: 1784 });
+  assert.equal(priced.priceUsd, 0.1597);
+  assert.ok(Math.abs(priced.quoteUsdValue - 7.5 * 1784) < 0.01);
+
+  const fallback = bot.applyTradeUsd(trade, { priceUsd: Number.NaN, ethUsd: 1784 });
+  assert.ok(Math.abs(fallback.priceUsd - (7.5 * 1784) / 83073.3186) < 0.001);
+});
+
 test("stale trades are not considered fresh for alerts", () => {
   const now = Date.parse("2026-07-13T14:27:00+07:00");
   const fresh = { timestamp: "2026-07-13T14:26:30+07:00" };

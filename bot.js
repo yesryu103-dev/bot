@@ -389,7 +389,8 @@ async function pollRpcSwaps(state) {
         seen.add(txHash);
         continue;
       }
-      await sendTelegram(tradeMessage(trade), alertTradeKeyboard());
+      const priced = await enrichTradePrices(trade);
+      await sendTelegram(tradeMessage(priced), alertTradeKeyboard());
       alerted.push(txHash);
       seen.add(txHash);
     }
@@ -421,6 +422,63 @@ async function fetchDexPair() {
   const url = `https://api.dexscreener.com/latest/dex/pairs/robinhood/${config.pairAddress}`;
   const payload = await fetchJson(url);
   return payload.pair || payload.pairs?.[0] || null;
+}
+
+const dexTradePriceCache = { at: 0, priceUsd: Number.NaN, ethUsd: Number.NaN };
+
+function applyTradeUsd(trade, { priceUsd, ethUsd } = {}) {
+  const quoteAmount = Number(trade?.quoteAmount);
+  const baseAmount = Number(trade?.baseAmount);
+  const quoteUsdValue =
+    Number.isFinite(ethUsd) && quoteAmount > 0
+      ? quoteAmount * ethUsd
+      : Number(trade?.quoteUsdValue);
+
+  // Prefer Dexscreener spot so alerts match the chart; fall back to execution price.
+  let displayPrice = Number(priceUsd);
+  if (!Number.isFinite(displayPrice) && Number.isFinite(quoteUsdValue) && baseAmount > 0) {
+    displayPrice = quoteUsdValue / baseAmount;
+  }
+
+  return {
+    ...trade,
+    quoteUsdValue: Number.isFinite(quoteUsdValue) ? quoteUsdValue : Number.NaN,
+    priceUsd: Number.isFinite(displayPrice) ? displayPrice : Number.NaN,
+  };
+}
+
+async function enrichTradePrices(trade) {
+  const now = Date.now();
+  let priceUsd = Number.NaN;
+  let ethUsd = Number.NaN;
+
+  if (now - dexTradePriceCache.at < 15_000) {
+    priceUsd = dexTradePriceCache.priceUsd;
+    ethUsd = dexTradePriceCache.ethUsd;
+  } else {
+    try {
+      const pair = await fetchDexPair();
+      priceUsd = Number(pair?.priceUsd);
+      const priceNative = Number(pair?.priceNative);
+      if (Number.isFinite(priceUsd) && Number.isFinite(priceNative) && priceNative > 0) {
+        ethUsd = priceUsd / priceNative;
+      }
+    } catch {
+      // ignore — fall back below
+    }
+    if (!Number.isFinite(ethUsd)) {
+      try {
+        ethUsd = await fetchEthPriceUsd();
+      } catch {
+        ethUsd = Number.NaN;
+      }
+    }
+    dexTradePriceCache.at = now;
+    dexTradePriceCache.priceUsd = priceUsd;
+    dexTradePriceCache.ethUsd = ethUsd;
+  }
+
+  return applyTradeUsd(trade, { priceUsd, ethUsd });
 }
 
 async function fetchTokenPairs(tokenAddress) {
@@ -4877,7 +4935,10 @@ async function handleNewGroups(groups, state) {
         }
       }
 
-      if (trade) await sendTelegram(tradeMessage(trade), alertTradeKeyboard());
+      if (trade) {
+        const priced = await enrichTradePrices(trade);
+        await sendTelegram(tradeMessage(priced), alertTradeKeyboard());
+      }
     } catch (error) {
       console.error(`Failed to process ${group.hash}: ${error.message}`);
     }
@@ -5066,6 +5127,7 @@ module.exports = {
   analyzeProxyRisk,
   analyzeRoundTripTax,
   analyzeV4HookRisk,
+  applyTradeUsd,
   readTokenRiskViews,
   shouldTradeImmediately,
   sniperTradeKeyboard,
