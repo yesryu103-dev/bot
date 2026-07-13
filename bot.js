@@ -2657,17 +2657,10 @@ function toolsKeyboard() {
   return {
     inline_keyboard: [
       [
-        { text: "Honeypot", callback_data: "panel:honeypot" },
-        { text: "Add LP", callback_data: "panel:lp" },
-      ],
-      [
-        { text: "My LP", callback_data: "panel:mylp" },
-        { text: "Wallets", callback_data: "panel:wallets" },
-      ],
-      [
-        { text: "Profile", callback_data: "panel:profile" },
         { text: "Update Price", callback_data: "portfolio:refresh" },
+        { text: "Profile", callback_data: "panel:profile" },
       ],
+      [{ text: "Wallets", callback_data: "panel:wallets" }],
       [{ text: "Main Menu", callback_data: "menu" }],
     ],
   };
@@ -2677,7 +2670,7 @@ function toolsPanelText() {
   return [
     `<b>Tools</b>`,
     `Đang theo dõi: <b>${escapeHtml(config.baseSymbol)}</b>`,
-    "Honeypot / LP / ví / profile nằm ở đây.",
+    "Update Price / ví / profile.",
   ].join("\n");
 }
 
@@ -2781,8 +2774,6 @@ function tradePanelText(title = `${config.baseSymbol} Sniper`) {
     `Buy: số ${escapeHtml(config.quoteSymbol)}. Sell: <b>25% / 50% / 70% / All</b> bag.`,
     `One-tap: <b>${config.oneTapTrade ? "ON" : "OFF"}</b> | Trading: <b>${config.tradeEnabled ? "ON" : "OFF"}</b>`,
     `Slippage: <b>${config.slippageBps / 100}%</b>`,
-    "",
-    `Honeypot / Add LP: bấm nút riêng khi cần (không chạy lúc paste CA).`,
   ].join("\n");
 }
 
@@ -3156,8 +3147,6 @@ async function followTokenAddress(tokenAddress, state, chatId) {
         ? `Watching <b>${trackedPair.watchPairAddresses.length}</b> WETH pools`
         : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
-      "",
-      `Honeypot / Add LP: bấm nút bên dưới khi cần.`,
     ]
       .filter(Boolean)
       .join("\n"),
@@ -3686,10 +3675,6 @@ function afterTrackKeyboard() {
   return {
     inline_keyboard: [
       ...tradeActionRows(),
-      [
-        { text: "Honeypot", callback_data: "panel:honeypot" },
-        { text: "Add LP", callback_data: "panel:lp" },
-      ],
       [
         { text: "Tools", callback_data: "panel:tools" },
         { text: "Main Menu", callback_data: "menu" },
@@ -5028,71 +5013,12 @@ async function handleCallbackQuery(callbackQuery, state) {
     return;
   }
 
-  if (data === "panel:honeypot") {
-    await runHoneypotOnDemand(state, chatId, callbackQuery);
-    return;
-  }
-
-  if (data === "panel:lp") {
-    await showLpPanel(callbackQuery, state);
-    return;
-  }
-
-  if (data === "panel:mylp") {
-    await showMyLpPanel(callbackQuery);
-    return;
-  }
-
-  if (data.startsWith("lp:pos:")) {
-    const tokenId = data.slice("lp:pos:".length);
-    await showLpPosition(callbackQuery, tokenId);
-    return;
-  }
-
-  if (data.startsWith("lp:rm:")) {
-    const parts = data.split(":");
-    const tokenId = parts[2];
-    const percent = parts[3];
-    await runRemoveLiquidity(callbackQuery, tokenId, percent);
-    return;
-  }
-
-  if (data.startsWith("lp:rerange:")) {
-    const tokenId = data.slice("lp:rerange:".length);
-    await startLpRerange(callbackQuery, state, tokenId);
-    return;
-  }
-
-  if (data === "lp:ranges") {
-    await showLpRanges(callbackQuery, state);
-    return;
-  }
-
-  if (data === "lp:amounts") {
-    try {
-      const poolState = await fetchLpPoolState(state);
-      await editTradeMessage(callbackQuery, lpPanelText(poolState, { step: "amount" }), lpAmountKeyboard());
-    } catch (error) {
-      await editTradeMessage(callbackQuery, `<b>Add LP</b>\n${escapeHtml(error.message)}`, mainMenuKeyboard());
-    }
-    return;
-  }
-
-  if (data.startsWith("lp:range:")) {
-    const percent = data.slice("lp:range:".length);
-    await applyLpRange(callbackQuery, state, percent);
-    return;
-  }
-
-  if (data.startsWith("lp:preview:")) {
-    const ethAmount = data.slice("lp:preview:".length);
-    await showLpPreview(callbackQuery, state, ethAmount);
-    return;
-  }
-
-  if (data.startsWith("lp:confirm:")) {
-    const ethAmount = data.slice("lp:confirm:".length);
-    await runConfirmedAddLiquidity(callbackQuery, state, ethAmount);
+  if (data === "panel:honeypot" || data === "panel:lp" || data === "panel:mylp" || data.startsWith("lp:")) {
+    await editTradeMessage(
+      callbackQuery,
+      "<b>Tools</b>\nHoneypot / LP đã tắt trên bot này.",
+      toolsKeyboard(),
+    );
     return;
   }
 
@@ -5365,42 +5291,14 @@ async function handleTelegramMessage(message, state) {
     return;
   }
 
-  if (text === "/lp" || text.startsWith("/lp@")) {
-    try {
-      if (!state.lp?.tokenAddress && state.trackedPair?.baseTokenAddress) {
-        await prepareLpFromToken(state.trackedPair.baseTokenAddress, state);
-      }
-      if (!state.lp?.tokenAddress) {
-        await telegramRequest("sendMessage", {
-          chat_id: chatId,
-          text: [
-            `<b>Add Liquidity</b>`,
-            "Paste contract token vào chat.",
-            "Flow: đọc pool → chọn range → chọn ETH → Confirm.",
-          ].join("\n"),
-          parse_mode: "HTML",
-          disable_web_page_preview: "true",
-          reply_markup: mainMenuKeyboard(),
-        });
-        return;
-      }
-      const poolState = await fetchLpPoolState(state);
-      await telegramRequest("sendMessage", {
-        chat_id: chatId,
-        text: lpPanelText(poolState, { step: "range" }),
-        parse_mode: "HTML",
-        disable_web_page_preview: "true",
-        reply_markup: lpRangeKeyboard(),
-      });
-    } catch (error) {
-      await telegramRequest("sendMessage", {
-        chat_id: chatId,
-        text: `<b>Add LP</b>\n${escapeHtml(error.message)}`,
-        parse_mode: "HTML",
-        disable_web_page_preview: "true",
-        reply_markup: mainMenuKeyboard(),
-      });
-    }
+  if (text === "/lp" || text.startsWith("/lp@") || text === "/honeypot" || text.startsWith("/honeypot@")) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: "Honeypot / LP đã tắt trên bot này.",
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    });
     return;
   }
 

@@ -227,12 +227,12 @@ test("main menu looks like a trading dashboard", () => {
 
   const tools = bot.toolsKeyboard().inline_keyboard.flat().map((button) => button.text);
   const toolCallbacks = bot.toolsKeyboard().inline_keyboard.flat().map((button) => button.callback_data).filter(Boolean);
-  assert(tools.includes("Honeypot"));
-  assert(tools.includes("Add LP"));
-  assert(tools.includes("My LP"));
+  assert.equal(tools.includes("Honeypot"), false);
+  assert.equal(tools.includes("Add LP"), false);
+  assert.equal(tools.includes("My LP"), false);
+  assert(tools.includes("Update Price"));
   assert(tools.includes("Profile"));
   assert(tools.includes("Wallets"));
-  assert(tools.includes("Update Price"));
   assert(toolCallbacks.includes("portfolio:refresh"));
 });
 
