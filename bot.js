@@ -2473,7 +2473,7 @@ function chunkButtons(buttons, size = 2) {
   return rows;
 }
 
-function sniperTradeKeyboard() {
+function tradeActionRows() {
   const buyButtons = config.buyAmountsQuote.map((amount) => ({
     text: `Buy ${amount} ${config.quoteSymbol}`,
     callback_data: `qtrade:BUY:${amount}`,
@@ -2483,13 +2483,19 @@ function sniperTradeKeyboard() {
     callback_data: `qtrade:SELL:${percent}%`,
   }));
 
+  return [
+    ...chunkButtons(buyButtons, 2),
+    ...chunkButtons(sellButtons, 2),
+    [{ text: `Sell All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" }],
+  ];
+}
+
+function sniperTradeKeyboard() {
   return {
     inline_keyboard: [
-      ...chunkButtons(buyButtons, 2),
-      ...chunkButtons(sellButtons, 2),
-      [{ text: `Sell All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" }],
+      ...tradeActionRows(),
       [
-        { text: "Refresh", callback_data: "menu" },
+        { text: "Main Menu", callback_data: "menu" },
         { text: "Chart", url: config.dexscreenPairUrl },
       ],
     ],
@@ -2520,21 +2526,43 @@ function alertTradeKeyboard() {
   return sniperTradeKeyboard();
 }
 
-function mainMenuKeyboard() {
+function toolsKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: `Sell All ${config.baseSymbol}`, callback_data: "qtrade:SELL:ALL" }],
-      [{ text: "Buy & Sell", callback_data: "panel:trade" }],
       [
         { text: "Honeypot", callback_data: "panel:honeypot" },
         { text: "Add LP", callback_data: "panel:lp" },
       ],
-      [{ text: "My LP", callback_data: "panel:mylp" }],
+      [
+        { text: "My LP", callback_data: "panel:mylp" },
+        { text: "Wallets", callback_data: "panel:wallets" },
+      ],
+      [
+        { text: "Profile", callback_data: "panel:profile" },
+        { text: "Update Price", callback_data: "portfolio:refresh" },
+      ],
+      [{ text: "Main Menu", callback_data: "menu" }],
+    ],
+  };
+}
+
+function toolsPanelText() {
+  return [
+    `<b>Tools</b>`,
+    `Đang theo dõi: <b>${escapeHtml(config.baseSymbol)}</b>`,
+    "Honeypot / LP / ví / profile nằm ở đây.",
+  ].join("\n");
+}
+
+function mainMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      ...tradeActionRows(),
       [
         { text: "Update Price", callback_data: "portfolio:refresh" },
-        { text: "Profile", callback_data: "panel:profile" },
+        { text: "Chart", url: config.dexscreenPairUrl },
       ],
-      [{ text: "Wallets", callback_data: "panel:wallets" }],
+      [{ text: "Tools", callback_data: "panel:tools" }],
     ],
   };
 }
@@ -3422,12 +3450,15 @@ function lpConfirmKeyboard(ethAmount) {
 function afterTrackKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: "Buy & Sell", callback_data: "panel:trade" }],
+      ...tradeActionRows(),
       [
         { text: "Honeypot", callback_data: "panel:honeypot" },
         { text: "Add LP", callback_data: "panel:lp" },
       ],
-      [{ text: "Main Menu", callback_data: "menu" }],
+      [
+        { text: "Tools", callback_data: "panel:tools" },
+        { text: "Main Menu", callback_data: "menu" },
+      ],
     ],
   };
 }
@@ -4452,13 +4483,13 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
         `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
         `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
       ].join("\n"),
-      sniperTradeKeyboard(),
+      mainMenuKeyboard(),
     );
   } catch (error) {
     await editTradeMessage(
       callbackQuery,
       `<b>Trade not sent</b>\n${escapeHtml(error.message)}`,
-      sniperTradeKeyboard(),
+      mainMenuKeyboard(),
     );
   }
 }
@@ -4485,6 +4516,11 @@ async function handleCallbackQuery(callbackQuery, state) {
 
   if (data === "panel:trade") {
     await editTradeMessage(callbackQuery, tradePanelText(), sniperTradeKeyboard());
+    return;
+  }
+
+  if (data === "panel:tools") {
+    await editTradeMessage(callbackQuery, toolsPanelText(), toolsKeyboard());
     return;
   }
 
@@ -5006,6 +5042,7 @@ module.exports = {
   ticksAroundPrice,
   normalizeAddress,
   mainMenuKeyboard,
+  toolsKeyboard,
   mainPanelText,
   chooseBestPairForToken,
   chooseWatchPairAddresses,

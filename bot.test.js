@@ -188,19 +188,31 @@ test("main menu looks like a trading dashboard", () => {
 
   assert(text.includes(bot.config.botTitle));
   assert(text.includes("Portfolio"));
+  assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]} ${bot.config.quoteSymbol}`));
+  assert(labels.includes("Sell 25%"));
+  assert(labels.includes("Sell 50%"));
+  assert(labels.includes("Sell 70%"));
   assert(labels.includes(`Sell All ${bot.config.baseSymbol}`));
   assert(callbacks.includes("qtrade:SELL:ALL"));
-  assert(labels.includes("Buy & Sell"));
-  assert(labels.includes("Honeypot"));
-  assert(labels.includes("Add LP"));
-  assert(labels.includes("My LP"));
-  assert.equal(labels.includes("Portfolio"), false);
+  assert(labels.includes("Tools"));
   assert(labels.includes("Update Price"));
-  assert(labels.includes("Profile"));
-  assert(labels.includes("Wallets"));
+  assert.equal(labels.includes("Buy & Sell"), false);
+  assert.equal(labels.includes("Portfolio"), false);
+  assert.equal(labels.includes("Honeypot"), false);
+  assert.equal(labels.includes("Add LP"), false);
+  assert.equal(labels.includes("My LP"), false);
+  assert.equal(labels.includes("Profile"), false);
+  assert.equal(labels.includes("Wallets"), false);
   assert.equal(labels.includes("Sniper"), false);
   assert.equal(labels.includes("Limit Orders"), false);
   assert.equal(labels.includes("Trades"), false);
+
+  const tools = bot.toolsKeyboard().inline_keyboard.flat().map((button) => button.text);
+  assert(tools.includes("Honeypot"));
+  assert(tools.includes("Add LP"));
+  assert(tools.includes("My LP"));
+  assert(tools.includes("Profile"));
+  assert(tools.includes("Wallets"));
 });
 
 test("expired Telegram callback errors are recognized", () => {
