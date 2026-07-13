@@ -30,7 +30,7 @@ const config = {
   quoteSymbol: process.env.QUOTE_SYMBOL || "WETH",
   pollSeconds: Number(process.env.POLL_SECONDS || 3),
   stateFile: process.env.STATE_FILE || "state.json",
-  maxItems: Number(process.env.MAX_ITEMS || 50),
+  maxItems: Number(process.env.MAX_ITEMS || 200),
   minUsd: Number(process.env.MIN_USD || 0),
   minQuoteAmount: 1,
   dryRun: truthy(process.env.DRY_RUN),
@@ -161,9 +161,24 @@ async function fetchJson(url, options = {}, retries = 3) {
 }
 
 async function fetchTokenTransfers() {
-  const url = `${config.blockscoutBaseUrl}/api/v2/addresses/${config.pairAddress}/token-transfers`;
-  const payload = await fetchJson(url, {}, 2);
-  return (payload.items || []).slice(0, config.maxItems);
+  const maxItems = Math.max(50, Number(config.maxItems || 200));
+  const maxPages = Math.max(1, Number(process.env.TRANSFER_MAX_PAGES || 6));
+  const collected = [];
+  let query = "";
+
+  for (let page = 0; page < maxPages && collected.length < maxItems; page += 1) {
+    const url = `${config.blockscoutBaseUrl}/api/v2/addresses/${config.pairAddress}/token-transfers${query}`;
+    const payload = await fetchJson(url, {}, 2);
+    const items = payload.items || [];
+    if (!items.length) break;
+    collected.push(...items);
+
+    const next = payload.next_page_params;
+    if (!next || typeof next !== "object") break;
+    query = `?${new URLSearchParams(Object.entries(next).map(([key, value]) => [key, String(value)]))}`;
+  }
+
+  return collected.slice(0, maxItems);
 }
 
 function isTransientHttpError(error) {
@@ -2682,12 +2697,20 @@ function classifyFromTransaction(tx, overrides = {}) {
   const side = settings.buyWhenBaseLeavesPool ? (baseNet < 0n ? "BUY" : "SELL") : baseNet > 0n ? "BUY" : "SELL";
   const baseRaw = baseNet < 0n ? -baseNet : baseNet;
   const quoteRaw = quoteNet < 0n ? -quoteNet : quoteNet;
-  const baseAmount = unitsToNumber(baseRaw, baseDecimals);
-  const quoteAmount = unitsToNumber(quoteRaw, quoteDecimals);
-  const quoteUsdValue = Number.isFinite(quoteUsd) ? quoteAmount * quoteUsd : baseAmount * baseUsd;
+  let baseAmount = unitsToNumber(baseRaw, baseDecimals);
+  let quoteAmount = unitsToNumber(quoteRaw, quoteDecimals);
+  let quoteUsdValue = Number.isFinite(quoteUsd) ? quoteAmount * quoteUsd : baseAmount * baseUsd;
   const priceUsd = baseAmount > 0 ? quoteUsdValue / baseAmount : baseUsd;
 
-  if (Number.isFinite(settings.minQuoteAmount) && quoteAmount < settings.minQuoteAmount) return null;
+  // If WETH transfer missing from this page, estimate size from token USD rate.
+  if (quoteRaw === 0n && Number.isFinite(baseUsd) && baseUsd > 0 && Number.isFinite(quoteUsd) && quoteUsd > 0) {
+    quoteAmount = (baseAmount * baseUsd) / quoteUsd;
+    quoteUsdValue = baseAmount * baseUsd;
+  }
+
+  const minQuote = Number(settings.minQuoteAmount);
+  // Soft floor: 0.95 ETH counts when threshold is 1 (fee/rounding near-1 buys).
+  if (Number.isFinite(minQuote) && minQuote > 0 && quoteAmount < minQuote * 0.95) return null;
   if (Number.isFinite(quoteUsdValue) && quoteUsdValue < settings.minUsd) return null;
 
   return {
@@ -2697,7 +2720,7 @@ function classifyFromTransaction(tx, overrides = {}) {
     side,
     trader: addressOf(tx.from),
     baseRaw,
-    quoteRaw,
+    quoteRaw: quoteRaw > 0n ? quoteRaw : 0n,
     baseDecimals,
     quoteDecimals,
     baseAmount,
@@ -4319,7 +4342,7 @@ async function processTelegramUpdates(state) {
 
   const payload = await telegramRequest("getUpdates", {
     offset: Number(state.telegramOffset || 0),
-    timeout: 25,
+    timeout: 10,
     allowed_updates: ["message", "callback_query"],
   });
   const updates = payload.result || [];
@@ -4350,8 +4373,22 @@ async function handleNewGroups(groups, state) {
 
   for (const group of newGroups) {
     try {
-      const tx = config.fetchTxDetails ? await fetchTransaction(group.hash) : transactionFromTransferGroup(group);
-      const trade = classifyFromTransaction(tx);
+      let tx = config.fetchTxDetails ? await fetchTransaction(group.hash) : transactionFromTransferGroup(group);
+      let trade = classifyFromTransaction(tx);
+
+      // Partial page groups often miss the WETH leg — refetch full tx once.
+      if (!trade && !config.fetchTxDetails) {
+        const tokens = new Set((group.transfers || []).map((item) => transferTokenAddress(item)));
+        const incomplete =
+          (group.transfers || []).length < 2 ||
+          !tokens.has(config.baseTokenAddress) ||
+          !tokens.has(config.quoteTokenAddress);
+        if (incomplete) {
+          tx = await fetchTransaction(group.hash);
+          trade = classifyFromTransaction(tx);
+        }
+      }
+
       if (trade) await sendTelegram(tradeMessage(trade), alertTradeKeyboard());
     } catch (error) {
       console.error(`Failed to process ${group.hash}: ${error.message}`);

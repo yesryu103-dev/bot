@@ -228,13 +228,31 @@ test("trade smaller than minimum quote amount is ignored", () => {
     from: addr("0xuser"),
     token_transfers: [
       transfer(bot.config.baseTokenAddress, "0xuser", bot.config.pairAddress, "1000000000000000000000", "0.002"),
-      transfer(bot.config.quoteTokenAddress, bot.config.pairAddress, "0xrouter", "1999999999999999999", "1783.74"),
+      transfer(bot.config.quoteTokenAddress, bot.config.pairAddress, "0xrouter", "500000000000000000", "1783.74"),
     ],
   };
 
   const trade = bot.classifyFromTransaction(tx, { buyWhenBaseLeavesPool: true, minQuoteAmount: 2 });
 
   assert.equal(trade, null);
+});
+
+test("near-threshold 1 ETH buy is still alerted", () => {
+  const tx = {
+    hash: "0xnear1",
+    block_number: 4,
+    timestamp: "2026-07-10T09:09:00Z",
+    from: addr("0xuser"),
+    token_transfers: [
+      transfer(bot.config.baseTokenAddress, bot.config.pairAddress, "0xuser", "1000000000000000000000", "0.002"),
+      transfer(bot.config.quoteTokenAddress, "0xuser", bot.config.pairAddress, "990000000000000000", "3000"),
+    ],
+  };
+
+  const trade = bot.classifyFromTransaction(tx, { buyWhenBaseLeavesPool: true, minQuoteAmount: 1 });
+  assert.ok(trade);
+  assert.equal(trade.side, "BUY");
+  assert.ok(trade.quoteAmount >= 0.95);
 });
 
 test("portfolio keeps liquid tokens and hides junk", () => {
