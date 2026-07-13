@@ -2478,9 +2478,13 @@ async function resolveMenuPortfolio(state = {}, { forceRefresh = false } = {}) {
   }
 
   try {
-    const portfolio = await buildPortfolio(wallet);
+    const portfolio = await withTimeout(buildPortfolio(wallet), 12_000, "Portfolio");
     return cachePortfolioSnapshot(state, portfolio);
   } catch (error) {
+    if (cached?.wallet === wallet && Array.isArray(cached.items)) {
+      console.warn(`Portfolio refresh failed, using cache: ${error.message}`);
+      return cached;
+    }
     return cachePortfolioSnapshot(state, {
       wallet,
       items: [],
@@ -2922,13 +2926,40 @@ async function sendTradeMenu(chatId = config.telegramChatId) {
 }
 
 async function sendMainMenu(chatId = config.telegramChatId, state = loadState()) {
-  const text = await mainPanelText({ state });
+  let portfolio = state.portfolioSnapshot || null;
+  try {
+    portfolio = await withTimeout(
+      resolveMenuPortfolio(state, { forceRefresh: false }),
+      8_000,
+      "Menu portfolio",
+    );
+  } catch (error) {
+    console.warn(`sendMainMenu portfolio skipped: ${error.message}`);
+    if (!portfolio) {
+      portfolio = {
+        wallet: getPortfolioWallet(state),
+        items: [],
+        skipped: 0,
+        totalUsd: 0,
+        error: error.message,
+      };
+    }
+  }
+
+  let text;
+  try {
+    text = await withTimeout(mainPanelText({ state, portfolio }), 10_000, "Main panel");
+  } catch (error) {
+    text = staticMainPanelText();
+    text += `\n\n<i>Menu partial: ${escapeHtml(error.message)}</i>`;
+  }
+
   return telegramRequest("sendMessage", {
     chat_id: chatId,
     text,
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-    reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    reply_markup: mainMenuKeyboard(portfolio || state.portfolioSnapshot),
   });
 }
 
@@ -4791,11 +4822,23 @@ async function handleCallbackQuery(callbackQuery, state) {
   await answerCallback(callbackQuery);
 
   if (data === "menu") {
-    await editTradeMessage(
-      callbackQuery,
-      await mainPanelText({ state }),
-      mainMenuKeyboard(state.portfolioSnapshot),
-    );
+    let portfolio = state.portfolioSnapshot || null;
+    try {
+      portfolio = await withTimeout(
+        resolveMenuPortfolio(state, { forceRefresh: false }),
+        8_000,
+        "Menu portfolio",
+      );
+    } catch (error) {
+      console.warn(`menu portfolio skipped: ${error.message}`);
+    }
+    let text;
+    try {
+      text = await withTimeout(mainPanelText({ state, portfolio }), 10_000, "Main panel");
+    } catch {
+      text = staticMainPanelText();
+    }
+    await editTradeMessage(callbackQuery, text, mainMenuKeyboard(portfolio || state.portfolioSnapshot));
     return;
   }
 
@@ -5213,20 +5256,39 @@ async function processTelegramUpdates(state) {
   }
 
   for (const update of updates) {
+    // Ack early so a hung handler cannot strand the offset forever across restarts.
     state.telegramOffset = update.update_id + 1;
+    saveState(state);
     try {
-      if (update.message) await handleTelegramMessage(update.message, state);
-      if (update.callback_query) await handleCallbackQuery(update.callback_query, state);
+      await withTimeout(
+        (async () => {
+          if (update.message) await handleTelegramMessage(update.message, state);
+          if (update.callback_query) await handleCallbackQuery(update.callback_query, state);
+        })(),
+        25_000,
+        `Telegram update ${update.update_id}`,
+      );
     } catch (error) {
       if (isExpiredCallbackError(error) || isMessageNotModifiedError(error)) {
         console.warn(`Ignored stale Telegram update ${update.update_id}.`);
       } else {
         console.error(`Telegram update ${update.update_id} failed: ${error.message}`);
+        try {
+          const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
+          if (chatId && String(error.message || "").includes("timed out")) {
+            await telegramRequest("sendMessage", {
+              chat_id: chatId,
+              text: "Bot đang chậm (timeout). Thử /menu lại hoặc Update Price.",
+              parse_mode: "HTML",
+              disable_web_page_preview: "true",
+            });
+          }
+        } catch {
+          // ignore
+        }
       }
     }
   }
-
-  saveState(state);
 }
 
 function tradeTimestampMs(txOrGroup) {
@@ -5367,7 +5429,7 @@ async function main() {
   let lastRpcWarnAt = 0;
   while (true) {
     try {
-      await processTelegramUpdates(state);
+      await withTimeout(processTelegramUpdates(state), 45_000, "Telegram poll cycle");
     } catch (error) {
       if (isPollingConflictError(error)) {
         console.error(
@@ -5381,7 +5443,7 @@ async function main() {
 
     // Primary realtime path: Uniswap v3 Swap logs via RPC (works when Blockscout 500s).
     try {
-      await pollRpcSwaps(state);
+      await withTimeout(pollRpcSwaps(state), 20_000, "RPC swap poll");
     } catch (error) {
       const now = Date.now();
       if (now - lastRpcWarnAt > 60_000) {
@@ -5392,11 +5454,11 @@ async function main() {
 
     // Optional secondary path via Blockscout transfers.
     try {
-      const groups = groupTransfers(await fetchTokenTransfers());
-      await handleNewGroups(groups, state);
+      const groups = groupTransfers(await withTimeout(fetchTokenTransfers(), 15_000, "Blockscout transfers"));
+      await withTimeout(handleNewGroups(groups, state), 20_000, "Blockscout alerts");
     } catch (error) {
       const now = Date.now();
-      if (isTransientHttpError(error)) {
+      if (isTransientHttpError(error) || String(error.message || "").includes("timed out")) {
         if (now - lastBlockscoutWarnAt > 60_000) {
           console.warn(`Blockscout temporarily unavailable: ${error.message || error}`);
           console.warn("Swap alerts continue via RPC logs.");
