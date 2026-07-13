@@ -35,6 +35,7 @@ const config = {
   minQuoteAmount: 1,
   // Only alert swaps younger than this (realtime). Stale txs after sleep/redeploy are ignored.
   maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 90_000),
+  rpcSwapLookbackBlocks: Number(process.env.RPC_SWAP_LOOKBACK_BLOCKS || 100),
   dryRun: truthy(process.env.DRY_RUN),
   backfillOnStart: truthy(process.env.BACKFILL_ON_START),
   fetchTxDetails: truthy(process.env.FETCH_TX_DETAILS),
@@ -204,6 +205,200 @@ async function fetchTokenTransfers() {
     }
   }
   return merged;
+}
+
+const poolMetaCache = new Map();
+
+function getRpcProvider() {
+  const { ethers } = require("ethers");
+  return new ethers.JsonRpcProvider(config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com");
+}
+
+async function getPoolMeta(pairAddress, provider = null) {
+  const { ethers } = require("ethers");
+  const pair = normalizeAddress(pairAddress);
+  if (poolMetaCache.has(pair)) return poolMetaCache.get(pair);
+  const rpc = provider || getRpcProvider();
+  const pool = new ethers.Contract(
+    pair,
+    [
+      "function token0() view returns (address)",
+      "function token1() view returns (address)",
+      "function fee() view returns (uint24)",
+    ],
+    rpc,
+  );
+  const [token0, token1, fee] = await Promise.all([pool.token0(), pool.token1(), pool.fee()]);
+  const meta = {
+    token0: normalizeAddress(token0),
+    token1: normalizeAddress(token1),
+    fee: Number(fee),
+  };
+  poolMetaCache.set(pair, meta);
+  return meta;
+}
+
+function tradeFromV3SwapLog({ amount0, amount1, token0, token1, quoteToken, baseToken, txHash, blockNumber, timestampMs, recipient }) {
+  const quote = normalizeAddress(quoteToken);
+  const base = normalizeAddress(baseToken);
+  const t0 = normalizeAddress(token0);
+  const t1 = normalizeAddress(token1);
+  const quoteIs0 = t0 === quote;
+  const baseIs0 = t0 === base;
+  if (!(quoteIs0 || t1 === quote) || !(baseIs0 || t1 === base)) return null;
+
+  const quoteDelta = quoteIs0 ? amount0 : amount1;
+  const baseDelta = baseIs0 ? amount0 : amount1;
+  if (quoteDelta === 0n) return null;
+
+  // Pool received quote token => market BUY of base.
+  const side = quoteDelta > 0n ? "BUY" : "SELL";
+  const quoteRaw = quoteDelta < 0n ? -quoteDelta : quoteDelta;
+  const baseRaw = baseDelta < 0n ? -baseDelta : baseDelta;
+  const { ethers } = require("ethers");
+  const quoteAmount = Number(ethers.formatUnits(quoteRaw, 18));
+  const baseAmount = Number(ethers.formatUnits(baseRaw, 18));
+  const minQuote = Number(config.minQuoteAmount);
+  if (Number.isFinite(minQuote) && minQuote > 0 && quoteAmount < minQuote * 0.95) return null;
+
+  return {
+    txHash: String(txHash || "").toLowerCase(),
+    blockNumber: Number(blockNumber || 0),
+    timestamp: new Date(timestampMs || Date.now()).toISOString(),
+    side,
+    trader: normalizeAddress(recipient) || "",
+    baseRaw,
+    quoteRaw,
+    baseDecimals: 18,
+    quoteDecimals: 18,
+    baseAmount,
+    quoteAmount,
+    quoteUsdValue: Number.NaN,
+    priceUsd: Number.NaN,
+  };
+}
+
+async function initRpcSwapCursors(state) {
+  if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
+  const provider = getRpcProvider();
+  const latest = Number(await provider.getBlockNumber());
+  for (const pair of watchedPairSet()) {
+    state.swapBlocks[pair] = latest;
+  }
+  saveState(state);
+  return latest;
+}
+
+async function pollRpcSwaps(state) {
+  const { ethers } = require("ethers");
+  const provider = getRpcProvider();
+  const latest = Number(await provider.getBlockNumber());
+  if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
+
+  const iface = new ethers.Interface([
+    "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
+  ]);
+  const topic = iface.getEvent("Swap").topicHash;
+  const seen = new Set(state.seen || []);
+  const now = Date.now();
+  const lookback = Math.max(20, Number(config.rpcSwapLookbackBlocks || 100));
+  const alerted = [];
+
+  for (const pair of watchedPairSet()) {
+    let fromBlock = Number(state.swapBlocks[pair] || 0);
+    if (!fromBlock || fromBlock < latest - lookback) fromBlock = latest - lookback;
+    if (fromBlock >= latest) {
+      state.swapBlocks[pair] = latest;
+      continue;
+    }
+
+    let meta;
+    try {
+      meta = await getPoolMeta(pair, provider);
+    } catch (error) {
+      console.warn(`RPC pool meta failed for ${pair}: ${error.message}`);
+      continue;
+    }
+
+    if (
+      !(
+        (meta.token0 === config.baseTokenAddress || meta.token0 === config.quoteTokenAddress) &&
+        (meta.token1 === config.baseTokenAddress || meta.token1 === config.quoteTokenAddress)
+      )
+    ) {
+      state.swapBlocks[pair] = latest;
+      continue;
+    }
+
+    // Keep trading fee aligned with the live tracked pool.
+    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
+
+    let logs = [];
+    try {
+      logs = await provider.getLogs({
+        address: pair,
+        fromBlock: fromBlock + 1,
+        toBlock: latest,
+        topics: [topic],
+      });
+    } catch (error) {
+      console.warn(`RPC getLogs failed for ${pair}: ${error.message}`);
+      continue;
+    }
+
+    const blockTs = new Map();
+    for (const log of logs) {
+      const blockNumber = Number(log.blockNumber);
+      if (blockTs.has(blockNumber)) continue;
+      try {
+        const block = await provider.getBlock(blockNumber);
+        blockTs.set(blockNumber, block?.timestamp ? Number(block.timestamp) * 1000 : now);
+      } catch {
+        blockTs.set(blockNumber, now);
+      }
+    }
+
+    for (const log of logs) {
+      const txHash = String(log.transactionHash || "").toLowerCase();
+      if (!txHash || seen.has(txHash)) continue;
+      let parsed;
+      try {
+        parsed = iface.parseLog(log);
+      } catch {
+        continue;
+      }
+      const tsMs = blockTs.get(Number(log.blockNumber)) || now;
+      if (now - tsMs > Number(config.maxAlertAgeMs || 90_000)) {
+        seen.add(txHash);
+        continue;
+      }
+      const trade = tradeFromV3SwapLog({
+        amount0: parsed.args.amount0,
+        amount1: parsed.args.amount1,
+        token0: meta.token0,
+        token1: meta.token1,
+        quoteToken: config.quoteTokenAddress,
+        baseToken: config.baseTokenAddress,
+        txHash,
+        blockNumber: Number(log.blockNumber),
+        timestampMs: tsMs,
+        recipient: parsed.args.recipient,
+      });
+      if (!trade) {
+        seen.add(txHash);
+        continue;
+      }
+      await sendTelegram(tradeMessage(trade), alertTradeKeyboard());
+      alerted.push(txHash);
+      seen.add(txHash);
+    }
+
+    state.swapBlocks[pair] = latest;
+  }
+
+  if (alerted.length) addSeen(state, alerted);
+  saveState(state);
+  return alerted.length;
 }
 
 function isTransientHttpError(error) {
@@ -2634,6 +2829,19 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     console.warn(`Could not warm seen transactions for ${trackedPair.baseSymbol}: ${error.message}`);
   }
 
+  try {
+    await initRpcSwapCursors(state);
+  } catch (error) {
+    console.warn(`Could not init RPC swap cursor: ${error.message}`);
+  }
+
+  try {
+    const meta = await getPoolMeta(trackedPair.pairAddress);
+    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
+  } catch (error) {
+    console.warn(`Could not read pool fee: ${error.message}`);
+  }
+
   saveState(state);
 
   let honeypotReport = null;
@@ -4564,6 +4772,12 @@ async function handleNewGroups(groups, state) {
 
 async function bootState(state) {
   try {
+    try {
+      await initRpcSwapCursors(state);
+    } catch (error) {
+      console.warn(`RPC swap cursor init failed: ${error.message}`);
+    }
+
     const groups = groupTransfers(await fetchTokenTransfers());
     if (config.backfillOnStart) {
       await handleNewGroups(groups, state);
@@ -4581,7 +4795,7 @@ async function bootState(state) {
     if (!state.seen) state.seen = [];
     saveState(state);
     console.warn(`Blockscout unavailable during boot: ${error.message}`);
-    console.warn("Telegram commands still work. Swap alerts will resume when Blockscout responds.");
+    console.warn("Telegram commands still work. RPC swap polling will still run.");
   }
 }
 
@@ -4623,6 +4837,7 @@ async function main() {
 
   console.log("Entering poll loop.");
   let lastBlockscoutWarnAt = 0;
+  let lastRpcWarnAt = 0;
   while (true) {
     try {
       await processTelegramUpdates(state);
@@ -4637,6 +4852,18 @@ async function main() {
       }
     }
 
+    // Primary realtime path: Uniswap v3 Swap logs via RPC (works when Blockscout 500s).
+    try {
+      await pollRpcSwaps(state);
+    } catch (error) {
+      const now = Date.now();
+      if (now - lastRpcWarnAt > 60_000) {
+        console.warn(`RPC swap poll failed: ${error.message || error}`);
+        lastRpcWarnAt = now;
+      }
+    }
+
+    // Optional secondary path via Blockscout transfers.
     try {
       const groups = groupTransfers(await fetchTokenTransfers());
       await handleNewGroups(groups, state);
@@ -4645,7 +4872,7 @@ async function main() {
       if (isTransientHttpError(error)) {
         if (now - lastBlockscoutWarnAt > 60_000) {
           console.warn(`Blockscout temporarily unavailable: ${error.message || error}`);
-          console.warn("Telegram commands still work; swap alerts paused until Blockscout recovers.");
+          console.warn("Swap alerts continue via RPC logs.");
           lastBlockscoutWarnAt = now;
         }
       } else {
@@ -4680,6 +4907,7 @@ module.exports = {
   classifyFromTransaction,
   isFreshTrade,
   tradeTimestampMs,
+  tradeFromV3SwapLog,
   classifyRestrictionError,
   config,
   feeToTickSpacing,

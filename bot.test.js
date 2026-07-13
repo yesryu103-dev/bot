@@ -156,6 +156,26 @@ test("stale trades are not considered fresh for alerts", () => {
   assert.equal(bot.isFreshTrade(stale, now, 90_000), false);
 });
 
+test("v3 swap log decoder flags 2 ETH buy", () => {
+  const weth = bot.config.quoteTokenAddress;
+  const token = "0xd7321801caae694090694ff55a9323139f043b88";
+  const trade = bot.tradeFromV3SwapLog({
+    amount0: 2n * 10n ** 18n, // pool received 2 WETH
+    amount1: -(1000n * 10n ** 18n),
+    token0: weth,
+    token1: token,
+    quoteToken: weth,
+    baseToken: token,
+    txHash: "0xabc",
+    blockNumber: 1,
+    timestampMs: Date.now(),
+    recipient: "0x1111111111111111111111111111111111111111",
+  });
+  assert.ok(trade);
+  assert.equal(trade.side, "BUY");
+  assert.equal(trade.quoteAmount, 2);
+});
+
 test("main menu looks like a trading dashboard", () => {
   const keyboard = bot.mainMenuKeyboard();
   const labels = keyboard.inline_keyboard.flat().map((button) => button.text);
