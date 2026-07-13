@@ -56,6 +56,8 @@ const config = {
   oneTapTrade: truthy(process.env.ONE_TAP_TRADE),
   buyAmountsQuote: parseAmountOptions(process.env.BUY_AMOUNTS_QUOTE || "0.01,0.05,0.1,0.25"),
   sellAmountsBase: parseAmountOptions(process.env.SELL_AMOUNTS_BASE || "1000,5000,10000,25000"),
+  minPortfolioLiquidityUsd: Number(process.env.MIN_PORTFOLIO_LIQUIDITY_USD || 50),
+  portfolioMaxTokens: Number(process.env.PORTFOLIO_MAX_TOKENS || 25),
 };
 
 function truthy(value) {
@@ -143,6 +145,25 @@ async function fetchDexPair() {
 
 async function fetchTokenPairs(tokenAddress) {
   return fetchJson(`https://api.dexscreener.com/token-pairs/v1/robinhood/${tokenAddress}`);
+}
+
+async function fetchWalletTokenBalances(walletAddress) {
+  const url = `${config.blockscoutBaseUrl}/api/v2/addresses/${walletAddress}/token-balances`;
+  const payload = await fetchJson(url);
+  return Array.isArray(payload) ? payload : payload.items || [];
+}
+
+async function fetchDexTokens(tokenAddresses) {
+  const addresses = [...new Set((tokenAddresses || []).map(normalizeAddress).filter(isEvmAddress))];
+  if (!addresses.length) return [];
+
+  const pairs = [];
+  for (let index = 0; index < addresses.length; index += 30) {
+    const chunk = addresses.slice(index, index + 30);
+    const payload = await fetchJson(`https://api.dexscreener.com/tokens/v1/robinhood/${chunk.join(",")}`);
+    if (Array.isArray(payload)) pairs.push(...payload);
+  }
+  return pairs;
 }
 
 function loadState() {
@@ -298,6 +319,169 @@ function formatUsd(value) {
   return `$${value.toPrecision(4)}`;
 }
 
+function formatTokenAmount(value) {
+  if (!Number.isFinite(value) || value === 0) return "0";
+  if (value >= 1000) return value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (value >= 1) return value.toLocaleString("en-US", { maximumFractionDigits: 4 });
+  return value.toPrecision(4);
+}
+
+function formatPriceUsd(value) {
+  if (!Number.isFinite(value) || value <= 0) return "n/a";
+  if (value >= 1) return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
+  return `$${value.toPrecision(4)}`;
+}
+
+function getPortfolioWallet(state = {}) {
+  return normalizeAddress(state.portfolioWallet || config.walletAddress || "");
+}
+
+function parseWalletBalanceEntry(entry) {
+  const token = entry?.token || {};
+  const address = normalizeAddress(token.address_hash || token.address);
+  const decimals = Number(token.decimals ?? 18);
+  const raw = BigInt(entry?.value || "0");
+  const amount = unitsToNumber(raw, Number.isFinite(decimals) ? decimals : 18);
+  const type = String(token.type || "ERC-20").toUpperCase();
+
+  return {
+    address,
+    symbol: token.symbol || "TOKEN",
+    name: token.name || "",
+    decimals: Number.isFinite(decimals) ? decimals : 18,
+    amount,
+    raw,
+    type,
+    exchangeRate: Number(token.exchange_rate),
+  };
+}
+
+function bestPairMapForTokens(pairs, tokenAddresses) {
+  const wanted = new Set((tokenAddresses || []).map(normalizeAddress));
+  const bestByToken = new Map();
+
+  for (const address of wanted) {
+    const pair = chooseBestPairForToken(pairs, address);
+    if (pair) bestByToken.set(address, pair);
+  }
+
+  return bestByToken;
+}
+
+function isTradeablePortfolioItem(item, minLiquidityUsd = config.minPortfolioLiquidityUsd) {
+  if (!item) return false;
+  if (!(item.amount > 0)) return false;
+  if (!Number.isFinite(item.priceUsd) || item.priceUsd <= 0) return false;
+  if (!Number.isFinite(item.liquidityUsd) || item.liquidityUsd < minLiquidityUsd) return false;
+  return true;
+}
+
+function buildPortfolioFromBalances(balances, pairs, options = {}) {
+  const minLiquidityUsd = Number(options.minLiquidityUsd ?? config.minPortfolioLiquidityUsd);
+  const maxTokens = Number(options.maxTokens ?? config.portfolioMaxTokens);
+  const parsed = (balances || [])
+    .map(parseWalletBalanceEntry)
+    .filter((item) => item.address && item.type.includes("ERC-20") && item.amount > 0);
+
+  const bestByToken = bestPairMapForTokens(pairs, parsed.map((item) => item.address));
+  const tradeable = [];
+  let skipped = 0;
+
+  for (const item of parsed) {
+    const pair = bestByToken.get(item.address);
+    const priceUsd = Number(pair?.priceUsd);
+    const liquidityUsd = Number(pair?.liquidity?.usd);
+    const valueUsd = Number.isFinite(priceUsd) ? item.amount * priceUsd : NaN;
+    const enriched = {
+      ...item,
+      priceUsd,
+      liquidityUsd,
+      valueUsd,
+      pairAddress: normalizeAddress(pair?.pairAddress || ""),
+      pairUrl: pair?.url || (pair?.pairAddress ? `https://dexscreener.com/robinhood/${pair.pairAddress}` : ""),
+    };
+
+    if (isTradeablePortfolioItem(enriched, minLiquidityUsd)) {
+      tradeable.push(enriched);
+    } else {
+      skipped += 1;
+    }
+  }
+
+  tradeable.sort((a, b) => Number(b.valueUsd || 0) - Number(a.valueUsd || 0));
+  const items = tradeable.slice(0, maxTokens);
+  const totalUsd = items.reduce((sum, item) => sum + (Number(item.valueUsd) || 0), 0);
+
+  return {
+    items,
+    skipped,
+    totalUsd,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function buildPortfolio(walletAddress, options = {}) {
+  const wallet = normalizeAddress(walletAddress);
+  if (!isEvmAddress(wallet)) {
+    throw new Error("Portfolio wallet chưa được cấu hình. Gửi /wallet 0x... hoặc set WALLET_ADDRESS.");
+  }
+
+  const balances = await fetchWalletTokenBalances(wallet);
+  const tokenAddresses = balances
+    .map(parseWalletBalanceEntry)
+    .filter((item) => item.address && item.type.includes("ERC-20") && item.amount > 0)
+    .map((item) => item.address);
+  const pairs = await fetchDexTokens(tokenAddresses);
+  const portfolio = buildPortfolioFromBalances(balances, pairs, options);
+  return { wallet, ...portfolio };
+}
+
+function portfolioPanelText(portfolio) {
+  if (!portfolio?.wallet) {
+    return [
+      `<b>Portfolio</b>`,
+      "Chưa có ví. Gửi lệnh:",
+      "<code>/wallet 0xYourAddress</code>",
+      "Hoặc paste địa chỉ ví của bạn.",
+    ].join("\n");
+  }
+
+  const lines = [
+    `<b>Portfolio</b>`,
+    `Wallet: <code>${escapeHtml(compactAddress(portfolio.wallet))}</code>`,
+    `Total: <b>${escapeHtml(formatUsd(portfolio.totalUsd))}</b>`,
+    `Tradeable: <b>${portfolio.items.length}</b> | Hidden junk: <b>${portfolio.skipped}</b>`,
+    `Min liquidity: <b>${escapeHtml(formatUsd(config.minPortfolioLiquidityUsd))}</b>`,
+    "",
+  ];
+
+  if (!portfolio.items.length) {
+    lines.push("Không còn token nào có giá + thanh khoản hợp lệ.");
+  } else {
+    for (const item of portfolio.items) {
+      const chart = item.pairUrl ? ` <a href="${escapeHtml(item.pairUrl)}">chart</a>` : "";
+      lines.push(
+        `<b>${escapeHtml(item.symbol)}</b> ${escapeHtml(formatTokenAmount(item.amount))} · ${escapeHtml(formatPriceUsd(item.priceUsd))} · <b>${escapeHtml(formatUsd(item.valueUsd))}</b>${chart}`,
+      );
+    }
+  }
+
+  lines.push("", "<i>Bấm Update Price để quét lại ví và bỏ token rác / hết thanh khoản.</i>");
+  return lines.join("\n");
+}
+
+function portfolioKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Update Price", callback_data: "portfolio:refresh" }],
+      [
+        { text: "Main Menu", callback_data: "menu" },
+        { text: "Wallets", callback_data: "panel:wallets" },
+      ],
+    ],
+  };
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -400,6 +584,10 @@ function mainMenuKeyboard() {
       [
         { text: "Buy & Sell", callback_data: "panel:trade" },
         { text: "Sniper", callback_data: "panel:trade" },
+      ],
+      [
+        { text: "Portfolio", callback_data: "panel:portfolio" },
+        { text: "Update Price", callback_data: "portfolio:refresh" },
       ],
       [
         { text: "Limit Orders", callback_data: "soon:Limit Orders" },
@@ -605,10 +793,120 @@ async function sendMainMenu(chatId = config.telegramChatId) {
   });
 }
 
+async function showPortfolio(chatId, state, { editCallback = null, announce = false } = {}) {
+  const wallet = getPortfolioWallet(state);
+  if (!wallet) {
+    const text = portfolioPanelText(null);
+    if (editCallback) {
+      await editTradeMessage(editCallback, text, portfolioKeyboard());
+      return null;
+    }
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: portfolioKeyboard(),
+    });
+    return null;
+  }
+
+  if (announce) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `Đang cập nhật giá portfolio cho:\n<code>${escapeHtml(wallet)}</code>`,
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+    });
+  }
+
+  try {
+    const portfolio = await buildPortfolio(wallet);
+    state.portfolioWallet = wallet;
+    state.portfolioCache = {
+      totalUsd: portfolio.totalUsd,
+      count: portfolio.items.length,
+      skipped: portfolio.skipped,
+      updatedAt: portfolio.updatedAt,
+    };
+    saveState(state);
+
+    const text = portfolioPanelText(portfolio);
+    if (editCallback) {
+      await editTradeMessage(editCallback, text, portfolioKeyboard());
+    } else {
+      await telegramRequest("sendMessage", {
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: "true",
+        reply_markup: portfolioKeyboard(),
+      });
+    }
+    return portfolio;
+  } catch (error) {
+    const text = [
+      `<b>Portfolio</b>`,
+      `Wallet: <code>${escapeHtml(compactAddress(wallet))}</code>`,
+      `Không lấy được giá lúc này: ${escapeHtml(error.message)}`,
+      "Thử lại bằng nút Update Price.",
+    ].join("\n");
+    if (editCallback) {
+      await editTradeMessage(editCallback, text, portfolioKeyboard());
+    } else {
+      await telegramRequest("sendMessage", {
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: "true",
+        reply_markup: portfolioKeyboard(),
+      });
+    }
+    return null;
+  }
+}
+
+async function setPortfolioWallet(walletAddress, state, chatId) {
+  const wallet = normalizeAddress(walletAddress);
+  if (!isEvmAddress(wallet)) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: "Địa chỉ ví không hợp lệ. Ví dụ: <code>/wallet 0x...</code>",
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+    });
+    return;
+  }
+
+  state.portfolioWallet = wallet;
+  saveState(state);
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: `Đã gắn portfolio wallet:\n<code>${escapeHtml(wallet)}</code>`,
+    parse_mode: "HTML",
+    disable_web_page_preview: "true",
+  });
+  await showPortfolio(chatId, state);
+}
+
 async function followTokenAddress(tokenAddress, state, chatId) {
   const pairs = await fetchTokenPairs(tokenAddress);
   const pair = chooseBestPairForToken(pairs, tokenAddress);
   if (!pair) {
+    try {
+      const balances = await fetchWalletTokenBalances(tokenAddress);
+      const hasTokens = balances.some((entry) => {
+        const item = parseWalletBalanceEntry(entry);
+        return item.address && item.amount > 0;
+      });
+      if (hasTokens) {
+        await setPortfolioWallet(tokenAddress, state, chatId);
+        return;
+      }
+    } catch (error) {
+      console.warn(`Could not treat ${tokenAddress} as wallet: ${error.message}`);
+    }
+
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: `Không tìm thấy pool Robinhood cho contract:\n<code>${escapeHtml(tokenAddress)}</code>`,
@@ -643,6 +941,8 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       `Quote: <b>${escapeHtml(trackedPair.quoteSymbol)}</b>`,
       `Alert min: <b>${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}</b>`,
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
+      "",
+      "Muốn xem cả ví? Gửi <code>/portfolio</code> hoặc paste địa chỉ ví.",
     ].join("\n"),
     parse_mode: "HTML",
     disable_web_page_preview: "true",
@@ -982,7 +1282,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
   }
 }
 
-async function handleCallbackQuery(callbackQuery) {
+async function handleCallbackQuery(callbackQuery, state) {
   const chatId = callbackQuery.message?.chat?.id;
   if (!isAuthorizedChat(chatId)) {
     await answerCallback(callbackQuery, `Unauthorized chat ${chatId}. Add it to TELEGRAM_CHAT_ID.`);
@@ -1007,6 +1307,11 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  if (data === "panel:portfolio" || data === "portfolio:refresh") {
+    await showPortfolio(chatId, state, { editCallback: callbackQuery });
+    return;
+  }
+
   if (data === "panel:profile") {
     await editTradeMessage(
       callbackQuery,
@@ -1015,6 +1320,7 @@ async function handleCallbackQuery(callbackQuery) {
         `Trading: <b>${config.tradeEnabled ? "ON" : "OFF"}</b>`,
         `One-tap: <b>${config.oneTapTrade ? "ON" : "OFF"}</b>`,
         `Alert min: <b>${config.minQuoteAmount} ${escapeHtml(config.quoteSymbol)}</b>`,
+        `Portfolio wallet: <code>${escapeHtml(getPortfolioWallet(state) ? compactAddress(getPortfolioWallet(state)) : "Not set")}</code>`,
       ].join("\n"),
       mainMenuKeyboard(),
     );
@@ -1024,14 +1330,19 @@ async function handleCallbackQuery(callbackQuery) {
   if (data === "panel:wallets") {
     const wallet = await getDisplayWallet();
     const balance = await getNativeBalance(wallet);
+    const portfolioWallet = getPortfolioWallet(state);
     await editTradeMessage(
       callbackQuery,
       [
         `<b>Wallets</b>`,
-        `Main: <code>${escapeHtml(wallet ? compactAddress(wallet) : "Not configured")}</code>`,
+        `Trade wallet: <code>${escapeHtml(wallet ? compactAddress(wallet) : "Not configured")}</code>`,
         `Balance: <code>${escapeHtml(balance ? `${Number(balance).toPrecision(6)} ETH` : "n/a")}</code>`,
+        `Portfolio wallet: <code>${escapeHtml(portfolioWallet ? compactAddress(portfolioWallet) : "Not set")}</code>`,
+        "",
+        "Gắn ví portfolio: <code>/wallet 0x...</code>",
+        "Xem giá: bấm Portfolio hoặc Update Price.",
       ].join("\n"),
-      mainMenuKeyboard(),
+      portfolioKeyboard(),
     );
     return;
   }
@@ -1107,7 +1418,7 @@ async function handleTelegramMessage(message, state) {
   if (isEvmAddress(text)) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text: `Đang tìm pool Robinhood cho:\n<code>${escapeHtml(text)}</code>`,
+      text: `Đang kiểm tra địa chỉ:\n<code>${escapeHtml(text)}</code>`,
       parse_mode: "HTML",
       disable_web_page_preview: "true",
     });
@@ -1115,8 +1426,19 @@ async function handleTelegramMessage(message, state) {
     return;
   }
 
+  const walletMatch = text.match(/^\/wallet(?:@\w+)?\s+(0x[a-fA-F0-9]{40})$/i);
+  if (walletMatch) {
+    await setPortfolioWallet(walletMatch[1], state, chatId);
+    return;
+  }
+
   if (text === "/start" || text === "/menu") {
     await sendMainMenu(chatId);
+    return;
+  }
+
+  if (text === "/portfolio" || text.startsWith("/portfolio@")) {
+    await showPortfolio(chatId, state, { announce: true });
     return;
   }
 
@@ -1156,7 +1478,7 @@ async function processTelegramUpdates(state) {
     state.telegramOffset = update.update_id + 1;
     try {
       if (update.message) await handleTelegramMessage(update.message, state);
-      if (update.callback_query) await handleCallbackQuery(update.callback_query);
+      if (update.callback_query) await handleCallbackQuery(update.callback_query, state);
     } catch (error) {
       if (isExpiredCallbackError(error) || isMessageNotModifiedError(error)) {
         console.warn(`Ignored stale Telegram update ${update.update_id}.`);
@@ -1271,9 +1593,11 @@ if (require.main === module) {
 }
 
 module.exports = {
+  buildPortfolioFromBalances,
   classifyFromTransaction,
   config,
   formatUnits,
+  getPortfolioWallet,
   groupHashes,
   groupTransfers,
   isAuthorizedChat,
@@ -1281,11 +1605,15 @@ module.exports = {
   isEvmAddress,
   isMessageNotModifiedError,
   isPollingConflictError,
+  isTradeablePortfolioItem,
   normalizeAddress,
   mainMenuKeyboard,
   mainPanelText,
   chooseBestPairForToken,
   parseTelegramChatIds,
+  parseWalletBalanceEntry,
+  portfolioKeyboard,
+  portfolioPanelText,
   shouldTradeImmediately,
   sniperTradeKeyboard,
   staticMainPanelText,

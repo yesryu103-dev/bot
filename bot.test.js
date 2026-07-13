@@ -233,3 +233,62 @@ test("trade smaller than minimum quote amount is ignored", () => {
 
   assert.equal(trade, null);
 });
+
+test("portfolio keeps liquid tokens and hides junk", () => {
+  const goodToken = "0x1111111111111111111111111111111111111111";
+  const junkToken = "0x2222222222222222222222222222222222222222";
+  const balances = [
+    {
+      value: "1000000000000000000000",
+      token: { address_hash: goodToken, symbol: "GOOD", decimals: "18", type: "ERC-20" },
+    },
+    {
+      value: "5000000000000000000000",
+      token: { address_hash: junkToken, symbol: "SCAM", decimals: "18", type: "ERC-20" },
+    },
+  ];
+  const pairs = [
+    {
+      chainId: "robinhood",
+      pairAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      url: "https://dexscreener.com/robinhood/0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      baseToken: { address: goodToken, symbol: "GOOD" },
+      quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      priceUsd: "0.01",
+      liquidity: { usd: 250 },
+    },
+    {
+      chainId: "robinhood",
+      pairAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      baseToken: { address: junkToken, symbol: "SCAM" },
+      quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      priceUsd: "0.02",
+      liquidity: { usd: 5 },
+    },
+  ];
+
+  const portfolio = bot.buildPortfolioFromBalances(balances, pairs, { minLiquidityUsd: 50, maxTokens: 10 });
+
+  assert.equal(portfolio.items.length, 1);
+  assert.equal(portfolio.items[0].symbol, "GOOD");
+  assert.equal(portfolio.skipped, 1);
+  assert.ok(portfolio.totalUsd > 0);
+  assert.equal(bot.isTradeablePortfolioItem(portfolio.items[0], 50), true);
+});
+
+test("portfolio keyboard exposes Update Price", () => {
+  const keyboard = bot.portfolioKeyboard();
+  assert.equal(keyboard.inline_keyboard[0][0].callback_data, "portfolio:refresh");
+  assert.ok(bot.mainMenuKeyboard().inline_keyboard.flat().some((button) => button.callback_data === "panel:portfolio"));
+});
+
+test("portfolio wallet prefers state over config", () => {
+  const original = bot.config.walletAddress;
+  bot.config.walletAddress = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  assert.equal(bot.getPortfolioWallet({}), "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  assert.equal(
+    bot.getPortfolioWallet({ portfolioWallet: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  );
+  bot.config.walletAddress = original;
+});
