@@ -795,7 +795,23 @@ async function executeSwap(side, amountText, overrides = {}) {
   };
 }
 
-async function ensureRouterApprovals() {
+function parseQuickTradeCallback(data) {
+  if (!String(data || "").startsWith("qtrade:")) return null;
+  const parts = String(data).split(":");
+  if (parts.length < 3) return null;
+  const side = String(parts[1] || "").toUpperCase();
+  const amount = parts.slice(2).join(":").trim();
+  if (!["BUY", "SELL"].includes(side) || !amount) return null;
+  if (side === "BUY") {
+    if (!/^[0-9]*\.?[0-9]+$/.test(amount)) return null;
+    return { side, amount };
+  }
+  if (parseSellPercent(amount) !== null) return { side, amount: amount.toUpperCase() };
+  if (/^[0-9]*\.?[0-9]+$/.test(amount)) return { side, amount };
+  return null;
+}
+
+async function ensureRouterApprovals(state = null) {
   if (!config.tradeEnabled || !config.walletPrivateKey || !config.rpcUrl) return;
 
   const { ethers } = require("ethers");
@@ -804,7 +820,11 @@ async function ensureRouterApprovals() {
     "function allowance(address owner,address spender) view returns (uint256)",
     "function approve(address spender,uint256 amount) returns (bool)",
   ];
-  const tokens = [...new Set([config.baseTokenAddress].map(normalizeAddress).filter(isEvmAddress))];
+  const snapshot = state || loadState();
+  const bagTokens = (snapshot?.portfolioSnapshot?.bagItems || [])
+    .map((item) => normalizeAddress(item?.address))
+    .filter(isEvmAddress);
+  const tokens = [...new Set([config.baseTokenAddress, ...bagTokens].map(normalizeAddress).filter(isEvmAddress))];
 
   for (const token of tokens) {
     try {
@@ -1183,7 +1203,7 @@ function portfolioSectionText(portfolio) {
       `<b>📦 Portfolio</b>`,
       `Wallet: <code>${escapeHtml(compactAddress(portfolio.wallet))}</code>`,
       `Không lấy được giá: ${escapeHtml(portfolio.error)}`,
-      "<i>Tools → Update Price để thử lại.</i>",
+      "<i>Bấm Update Price để thử lại.</i>",
     ].join("\n");
   }
 
@@ -1700,7 +1720,10 @@ async function showPortfolio(chatId, state, { editCallback = null, announce = fa
     }
   }
 
-  const text = await mainPanelText({ state, refreshPortfolio: forceRefresh });
+  const text = await mainPanelText({ state, refreshPortfolio: forceRefresh }).catch((error) => {
+    console.warn(`Portfolio panel failed: ${error.message}`);
+    return `${staticMainPanelText()}\n\n<i>Portfolio lỗi: ${escapeHtml(error.message)}</i>`;
+  });
   if (editCallback) {
     await editTradeMessage(editCallback, text, mainMenuKeyboard(state.portfolioSnapshot));
     return state.portfolioSnapshot || null;
@@ -1776,6 +1799,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       text: `Không tìm thấy pool Robinhood cho contract:\n<code>${escapeHtml(tokenAddress)}</code>`,
       parse_mode: "HTML",
       disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
     });
     return;
   }
@@ -1828,7 +1852,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       .join("\n"),
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-    reply_markup: afterTrackKeyboard(),
+    reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
   });
 }
 
@@ -1853,6 +1877,7 @@ async function enqueueFollowToken(tokenAddress, state, chatId) {
             text: `Không theo dõi được token:\n<code>${escapeHtml(job.tokenAddress)}</code>\n${escapeHtml(error.message)}`,
             parse_mode: "HTML",
             disable_web_page_preview: "true",
+            reply_markup: mainMenuKeyboard(job.state?.portfolioSnapshot),
           });
         } catch {
           // ignore
@@ -2272,6 +2297,28 @@ async function handleCallbackQuery(callbackQuery, state) {
     return;
   }
 
+  try {
+    await handleCallbackQueryInner(callbackQuery, state);
+  } catch (error) {
+    if (isExpiredCallbackError(error) || isMessageNotModifiedError(error)) {
+      console.warn(`Ignored stale callback: ${error.message}`);
+      return;
+    }
+    console.error(`Callback failed: ${error.message}`);
+    try {
+      await editTradeMessage(
+        callbackQuery,
+        `<b>Lỗi bot</b>\n${escapeHtml(error.message)}\n\nThử /menu hoặc Update Price.`,
+        mainMenuKeyboard(state.portfolioSnapshot),
+      );
+    } catch {
+      // ignore secondary telegram errors
+    }
+  }
+}
+
+async function handleCallbackQueryInner(callbackQuery, state) {
+  const chatId = callbackQuery.message?.chat?.id;
   const data = String(callbackQuery.data || "");
   const toast =
     data.startsWith("qtrade:") || data.startsWith("bagsell:")
@@ -2280,7 +2327,9 @@ async function handleCallbackQuery(callbackQuery, state) {
         ? "Updating…"
         : data.startsWith("bag:")
           ? "Bag…"
-          : "";
+          : data.startsWith("bagtrack:")
+            ? "Tracking…"
+            : "";
   await answerCallback(callbackQuery, toast);
 
   if (data === "menu") {
@@ -2338,10 +2387,17 @@ async function handleCallbackQuery(callbackQuery, state) {
     return;
   }
 
-  if (data.startsWith("qtrade:")) {
-    const [, side, amount] = data.split(":");
-    await runConfirmedTrade(callbackQuery, side, amount);
+  const trade = parseQuickTradeCallback(data);
+  if (trade) {
+    await runConfirmedTrade(callbackQuery, trade.side, trade.amount);
+    return;
   }
+
+  await editTradeMessage(
+    callbackQuery,
+    "Nút không còn hỗ trợ. Bấm /menu để làm mới.",
+    mainMenuKeyboard(state.portfolioSnapshot),
+  );
 }
 
 async function handleTelegramMessage(message, state) {
@@ -2351,6 +2407,22 @@ async function handleTelegramMessage(message, state) {
     return;
   }
 
+  try {
+    await handleTelegramMessageInner(message, state);
+  } catch (error) {
+    console.error(`Telegram message failed: ${error.message}`);
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `<b>Lỗi bot</b>\n${escapeHtml(error.message)}\n\nThử /menu hoặc Update Price.`,
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    }).catch(() => {});
+  }
+}
+
+async function handleTelegramMessageInner(message, state) {
+  const chatId = message.chat?.id;
   const text = String(message.text || "").trim();
   console.log(`Telegram message from chat ${chatId}: ${text.slice(0, 80) || "(no text)"}`);
   if (isEvmAddress(text)) {
@@ -2359,6 +2431,7 @@ async function handleTelegramMessage(message, state) {
       text: `Đang track buy/sell cho:\n<code>${escapeHtml(text)}</code>`,
       parse_mode: "HTML",
       disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
     });
     enqueueFollowToken(text, state, chatId).catch((error) => {
       console.error(`enqueueFollowToken failed: ${error.message}`);
@@ -2456,12 +2529,13 @@ async function processTelegramUpdates(state) {
         console.error(`Telegram update ${update.update_id} failed: ${error.message}`);
         try {
           const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
-          if (chatId && String(error.message || "").includes("timed out")) {
+          if (chatId && isAuthorizedChat(chatId)) {
             await telegramRequest("sendMessage", {
               chat_id: chatId,
-              text: "Bot đang chậm (timeout). Thử /menu lại hoặc Update Price.",
+              text: `<b>Lỗi bot</b>\n${escapeHtml(error.message)}\n\nThử /menu hoặc Update Price.`,
               parse_mode: "HTML",
               disable_web_page_preview: "true",
+              reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
             });
           }
         } catch {
@@ -2601,7 +2675,7 @@ async function main() {
   }
 
   if (config.tradeEnabled && config.walletPrivateKey && config.rpcUrl) {
-    ensureRouterApprovals().catch((error) => {
+    ensureRouterApprovals(state).catch((error) => {
       console.warn(`Router pre-approve skipped: ${error.message}`);
     });
   }
@@ -2685,6 +2759,7 @@ module.exports = {
   isTradeablePortfolioItem,
   mainMenuKeyboard,
   normalizeAddress,
+  parseQuickTradeCallback,
   parseSellPercent,
   parseTelegramChatIds,
   parseWalletBalanceEntry,

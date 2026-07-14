@@ -142,6 +142,15 @@ test("all trades execute immediately on button tap", () => {
   assert.equal(bot.shouldTradeImmediately("BUY", "0.01"), true);
 });
 
+test("quick trade callbacks validate buy and sell amounts", () => {
+  assert.deepEqual(bot.parseQuickTradeCallback("qtrade:BUY:0.2"), { side: "BUY", amount: "0.2" });
+  assert.deepEqual(bot.parseQuickTradeCallback("qtrade:SELL:25%"), { side: "SELL", amount: "25%" });
+  assert.deepEqual(bot.parseQuickTradeCallback("qtrade:SELL:ALL"), { side: "SELL", amount: "ALL" });
+  assert.equal(bot.parseQuickTradeCallback("qtrade:SELL:bad"), null);
+  assert.equal(bot.parseQuickTradeCallback("qtrade:HACK:0.2"), null);
+  assert.equal(bot.parseQuickTradeCallback("menu"), null);
+});
+
 test("sell percent parser and balance math", () => {
   assert.equal(bot.parseSellPercent("25%"), 25);
   assert.equal(bot.parseSellPercent("ALL"), 100);
