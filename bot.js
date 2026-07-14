@@ -1109,6 +1109,7 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
   const tradeable = [];
   const bagCandidates = [];
   let skipped = 0;
+  let totalUsd = 0;
 
   for (const item of parsed) {
     const pair = bestByToken.get(item.address);
@@ -1129,6 +1130,7 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
       pairUrl: pair?.url || (pair?.pairAddress ? `https://dexscreener.com/robinhood/${pair.pairAddress}` : ""),
     };
 
+    if (Number.isFinite(valueUsd) && valueUsd > 0) totalUsd += valueUsd;
     if (isBagSellableItem(enriched)) bagCandidates.push(enriched);
 
     if (isTradeablePortfolioItem(enriched, filterOptions)) {
@@ -1142,7 +1144,6 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
   bagCandidates.sort((a, b) => Number(b.valueUsd || 0) - Number(a.valueUsd || 0));
   const items = tradeable.slice(0, maxTokens).map(serializePortfolioItem);
   const bagItems = bagCandidates.slice(0, 6).map(serializePortfolioItem);
-  const totalUsd = items.reduce((sum, item) => sum + (Number(item.valueUsd) || 0), 0);
 
   return {
     items,
@@ -1189,10 +1190,9 @@ function portfolioSectionText(portfolio) {
   const items = Array.isArray(portfolio.items) ? portfolio.items : [];
   const bagItems = Array.isArray(portfolio.bagItems) ? portfolio.bagItems : [];
   const displayItems = bagItems.length ? bagItems : items;
-  const totalUsd = displayItems.reduce((sum, item) => sum + (Number(item.valueUsd) || 0), 0);
   const lines = [
     `<b>📦 Portfolio</b>`,
-    `Total: <b>${escapeHtml(formatUsd(totalUsd))}</b> · Bags: <b>${displayItems.length}</b> · Hidden: <b>${Number(portfolio.skipped) || 0}</b>`,
+    `Bags: <b>${displayItems.length}</b> · Hidden: <b>${Number(portfolio.skipped) || 0}</b>`,
   ];
 
   if (!displayItems.length) {
@@ -1543,10 +1543,17 @@ async function mainPanelText(options = {}) {
   const walletText = wallet ? compactAddress(wallet) : "Not configured";
   const balanceText = balance ? `${Number(balance).toPrecision(6)} ETH` : "n/a";
 
+  const portfolioTotal =
+    Number.isFinite(Number(portfolio?.totalUsd)) && Number(portfolio.totalUsd) > 0
+      ? Number(portfolio.totalUsd)
+      : null;
+  const totalUsdText = portfolioTotal != null ? formatUsd(portfolioTotal) : "n/a";
+
   return [
     `🚀 <b>${escapeHtml(config.botTitle)}</b>`,
     "",
     `💰 <b>ETH Price:</b> <code>${escapeHtml(priceText)}</code>`,
+    `💵 <b>Total USD:</b> <code>${escapeHtml(totalUsdText)}</code>`,
     "",
     `💳 <b>Your Wallet</b>`,
     `↳ <code>${escapeHtml(walletText)}</code>`,
@@ -1561,6 +1568,7 @@ function staticMainPanelText() {
     `🚀 <b>${escapeHtml(config.botTitle)}</b>`,
     "",
     `💰 <b>ETH Price:</b> <code>n/a</code>`,
+    `💵 <b>Total USD:</b> <code>n/a</code>`,
     "",
     `💳 <b>Your Wallet</b>`,
     `↳ <code>${escapeHtml(config.walletAddress ? compactAddress(config.walletAddress) : "Not configured")}</code>`,

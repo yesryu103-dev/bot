@@ -234,6 +234,7 @@ test("main menu looks like a trading dashboard", () => {
 
   assert(text.includes(bot.config.botTitle));
   assert(text.includes("Portfolio"));
+  assert(text.includes("Total USD"));
   assert(labels.includes(`Buy ${bot.config.buyAmountsQuote[0]}`));
   assert(labels.includes("25%"));
   assert(labels.includes("50%"));
