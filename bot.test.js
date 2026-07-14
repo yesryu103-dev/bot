@@ -168,6 +168,37 @@ test("trade USD enrichment prefers Dexscreener spot price", () => {
   assert.ok(Math.abs(fallback.priceUsd - (7.5 * 1784) / 83073.3186) < 0.001);
 });
 
+test("trade alert labels distinguish buy and sell", () => {
+  const buy = bot.tradeMessage({
+    side: "BUY",
+    txHash: "0xabc",
+    baseRaw: 1000n * 10n ** 18n,
+    quoteRaw: 2n * 10n ** 18n,
+    baseDecimals: 18,
+    quoteDecimals: 18,
+    quoteUsdValue: 3000,
+    priceUsd: 0.003,
+    trader: "0x1111111111111111111111111111111111111111",
+    blockNumber: 1,
+  });
+  const sell = bot.tradeMessage({
+    side: "SELL",
+    txHash: "0xdef",
+    baseRaw: 1000n * 10n ** 18n,
+    quoteRaw: 2n * 10n ** 18n,
+    baseDecimals: 18,
+    quoteDecimals: 18,
+    quoteUsdValue: 3000,
+    priceUsd: 0.003,
+    trader: "0x1111111111111111111111111111111111111111",
+    blockNumber: 2,
+  });
+  assert.ok(buy.includes("🟢 BUY"));
+  assert.ok(sell.includes("🔴 SELL"));
+  assert.equal(buy.includes("🔴"), false);
+  assert.equal(sell.includes("🟢"), false);
+});
+
 test("stale trades are not considered fresh for alerts", () => {
   const now = Date.parse("2026-07-13T14:27:00+07:00");
   const fresh = { timestamp: "2026-07-13T14:26:30+07:00" };

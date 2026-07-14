@@ -3635,10 +3635,18 @@ function transactionFromTransferGroup(group) {
   };
 }
 
+function tradeSideLabel(side) {
+  const value = String(side || "").toUpperCase();
+  if (value === "BUY") return "🟢 BUY";
+  if (value === "SELL") return "🔴 SELL";
+  return value || "TRADE";
+}
+
 function tradeMessage(trade) {
   const txUrl = `${config.blockscoutBaseUrl}/tx/${trade.txHash}`;
+  const sideLabel = tradeSideLabel(trade.side);
   return [
-    `<b>${escapeHtml(trade.side)} ${escapeHtml(config.baseSymbol)}</b> on Robinhood Uniswap`,
+    `<b>${sideLabel} ${escapeHtml(config.baseSymbol)}</b> on Robinhood Uniswap`,
     `Amount: <b>${escapeHtml(formatUnits(trade.baseRaw, trade.baseDecimals, 4))} ${escapeHtml(config.baseSymbol)}</b>`,
     `Quote: <b>${escapeHtml(formatUnits(trade.quoteRaw, trade.quoteDecimals, 6))} ${escapeHtml(config.quoteSymbol)}</b> (${escapeHtml(formatUsd(trade.quoteUsdValue))})`,
     `Price: <b>${escapeHtml(formatUsd(trade.priceUsd))}</b>`,
