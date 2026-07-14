@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node bot.js",
     "send-menu": "node bot.js --send-menu",
-    "send-trade": "node bot.js --send-trade",
     "test": "node --test"
   },
   "engines": {
