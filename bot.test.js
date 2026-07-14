@@ -142,6 +142,14 @@ test("all trades execute immediately on button tap", () => {
   assert.equal(bot.shouldTradeImmediately("BUY", "0.01"), true);
 });
 
+test("buy amount parser accepts positive decimals", () => {
+  assert.equal(bot.parseBuyAmountText("0.15"), "0.15");
+  assert.equal(bot.parseBuyAmountText("1"), "1");
+  assert.equal(bot.parseBuyAmountText("0"), null);
+  assert.equal(bot.parseBuyAmountText("-1"), null);
+  assert.equal(bot.parseBuyAmountText("abc"), null);
+});
+
 test("quick trade callbacks validate buy and sell amounts", () => {
   assert.deepEqual(bot.parseQuickTradeCallback("qtrade:BUY:0.2"), { side: "BUY", amount: "0.2" });
   assert.deepEqual(bot.parseQuickTradeCallback("qtrade:SELL:25%"), { side: "SELL", amount: "25%" });
@@ -249,6 +257,8 @@ test("main menu looks like a trading dashboard", () => {
   assert(labels.includes("50%"));
   assert(labels.includes("70%"));
   assert(labels.includes(`All ${bot.config.baseSymbol}`));
+  assert(labels.includes("Buy custom"));
+  assert(callbacks.includes("buy:custom"));
   assert(callbacks.includes("qtrade:SELL:ALL"));
   assert(labels.includes("Chart"));
   assert(labels.includes("Update Price"));

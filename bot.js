@@ -795,6 +795,28 @@ async function executeSwap(side, amountText, overrides = {}) {
   };
 }
 
+function parseBuyAmountText(text) {
+  const value = String(text || "").trim();
+  if (!/^[0-9]*\.?[0-9]+$/.test(value)) return null;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return value;
+}
+
+function getPendingBuyPrompt(state, chatId) {
+  const pending = state?.pendingBuyPrompt;
+  if (!pending || String(pending.chatId) !== String(chatId)) return null;
+  if (Date.now() - Number(pending.createdAt || 0) > 300_000) return null;
+  return pending;
+}
+
+function clearPendingBuyPrompt(state) {
+  if (state?.pendingBuyPrompt) {
+    delete state.pendingBuyPrompt;
+    saveState(state);
+  }
+}
+
 function parseQuickTradeCallback(data) {
   if (!String(data || "").startsWith("qtrade:")) return null;
   const parts = String(data).split(":");
@@ -1360,10 +1382,13 @@ function chunkButtons(buttons, size = 2) {
 }
 
 function tradeActionRows() {
-  const buyButtons = config.buyAmountsQuote.map((amount) => ({
-    text: `Buy ${amount}`,
-    callback_data: `qtrade:BUY:${amount}`,
-  }));
+  const buyButtons = [
+    ...config.buyAmountsQuote.map((amount) => ({
+      text: `Buy ${amount}`,
+      callback_data: `qtrade:BUY:${amount}`,
+    })),
+    { text: "Buy custom", callback_data: "buy:custom" },
+  ];
   const sellButtons = [
     ...(config.sellPercents || [25, 50, 70]).map((percent) => ({
       text: `${percent}%`,
@@ -2317,6 +2342,43 @@ async function handleCallbackQuery(callbackQuery, state) {
   }
 }
 
+async function sendTextTrade(chatId, state, side, amount) {
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: `<b>Sending ${escapeHtml(side)} ${escapeHtml(config.baseSymbol)}...</b>\nAmount: <b>${escapeHtml(amount)}</b>`,
+    parse_mode: "HTML",
+    disable_web_page_preview: "true",
+  });
+  try {
+    const result = await executeSwap(side, amount);
+    const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    nativeBalanceCache.at = 0;
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: [
+        `<b>${escapeHtml(side)} sent</b>`,
+        result.paidNative ? `Paid: <b>${escapeHtml(result.paidNative)} ETH</b>` : "",
+        `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+        `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
+        result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    });
+  } catch (error) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `<b>Trade not sent</b>\n${escapeHtml(error.message)}`,
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    });
+  }
+}
+
 async function handleCallbackQueryInner(callbackQuery, state) {
   const chatId = callbackQuery.message?.chat?.id;
   const data = String(callbackQuery.data || "");
@@ -2329,8 +2391,25 @@ async function handleCallbackQueryInner(callbackQuery, state) {
           ? "Bag…"
           : data.startsWith("bagtrack:")
             ? "Tracking…"
-            : "";
+            : data === "buy:custom"
+              ? "Buy…"
+              : "";
   await answerCallback(callbackQuery, toast);
+
+  if (data === "buy:custom") {
+    state.pendingBuyPrompt = { chatId: String(chatId), createdAt: Date.now() };
+    saveState(state);
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>Buy ${escapeHtml(config.baseSymbol)}</b>`,
+        `Gửi số ETH muốn mua (ví dụ <code>0.15</code> hoặc <code>1.5</code>).`,
+        `<i>Hết hạn sau 5 phút · /menu để hủy</i>`,
+      ].join("\n"),
+      mainMenuKeyboard(state.portfolioSnapshot),
+    );
+    return;
+  }
 
   if (data === "menu") {
     await renderMainMenuFast(callbackQuery, state);
@@ -2425,6 +2504,25 @@ async function handleTelegramMessageInner(message, state) {
   const chatId = message.chat?.id;
   const text = String(message.text || "").trim();
   console.log(`Telegram message from chat ${chatId}: ${text.slice(0, 80) || "(no text)"}`);
+
+  const pendingBuy = getPendingBuyPrompt(state, chatId);
+  const customBuyAmount = pendingBuy ? parseBuyAmountText(text) : null;
+  if (pendingBuy && customBuyAmount) {
+    clearPendingBuyPrompt(state);
+    await sendTextTrade(chatId, state, "BUY", customBuyAmount);
+    return;
+  }
+  if (pendingBuy && text && !text.startsWith("/")) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `Số ETH không hợp lệ. Gửi lại (ví dụ <code>0.15</code>) hoặc /menu để hủy.`,
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    });
+    return;
+  }
+
   if (isEvmAddress(text)) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
@@ -2446,6 +2544,7 @@ async function handleTelegramMessageInner(message, state) {
   }
 
   if (text === "/start" || text === "/menu" || text === "/trade") {
+    clearPendingBuyPrompt(state);
     await sendMainMenu(chatId, state);
     return;
   }
@@ -2457,42 +2556,10 @@ async function handleTelegramMessageInner(message, state) {
 
   const commandMatch = text.match(/^\/(buy|sell)\s+([0-9]*\.?[0-9]+%?|ALL)$/i);
   if (commandMatch) {
+    clearPendingBuyPrompt(state);
     const side = commandMatch[1].toUpperCase();
     const amount = commandMatch[2].toUpperCase();
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text: `<b>Sending ${escapeHtml(side)} ${escapeHtml(config.baseSymbol)}...</b>\nAmount: <b>${escapeHtml(amount)}</b>`,
-      parse_mode: "HTML",
-      disable_web_page_preview: "true",
-    });
-    try {
-      const result = await executeSwap(side, amount);
-      const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
-      nativeBalanceCache.at = 0;
-      await telegramRequest("sendMessage", {
-        chat_id: chatId,
-        text: [
-          `<b>${escapeHtml(side)} sent</b>`,
-          result.paidNative ? `Paid: <b>${escapeHtml(result.paidNative)} ETH</b>` : "",
-          `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
-          `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
-          result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        parse_mode: "HTML",
-        disable_web_page_preview: "true",
-        reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
-      });
-    } catch (error) {
-      await telegramRequest("sendMessage", {
-        chat_id: chatId,
-        text: `<b>Trade not sent</b>\n${escapeHtml(error.message)}`,
-        parse_mode: "HTML",
-        disable_web_page_preview: "true",
-        reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
-      });
-    }
+    await sendTextTrade(chatId, state, side, amount);
   }
 }
 
@@ -2759,6 +2826,7 @@ module.exports = {
   isTradeablePortfolioItem,
   mainMenuKeyboard,
   normalizeAddress,
+  parseBuyAmountText,
   parseQuickTradeCallback,
   parseSellPercent,
   parseTelegramChatIds,
