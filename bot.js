@@ -52,6 +52,8 @@ const config = {
   websiteUrl: "",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
   rpcUrl: process.env.RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
+  // Optional Alchemy/QuickNode WSS — when set, Swap alerts become near-realtime via subscription.
+  rpcWsUrl: process.env.RPC_WS_URL || "",
   walletPrivateKey: process.env.WALLET_PRIVATE_KEY || "",
   walletAddress: process.env.WALLET_ADDRESS || "",
   swapRouterAddress: process.env.SWAP_ROUTER_ADDRESS || "0xCaf681a66D020601342297493863E78C959E5cb2",
@@ -376,10 +378,10 @@ async function pollRpcSwaps(state) {
         seen.add(txHash);
         continue;
       }
-      const priced = await enrichTradePrices(trade);
-      await sendTelegram(tradeMessage(priced), alertTradeKeyboard());
       alerted.push(txHash);
       seen.add(txHash);
+      // Non-blocking: enrich + Telegram queue so RPC poll stays fast.
+      emitTradeAlertAsync(trade, state);
     }
 
     state.swapBlocks[pair] = latest;
@@ -388,6 +390,228 @@ async function pollRpcSwaps(state) {
   if (alerted.length) addSeen(state, alerted);
   saveState(state);
   return alerted.length;
+}
+
+// ============ Fast alert path: Telegram queue + optional WebSocket Swap feed ============
+const alertTgQueue = [];
+let alertTgWorkerRunning = false;
+const ALERT_TG_BACKOFFS_MS = [1000, 3000, 8000];
+
+const wsRuntime = {
+  provider: null,
+  healthy: false,
+  reconnectAttempts: 0,
+  listenedPairs: new Set(),
+  stateRef: null,
+  reconnectTimer: null,
+};
+const WS_RECONNECT_BACKOFFS_MS = [1000, 2000, 5000, 10000, 10000];
+
+function enqueueTelegramAlert(text, replyMarkup = null) {
+  alertTgQueue.push({ text, replyMarkup, attempts: 0 });
+  if (!alertTgWorkerRunning) {
+    processAlertTelegramQueue().catch((error) => {
+      console.error(`Alert Telegram queue crashed: ${error.message}`);
+      alertTgWorkerRunning = false;
+    });
+  }
+}
+
+async function processAlertTelegramQueue() {
+  alertTgWorkerRunning = true;
+  while (alertTgQueue.length) {
+    const item = alertTgQueue[0];
+    try {
+      await sendTelegram(item.text, item.replyMarkup);
+      alertTgQueue.shift();
+    } catch (error) {
+      item.attempts += 1;
+      if (item.attempts > ALERT_TG_BACKOFFS_MS.length) {
+        console.error(`Dropping alert after retries: ${error.message}`);
+        alertTgQueue.shift();
+        continue;
+      }
+      const wait = ALERT_TG_BACKOFFS_MS[item.attempts - 1];
+      console.warn(`Alert Telegram retry ${item.attempts}/${ALERT_TG_BACKOFFS_MS.length} in ${wait}ms: ${error.message}`);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+  alertTgWorkerRunning = false;
+}
+
+function emitTradeAlertAsync(trade, state) {
+  Promise.resolve()
+    .then(async () => {
+      let priced = trade;
+      try {
+        priced = await withTimeout(enrichTradePrices(trade), 2_500, "price enrich");
+      } catch {
+        // send without USD rather than delaying the alert
+      }
+      enqueueTelegramAlert(tradeMessage(priced), alertTradeKeyboard());
+    })
+    .catch((error) => console.error(`emitTradeAlertAsync failed: ${error.message}`));
+}
+
+function claimSwapAlert(state, txHash) {
+  const hash = String(txHash || "").toLowerCase();
+  if (!hash) return false;
+  const seen = new Set(state.seen || []);
+  if (seen.has(hash)) return false;
+  addSeen(state, [hash]);
+  saveState(state);
+  return true;
+}
+
+async function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockNumber }, state) {
+  const hash = String(txHash || "").toLowerCase();
+  if (!claimSwapAlert(state, hash)) return;
+
+  let meta;
+  try {
+    meta = await getPoolMeta(pair);
+  } catch (error) {
+    console.warn(`WS pool meta failed for ${pair}: ${error.message}`);
+    return;
+  }
+
+  if (
+    !(
+      (meta.token0 === config.baseTokenAddress || meta.token0 === config.quoteTokenAddress) &&
+      (meta.token1 === config.baseTokenAddress || meta.token1 === config.quoteTokenAddress)
+    )
+  ) {
+    return;
+  }
+  if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
+
+  const trade = tradeFromV3SwapLog({
+    amount0,
+    amount1,
+    token0: meta.token0,
+    token1: meta.token1,
+    quoteToken: config.quoteTokenAddress,
+    baseToken: config.baseTokenAddress,
+    txHash: hash,
+    blockNumber: Number(blockNumber || 0),
+    timestampMs: Date.now(),
+    recipient,
+  });
+  if (!trade) return;
+
+  if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
+  const bn = Number(blockNumber || 0);
+  if (bn > 0) state.swapBlocks[normalizeAddress(pair)] = Math.max(Number(state.swapBlocks[normalizeAddress(pair)] || 0), bn);
+  saveState(state);
+
+  emitTradeAlertAsync(trade, state);
+}
+
+function isWsAlertHealthy() {
+  return Boolean(config.rpcWsUrl && wsRuntime.healthy && wsRuntime.provider);
+}
+
+function destroyWsProvider() {
+  try {
+    wsRuntime.provider?.destroy?.();
+  } catch {
+    // ignore
+  }
+  wsRuntime.provider = null;
+  wsRuntime.healthy = false;
+  wsRuntime.listenedPairs.clear();
+}
+
+function scheduleWsReconnect(reason) {
+  if (!config.rpcWsUrl) return;
+  if (wsRuntime.reconnectTimer) return;
+
+  if (wsRuntime.reconnectAttempts >= WS_RECONNECT_BACKOFFS_MS.length) {
+    console.error(
+      `WS reconnect failed after ${WS_RECONNECT_BACKOFFS_MS.length} tries (${reason}). Falling back to HTTP poll.`,
+    );
+    destroyWsProvider();
+    wsRuntime.reconnectAttempts = 0;
+    return;
+  }
+
+  const wait = WS_RECONNECT_BACKOFFS_MS[wsRuntime.reconnectAttempts];
+  wsRuntime.reconnectAttempts += 1;
+  console.warn(
+    `WS down (${reason}). Reconnect ${wsRuntime.reconnectAttempts}/${WS_RECONNECT_BACKOFFS_MS.length} in ${wait}ms…`,
+  );
+  wsRuntime.healthy = false;
+  wsRuntime.reconnectTimer = setTimeout(() => {
+    wsRuntime.reconnectTimer = null;
+    try {
+      destroyWsProvider();
+      startWsSwapListener(wsRuntime.stateRef || loadState());
+    } catch (error) {
+      console.error(`WS reconnect error: ${error.message}`);
+      scheduleWsReconnect(error.message);
+    }
+  }, wait);
+}
+
+function startWsSwapListener(state) {
+  if (!config.rpcWsUrl) return false;
+  wsRuntime.stateRef = state;
+
+  const { ethers } = require("ethers");
+  destroyWsProvider();
+
+  const safeUrl = String(config.rpcWsUrl).replace(/\/v2\/[^/]+$/i, "/v2/***");
+  console.log(`Connecting Swap WebSocket: ${safeUrl}`);
+  const provider = new ethers.WebSocketProvider(config.rpcWsUrl);
+  wsRuntime.provider = provider;
+
+  const abi = [
+    "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
+  ];
+
+  for (const pair of watchedPairSet()) {
+    const pool = new ethers.Contract(pair, abi, provider);
+    pool.on("Swap", (sender, recipient, amount0, amount1, _sqrt, _liq, _tick, event) => {
+      const st = wsRuntime.stateRef || state;
+      const txHash = event?.log?.transactionHash || event?.transactionHash || "";
+      const blockNumber = event?.log?.blockNumber || event?.blockNumber || 0;
+      handleLiveSwapEvent(
+        { pair, amount0, amount1, recipient: recipient || sender, txHash, blockNumber },
+        st,
+      ).catch((error) => console.error(`WS Swap handler error: ${error.message}`));
+    });
+    wsRuntime.listenedPairs.add(pair);
+  }
+
+  const rawSocket = provider.websocket;
+  if (rawSocket?.on) {
+    rawSocket.on("close", () => scheduleWsReconnect("socket closed"));
+    rawSocket.on("error", (err) => scheduleWsReconnect(err?.message || "socket error"));
+  } else {
+    console.warn("WS raw socket hooks unavailable — auto-reconnect may not fire.");
+  }
+
+  wsRuntime.healthy = true;
+  wsRuntime.reconnectAttempts = 0;
+  console.log(`✅ WS Swap listener active on ${wsRuntime.listenedPairs.size} pool(s).`);
+  return true;
+}
+
+function refreshWsSwapListener(state) {
+  if (!config.rpcWsUrl) return;
+  if (!wsRuntime.healthy) {
+    startWsSwapListener(state);
+    return;
+  }
+  const wanted = [...watchedPairSet()];
+  const same =
+    wanted.length === wsRuntime.listenedPairs.size && wanted.every((pair) => wsRuntime.listenedPairs.has(pair));
+  if (!same) {
+    console.log("Tracked pools changed — refreshing WS subscriptions.");
+    startWsSwapListener(state);
+  } else {
+    wsRuntime.stateRef = state;
+  }
 }
 
 function isTransientHttpError(error) {
@@ -1861,6 +2085,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   }
 
   saveState(state);
+  refreshWsSwapListener(state);
 
   await telegramRequest("sendMessage", {
     chat_id: chatId,
@@ -2664,8 +2889,7 @@ async function handleNewGroups(groups, state) {
       }
 
       if (trade) {
-        const priced = await enrichTradePrices(trade);
-        await sendTelegram(tradeMessage(priced), alertTradeKeyboard());
+        emitTradeAlertAsync(trade, state);
       }
     } catch (error) {
       console.error(`Failed to process ${group.hash}: ${error.message}`);
@@ -2747,9 +2971,20 @@ async function main() {
     });
   }
 
+  if (config.rpcWsUrl) {
+    try {
+      startWsSwapListener(state);
+    } catch (error) {
+      console.warn(`WS Swap listener failed to start: ${error.message}`);
+    }
+  } else {
+    console.log("RPC_WS_URL not set — alerts use HTTP getLogs poll (slower).");
+  }
+
   console.log("Entering poll loop.");
   let lastBlockscoutWarnAt = 0;
   let lastRpcWarnAt = 0;
+  let lastHttpCatchupAt = 0;
   while (true) {
     try {
       await withTimeout(processTelegramUpdates(state), 90_000, "Telegram poll cycle");
@@ -2764,36 +2999,47 @@ async function main() {
       }
     }
 
-    // Primary realtime path: Uniswap v3 Swap logs via RPC (works when Blockscout 500s).
-    try {
-      await withTimeout(pollRpcSwaps(state), 20_000, "RPC swap poll");
-    } catch (error) {
-      const now = Date.now();
-      if (now - lastRpcWarnAt > 60_000) {
-        console.warn(`RPC swap poll failed: ${error.message || error}`);
-        lastRpcWarnAt = now;
+    const wsOk = isWsAlertHealthy();
+    wsRuntime.stateRef = state;
+
+    // HTTP catch-up: always when WS is down; rare safety net when WS is up.
+    const now = Date.now();
+    const shouldHttpCatchup = !wsOk || now - lastHttpCatchupAt > 45_000;
+    if (shouldHttpCatchup) {
+      try {
+        await withTimeout(pollRpcSwaps(state), 20_000, "RPC swap poll");
+        lastHttpCatchupAt = now;
+      } catch (error) {
+        if (now - lastRpcWarnAt > 60_000) {
+          console.warn(`RPC swap poll failed: ${error.message || error}`);
+          lastRpcWarnAt = now;
+        }
       }
     }
 
-    // Optional secondary path via Blockscout transfers.
-    try {
-      const groups = groupTransfers(await withTimeout(fetchTokenTransfers(), 15_000, "Blockscout transfers"));
-      await withTimeout(handleNewGroups(groups, state), 20_000, "Blockscout alerts");
-    } catch (error) {
-      const now = Date.now();
-      if (isTransientHttpError(error) || String(error.message || "").includes("timed out")) {
-        if (now - lastBlockscoutWarnAt > 60_000) {
-          console.warn(`Blockscout temporarily unavailable: ${error.message || error}`);
-          console.warn("Swap alerts continue via RPC logs.");
-          lastBlockscoutWarnAt = now;
+    // Blockscout is secondary — skip while WS is healthy to keep the loop snappy.
+    if (!wsOk) {
+      try {
+        const groups = groupTransfers(await withTimeout(fetchTokenTransfers(), 15_000, "Blockscout transfers"));
+        await withTimeout(handleNewGroups(groups, state), 20_000, "Blockscout alerts");
+      } catch (error) {
+        const t = Date.now();
+        if (isTransientHttpError(error) || String(error.message || "").includes("timed out")) {
+          if (t - lastBlockscoutWarnAt > 60_000) {
+            console.warn(`Blockscout temporarily unavailable: ${error.message || error}`);
+            console.warn("Swap alerts continue via RPC logs.");
+            lastBlockscoutWarnAt = t;
+          }
+        } else {
+          console.error(`Swap poll error: ${error.message || error}`);
         }
-      } else {
-        console.error(`Swap poll error: ${error.message || error}`);
       }
     }
 
     if (once) return;
-    await new Promise((resolve) => setTimeout(resolve, config.pollSeconds * 1000));
+    // Faster Telegram UI when WS owns alerts; keep 3s when relying on HTTP poll.
+    const sleepMs = wsOk ? Math.min(1000, config.pollSeconds * 1000) : config.pollSeconds * 1000;
+    await new Promise((resolve) => setTimeout(resolve, sleepMs));
   }
 }
 
