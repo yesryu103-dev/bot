@@ -62,6 +62,8 @@ const config = {
     .filter((value) => Number.isFinite(value) && value > 0 && value < 100),
   minPortfolioLiquidityUsd: Number(process.env.MIN_PORTFOLIO_LIQUIDITY_USD || 50),
   minPortfolioValueUsd: Number(process.env.MIN_PORTFOLIO_VALUE_USD || 3),
+  // Bag list / sell buttons: only show tokens above this USD value.
+  minBagValueUsd: Number(process.env.MIN_BAG_VALUE_USD || 1),
   portfolioMaxTokens: Number(process.env.PORTFOLIO_MAX_TOKENS || 25),
 };
 
@@ -1430,8 +1432,9 @@ function isBagSellableItem(item) {
   if (!(Number(item.amount) > 0)) return false;
   if (!Number.isFinite(Number(item.priceUsd)) || Number(item.priceUsd) <= 0) return false;
   if (!isEvmAddress(item.pairAddress)) return false;
-  // Show bag buttons even for small bags (portfolio text still uses stricter tradeable filter).
-  return Number.isFinite(Number(item.valueUsd)) && Number(item.valueUsd) >= 0.01;
+  const minBagUsd = Number(config.minBagValueUsd);
+  const floor = Number.isFinite(minBagUsd) && minBagUsd > 0 ? minBagUsd : 1;
+  return Number.isFinite(Number(item.valueUsd)) && Number(item.valueUsd) > floor;
 }
 
 function buildPortfolioFromBalances(balances, pairs, options = {}) {
@@ -1534,7 +1537,7 @@ function portfolioSectionText(portfolio) {
   ];
 
   if (!displayItems.length) {
-    lines.push(`Không còn token ≥ $0.01 với pair WETH để bán.`);
+    lines.push(`Không còn token > $${Number(config.minBagValueUsd) || 1} với pair WETH để bán.`);
   } else {
     for (const item of displayItems) {
       const chart = item.pairUrl ? ` <a href="${escapeHtml(item.pairUrl)}">chart</a>` : "";
