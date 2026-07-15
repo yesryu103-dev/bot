@@ -46,10 +46,6 @@ const config = {
   telegramChatId: parseTelegramChatIds(process.env.TELEGRAM_CHAT_ID || "")[0] || "",
   // Hardcoded brand — ignore stale Render BOT_TITLE env if set to old names.
   botTitle: "Treasure_tradingbot",
-  botTagline: "",
-  telegramUrl: "",
-  twitterUrl: "",
-  websiteUrl: "",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
   rpcUrl: process.env.RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
   // Optional Alchemy/QuickNode WSS — when set, Swap alerts become near-realtime via subscription.
@@ -67,7 +63,6 @@ const config = {
   minPortfolioLiquidityUsd: Number(process.env.MIN_PORTFOLIO_LIQUIDITY_USD || 50),
   minPortfolioValueUsd: Number(process.env.MIN_PORTFOLIO_VALUE_USD || 3),
   portfolioMaxTokens: Number(process.env.PORTFOLIO_MAX_TOKENS || 25),
-  lpWethAddress: normalizeAddress(process.env.QUOTE_TOKEN_ADDRESS || "0x0bd7d308f8e1639fab988df18a8011f41eacad73"),
 };
 
 function truthy(value) {
@@ -381,7 +376,7 @@ async function pollRpcSwaps(state) {
       alerted.push(txHash);
       seen.add(txHash);
       // Non-blocking: enrich + Telegram queue so RPC poll stays fast.
-      emitTradeAlertAsync(trade, state);
+      emitTradeAlertAsync(trade);
     }
 
     state.swapBlocks[pair] = latest;
@@ -400,12 +395,19 @@ const ALERT_TG_BACKOFFS_MS = [1000, 3000, 8000];
 const wsRuntime = {
   provider: null,
   healthy: false,
+  httpFallback: false,
+  generation: 0,
   reconnectAttempts: 0,
+  heartbeatFails: 0,
   listenedPairs: new Set(),
   stateRef: null,
   reconnectTimer: null,
+  heartbeatTimer: null,
+  lastFallbackLogAt: 0,
 };
-const WS_RECONNECT_BACKOFFS_MS = [1000, 2000, 5000, 10000, 10000];
+const WS_RECONNECT_BACKOFFS_MS = [1000, 2000, 5000, 10000, 15000];
+// After hard fallback to HTTP, keep retrying WS occasionally.
+const WS_RETRY_AFTER_FALLBACK_MS = 120_000;
 
 function enqueueTelegramAlert(text, replyMarkup = null) {
   alertTgQueue.push({ text, replyMarkup, attempts: 0 });
@@ -439,18 +441,15 @@ async function processAlertTelegramQueue() {
   alertTgWorkerRunning = false;
 }
 
-function emitTradeAlertAsync(trade, state) {
-  Promise.resolve()
-    .then(async () => {
-      let priced = trade;
-      try {
-        priced = await withTimeout(enrichTradePrices(trade), 2_500, "price enrich");
-      } catch {
-        // send without USD rather than delaying the alert
-      }
-      enqueueTelegramAlert(tradeMessage(priced), alertTradeKeyboard());
-    })
-    .catch((error) => console.error(`emitTradeAlertAsync failed: ${error.message}`));
+function emitTradeAlertAsync(trade) {
+  // Instant: use cached Dex price only — never block the Swap hot path.
+  const priced = applyTradeUsd(trade, {
+    priceUsd: dexTradePriceCache.priceUsd,
+    ethUsd: dexTradePriceCache.ethUsd,
+  });
+  enqueueTelegramAlert(tradeMessage(priced), mainMenuKeyboard());
+  // Refresh price cache in background for the next alert.
+  enrichTradePrices(trade).catch(() => {});
 }
 
 function claimSwapAlert(state, txHash) {
@@ -463,92 +462,143 @@ function claimSwapAlert(state, txHash) {
   return true;
 }
 
-async function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockNumber }, state) {
+function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockNumber }, state) {
   const hash = String(txHash || "").toLowerCase();
-  if (!claimSwapAlert(state, hash)) return;
+  if (!hash) return;
+  if ((state.seen || []).includes(hash)) return;
 
-  let meta;
-  try {
-    meta = await getPoolMeta(pair);
-  } catch (error) {
-    console.warn(`WS pool meta failed for ${pair}: ${error.message}`);
+  const cached = poolMetaCache.get(normalizeAddress(pair));
+  const run = (meta) => {
+    if (
+      !(
+        (meta.token0 === config.baseTokenAddress || meta.token0 === config.quoteTokenAddress) &&
+        (meta.token1 === config.baseTokenAddress || meta.token1 === config.quoteTokenAddress)
+      )
+    ) {
+      return;
+    }
+    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
+
+    const trade = tradeFromV3SwapLog({
+      amount0,
+      amount1,
+      token0: meta.token0,
+      token1: meta.token1,
+      quoteToken: config.quoteTokenAddress,
+      baseToken: config.baseTokenAddress,
+      txHash: hash,
+      blockNumber: Number(blockNumber || 0),
+      timestampMs: Date.now(),
+      recipient,
+    });
+    if (!trade) {
+      // Below threshold / invalid — mark seen so HTTP catch-up does not re-alert junk.
+      claimSwapAlert(state, hash);
+      return;
+    }
+    if (!claimSwapAlert(state, hash)) return;
+
+    if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
+    const bn = Number(blockNumber || 0);
+    const key = normalizeAddress(pair);
+    if (bn > 0) state.swapBlocks[key] = Math.max(Number(state.swapBlocks[key] || 0), bn);
+    saveState(state);
+
+    emitTradeAlertAsync(trade);
+  };
+
+  if (cached) {
+    run(cached);
     return;
   }
 
-  if (
-    !(
-      (meta.token0 === config.baseTokenAddress || meta.token0 === config.quoteTokenAddress) &&
-      (meta.token1 === config.baseTokenAddress || meta.token1 === config.quoteTokenAddress)
-    )
-  ) {
-    return;
-  }
-  if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
-
-  const trade = tradeFromV3SwapLog({
-    amount0,
-    amount1,
-    token0: meta.token0,
-    token1: meta.token1,
-    quoteToken: config.quoteTokenAddress,
-    baseToken: config.baseTokenAddress,
-    txHash: hash,
-    blockNumber: Number(blockNumber || 0),
-    timestampMs: Date.now(),
-    recipient,
-  });
-  if (!trade) return;
-
-  if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
-  const bn = Number(blockNumber || 0);
-  if (bn > 0) state.swapBlocks[normalizeAddress(pair)] = Math.max(Number(state.swapBlocks[normalizeAddress(pair)] || 0), bn);
-  saveState(state);
-
-  emitTradeAlertAsync(trade, state);
+  getPoolMeta(pair)
+    .then(run)
+    .catch((error) => console.warn(`WS pool meta failed for ${pair}: ${error.message}`));
 }
 
 function isWsAlertHealthy() {
-  return Boolean(config.rpcWsUrl && wsRuntime.healthy && wsRuntime.provider);
+  return Boolean(config.rpcWsUrl && wsRuntime.healthy && wsRuntime.provider && !wsRuntime.httpFallback);
+}
+
+function markHttpFallback(reason) {
+  wsRuntime.healthy = false;
+  wsRuntime.httpFallback = true;
+  const now = Date.now();
+  if (now - wsRuntime.lastFallbackLogAt > 30_000) {
+    const rpc = config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com";
+    console.warn(`⚠️  WSS unavailable (${reason}) — backup alerts via HTTP RPC: ${rpc}`);
+    wsRuntime.lastFallbackLogAt = now;
+  }
+}
+
+function clearWsReconnectTimer() {
+  if (wsRuntime.reconnectTimer) {
+    clearTimeout(wsRuntime.reconnectTimer);
+    wsRuntime.reconnectTimer = null;
+  }
+}
+
+function clearWsHeartbeat() {
+  if (wsRuntime.heartbeatTimer) {
+    clearInterval(wsRuntime.heartbeatTimer);
+    wsRuntime.heartbeatTimer = null;
+  }
 }
 
 function destroyWsProvider() {
-  try {
-    wsRuntime.provider?.destroy?.();
-  } catch {
-    // ignore
-  }
+  // Bump generation FIRST so in-flight "close" handlers from the old socket are ignored.
+  wsRuntime.generation += 1;
+  clearWsHeartbeat();
+  const old = wsRuntime.provider;
   wsRuntime.provider = null;
   wsRuntime.healthy = false;
   wsRuntime.listenedPairs.clear();
+  try {
+    old?.destroy?.();
+  } catch {
+    // ignore
+  }
 }
 
-function scheduleWsReconnect(reason) {
+function scheduleWsReconnect(reason, generation) {
   if (!config.rpcWsUrl) return;
+  if (generation !== wsRuntime.generation) return; // stale socket
   if (wsRuntime.reconnectTimer) return;
 
+  // Instantly hand alerts to HTTP while reconnecting.
+  wsRuntime.healthy = false;
+
   if (wsRuntime.reconnectAttempts >= WS_RECONNECT_BACKOFFS_MS.length) {
-    console.error(
-      `WS reconnect failed after ${WS_RECONNECT_BACKOFFS_MS.length} tries (${reason}). Falling back to HTTP poll.`,
-    );
     destroyWsProvider();
+    markHttpFallback(reason);
     wsRuntime.reconnectAttempts = 0;
+    // Keep trying WS later; HTTP covers alerts in the meantime.
+    wsRuntime.reconnectTimer = setTimeout(() => {
+      wsRuntime.reconnectTimer = null;
+      console.log("Retrying WSS after HTTP fallback…");
+      try {
+        startWsSwapListener(wsRuntime.stateRef || loadState());
+      } catch (error) {
+        markHttpFallback(error.message);
+        scheduleWsReconnect(error.message, wsRuntime.generation);
+      }
+    }, WS_RETRY_AFTER_FALLBACK_MS);
     return;
   }
 
   const wait = WS_RECONNECT_BACKOFFS_MS[wsRuntime.reconnectAttempts];
   wsRuntime.reconnectAttempts += 1;
   console.warn(
-    `WS down (${reason}). Reconnect ${wsRuntime.reconnectAttempts}/${WS_RECONNECT_BACKOFFS_MS.length} in ${wait}ms…`,
+    `WS down (${reason}). HTTP RPC backup active (${config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com"}). Reconnect ${wsRuntime.reconnectAttempts}/${WS_RECONNECT_BACKOFFS_MS.length} in ${wait}ms…`,
   );
-  wsRuntime.healthy = false;
   wsRuntime.reconnectTimer = setTimeout(() => {
     wsRuntime.reconnectTimer = null;
     try {
-      destroyWsProvider();
       startWsSwapListener(wsRuntime.stateRef || loadState());
     } catch (error) {
       console.error(`WS reconnect error: ${error.message}`);
-      scheduleWsReconnect(error.message);
+      scheduleWsReconnect(error.message, wsRuntime.generation);
     }
   }, wait);
 }
@@ -556,9 +606,11 @@ function scheduleWsReconnect(reason) {
 function startWsSwapListener(state) {
   if (!config.rpcWsUrl) return false;
   wsRuntime.stateRef = state;
+  clearWsReconnectTimer();
 
   const { ethers } = require("ethers");
-  destroyWsProvider();
+  destroyWsProvider(); // bumps generation + closes previous socket safely
+  const myGeneration = wsRuntime.generation;
 
   const safeUrl = String(config.rpcWsUrl).replace(/\/v2\/[^/]+$/i, "/v2/***");
   console.log(`Connecting Swap WebSocket: ${safeUrl}`);
@@ -571,27 +623,60 @@ function startWsSwapListener(state) {
 
   for (const pair of watchedPairSet()) {
     const pool = new ethers.Contract(pair, abi, provider);
-    pool.on("Swap", (sender, recipient, amount0, amount1, _sqrt, _liq, _tick, event) => {
+    pool.on("Swap", (_sender, recipient, amount0, amount1, _sqrt, _liq, _tick, event) => {
+      if (wsRuntime.generation !== myGeneration) return;
       const st = wsRuntime.stateRef || state;
       const txHash = event?.log?.transactionHash || event?.transactionHash || "";
       const blockNumber = event?.log?.blockNumber || event?.blockNumber || 0;
-      handleLiveSwapEvent(
-        { pair, amount0, amount1, recipient: recipient || sender, txHash, blockNumber },
-        st,
-      ).catch((error) => console.error(`WS Swap handler error: ${error.message}`));
+      try {
+        handleLiveSwapEvent(
+          { pair, amount0, amount1, recipient, txHash, blockNumber },
+          st,
+        );
+      } catch (error) {
+        console.error(`WS Swap handler error: ${error.message}`);
+      }
     });
     wsRuntime.listenedPairs.add(pair);
+    // Pre-warm meta so the first Swap does not wait on RPC.
+    getPoolMeta(pair, getRpcProvider()).catch(() => {});
   }
 
   const rawSocket = provider.websocket;
   if (rawSocket?.on) {
-    rawSocket.on("close", () => scheduleWsReconnect("socket closed"));
-    rawSocket.on("error", (err) => scheduleWsReconnect(err?.message || "socket error"));
+    rawSocket.on("close", () => {
+      if (wsRuntime.generation !== myGeneration) return;
+      scheduleWsReconnect("socket closed", myGeneration);
+    });
+    rawSocket.on("error", (err) => {
+      if (wsRuntime.generation !== myGeneration) return;
+      scheduleWsReconnect(err?.message || "socket error", myGeneration);
+    });
   } else {
     console.warn("WS raw socket hooks unavailable — auto-reconnect may not fire.");
   }
 
+  // Keepalive + detect dead WS → switch to HTTP backup.
+  clearWsHeartbeat();
+  wsRuntime.heartbeatFails = 0;
+  wsRuntime.heartbeatTimer = setInterval(() => {
+    if (wsRuntime.generation !== myGeneration || !wsRuntime.provider) return;
+    wsRuntime.provider
+      .getBlockNumber()
+      .then(() => {
+        wsRuntime.heartbeatFails = 0;
+      })
+      .catch((error) => {
+        wsRuntime.heartbeatFails += 1;
+        if (wsRuntime.heartbeatFails >= 3) {
+          console.warn(`WS heartbeat failed x3: ${error.message || error}`);
+          scheduleWsReconnect("heartbeat failed", myGeneration);
+        }
+      });
+  }, 25_000);
+
   wsRuntime.healthy = true;
+  wsRuntime.httpFallback = false;
   wsRuntime.reconnectAttempts = 0;
   console.log(`✅ WS Swap listener active on ${wsRuntime.listenedPairs.size} pool(s).`);
   return true;
@@ -599,6 +684,7 @@ function startWsSwapListener(state) {
 
 function refreshWsSwapListener(state) {
   if (!config.rpcWsUrl) return;
+  wsRuntime.stateRef = state;
   if (!wsRuntime.healthy) {
     startWsSwapListener(state);
     return;
@@ -609,20 +695,7 @@ function refreshWsSwapListener(state) {
   if (!same) {
     console.log("Tracked pools changed — refreshing WS subscriptions.");
     startWsSwapListener(state);
-  } else {
-    wsRuntime.stateRef = state;
   }
-}
-
-function isTransientHttpError(error) {
-  const message = String(error?.message || "");
-  return (
-    message.includes("timed out") ||
-    message.includes("HTTP 500") ||
-    message.includes("HTTP 502") ||
-    message.includes("HTTP 503") ||
-    message.includes("HTTP 504")
-  );
 }
 
 async function fetchTransaction(txHash) {
@@ -858,7 +931,7 @@ function formatSwapError(error) {
 }
 
 function isQuoteWethToken(tokenAddress) {
-  return normalizeAddress(tokenAddress) === normalizeAddress(config.quoteTokenAddress || config.lpWethAddress);
+  return normalizeAddress(tokenAddress) === normalizeAddress(config.quoteTokenAddress);
 }
 
 function displayQuoteSymbol(symbol = config.quoteSymbol) {
@@ -1003,11 +1076,6 @@ async function executeSwap(side, amountText, overrides = {}) {
     throw new Error(formatSwapError(error));
   }
 
-  const receipt = await tx.wait(1);
-  if (!receipt || receipt.status !== 1) {
-    throw new Error(`Swap reverted on-chain. Tx: ${tx.hash}`);
-  }
-
   return {
     hash: tx.hash,
     wallet: wallet.address,
@@ -1016,6 +1084,14 @@ async function executeSwap(side, amountText, overrides = {}) {
     minOut: ethers.formatUnits(minOut, decimalsOut),
     paidNative: buyWithNativeEth ? ethers.formatEther(payValue) : "",
     receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
+    // Confirm separately so Telegram can show the tx hash immediately (OKX-like feel).
+    confirm: async () => {
+      const receipt = await tx.wait(1);
+      if (!receipt || receipt.status !== 1) {
+        throw new Error(`Swap reverted on-chain. Tx: ${tx.hash}`);
+      }
+      return receipt;
+    },
   };
 }
 
@@ -1212,10 +1288,6 @@ function applyStateConfig(state) {
 }
 
 
-function groupHashes(transfers) {
-  return groupTransfers(transfers).map((group) => group.hash);
-}
-
 function groupTransfers(transfers) {
   const groups = new Map();
 
@@ -1354,7 +1426,7 @@ function serializePortfolioItem(item) {
 
 function isBagSellableItem(item) {
   if (!item || !isEvmAddress(item.address)) return false;
-  if (item.address === normalizeAddress(config.quoteTokenAddress || config.lpWethAddress)) return false;
+  if (item.address === normalizeAddress(config.quoteTokenAddress)) return false;
   if (!(Number(item.amount) > 0)) return false;
   if (!Number.isFinite(Number(item.priceUsd)) || Number(item.priceUsd) <= 0) return false;
   if (!isEvmAddress(item.pairAddress)) return false;
@@ -1474,10 +1546,6 @@ function portfolioSectionText(portfolio) {
 
   lines.push("<i>Bấm token bên dưới để Sell bag · Update Price để quét lại.</i>");
   return lines.join("\n");
-}
-
-function portfolioPanelText(portfolio) {
-  return portfolioSectionText(portfolio);
 }
 
 function portfolioKeyboard() {
@@ -1624,10 +1692,6 @@ function tradeActionRows() {
   return [...chunkButtons(buyButtons, 2), ...chunkButtons(sellButtons, 4)];
 }
 
-function alertTradeKeyboard() {
-  return mainMenuKeyboard();
-}
-
 function mainMenuKeyboard(portfolio = null) {
   return {
     inline_keyboard: [
@@ -1751,7 +1815,7 @@ async function fetchEthPriceUsd() {
     return ethPriceCache.value;
   }
   try {
-    const weth = normalizeAddress(config.quoteTokenAddress || config.lpWethAddress);
+    const weth = normalizeAddress(config.quoteTokenAddress);
     const pairs = await fetchTokenPairs(weth);
     const list = (Array.isArray(pairs) ? pairs : []).filter(
       (pair) => normalizeAddress(pair.chainId) === "robinhood" && Number(pair.liquidity?.usd || 0) > 0,
@@ -2058,7 +2122,6 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   applyTrackedPair(trackedPair);
   state.trackedPair = trackedPair;
   state.seen = [];
-  state.lp = null;
 
   try {
     // Mark current history as seen — do NOT backfill old buys/sells.
@@ -2311,22 +2374,6 @@ function tradeMessage(trade) {
   ].join("\n");
 }
 
-async function getWalletTokenBalance(tokenAddress) {
-  if (!config.rpcUrl || !config.walletPrivateKey) {
-    throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
-  }
-
-  const { ethers } = require("ethers");
-  const provider = new ethers.JsonRpcProvider(config.rpcUrl);
-  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
-  const erc20Abi = ["function balanceOf(address owner) view returns (uint256)"];
-  const token = new ethers.Contract(tokenAddress, erc20Abi, provider);
-  return {
-    wallet,
-    balance: await token.balanceOf(wallet.address),
-  };
-}
-
 async function resolveSellContext(tokenAddress, state = {}) {
   const token = normalizeAddress(tokenAddress);
   if (!isEvmAddress(token)) throw new Error("Invalid bag token address.");
@@ -2463,6 +2510,20 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
     await pending;
     const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
     const state = loadState();
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>${escapeHtml(side)} broadcast</b>`,
+        result.paidNative ? `Paid: <b>${escapeHtml(result.paidNative)} ETH</b>` : "",
+        `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+        `<i>Đang chờ confirm…</i>`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      mainMenuKeyboard(state.portfolioSnapshot),
+    ).catch(() => {});
+
+    await result.confirm();
     nativeBalanceCache.at = 0;
     await editTradeMessage(
       callbackQuery,
@@ -2511,6 +2572,17 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
     const result = await executeSwap("SELL", amount, ctx);
     await pending;
     const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>SELL ${escapeHtml(ctx.baseSymbol)} broadcast</b>`,
+        `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+        `<i>Đang chờ confirm…</i>`,
+      ].join("\n"),
+      mainMenuKeyboard(state.portfolioSnapshot),
+    ).catch(() => {});
+
+    await result.confirm();
     nativeBalanceCache.at = 0;
     await editTradeMessage(
       callbackQuery,
@@ -2577,6 +2649,18 @@ async function sendTextTrade(chatId, state, side, amount) {
   try {
     const result = await executeSwap(side, amount);
     const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: [
+        `<b>${escapeHtml(side)} broadcast</b>`,
+        `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+        `<i>Đang chờ confirm…</i>`,
+      ].join("\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+    }).catch(() => {});
+
+    await result.confirm();
     nativeBalanceCache.at = 0;
     await telegramRequest("sendMessage", {
       chat_id: chatId,
@@ -2889,7 +2973,7 @@ async function handleNewGroups(groups, state) {
       }
 
       if (trade) {
-        emitTradeAlertAsync(trade, state);
+        emitTradeAlertAsync(trade);
       }
     } catch (error) {
       console.error(`Failed to process ${group.hash}: ${error.message}`);
@@ -2976,13 +3060,14 @@ async function main() {
       startWsSwapListener(state);
     } catch (error) {
       console.warn(`WS Swap listener failed to start: ${error.message}`);
+      markHttpFallback(error.message || "start failed");
     }
   } else {
-    console.log("RPC_WS_URL not set — alerts use HTTP getLogs poll (slower).");
+    markHttpFallback("RPC_WS_URL not set");
+    console.log("RPC_WS_URL not set — alerts use HTTP getLogs poll.");
   }
 
   console.log("Entering poll loop.");
-  let lastBlockscoutWarnAt = 0;
   let lastRpcWarnAt = 0;
   let lastHttpCatchupAt = 0;
   while (true) {
@@ -3002,42 +3087,26 @@ async function main() {
     const wsOk = isWsAlertHealthy();
     wsRuntime.stateRef = state;
 
-    // HTTP catch-up: always when WS is down; rare safety net when WS is up.
+    // HTTP RPC backup (RPC_URL = robinhood public/private HTTP): always when WSS is down.
+    // When WSS is healthy, still catch up lightly every ~45s via the same HTTP RPC.
     const now = Date.now();
-    const shouldHttpCatchup = !wsOk || now - lastHttpCatchupAt > 45_000;
-    if (shouldHttpCatchup) {
+    const shouldHttpPoll = !wsOk || now - lastHttpCatchupAt > 45_000;
+    if (shouldHttpPoll) {
       try {
-        await withTimeout(pollRpcSwaps(state), 20_000, "RPC swap poll");
+        await withTimeout(pollRpcSwaps(state), 20_000, "HTTP RPC swap poll");
         lastHttpCatchupAt = now;
       } catch (error) {
         if (now - lastRpcWarnAt > 60_000) {
-          console.warn(`RPC swap poll failed: ${error.message || error}`);
+          console.warn(`HTTP RPC poll failed (${config.rpcUrl}): ${error.message || error}`);
           lastRpcWarnAt = now;
         }
       }
     }
 
-    // Blockscout is secondary — skip while WS is healthy to keep the loop snappy.
-    if (!wsOk) {
-      try {
-        const groups = groupTransfers(await withTimeout(fetchTokenTransfers(), 15_000, "Blockscout transfers"));
-        await withTimeout(handleNewGroups(groups, state), 20_000, "Blockscout alerts");
-      } catch (error) {
-        const t = Date.now();
-        if (isTransientHttpError(error) || String(error.message || "").includes("timed out")) {
-          if (t - lastBlockscoutWarnAt > 60_000) {
-            console.warn(`Blockscout temporarily unavailable: ${error.message || error}`);
-            console.warn("Swap alerts continue via RPC logs.");
-            lastBlockscoutWarnAt = t;
-          }
-        } else {
-          console.error(`Swap poll error: ${error.message || error}`);
-        }
-      }
-    }
+    // Optional Blockscout API is disabled in the hot loop — HTTP RPC (RPC_URL) already covers alerts.
+    // Boot / track-token warmup still use Blockscout when available.
 
     if (once) return;
-    // Faster Telegram UI when WS owns alerts; keep 3s when relying on HTTP poll.
     const sleepMs = wsOk ? Math.min(1000, config.pollSeconds * 1000) : config.pollSeconds * 1000;
     await new Promise((resolve) => setTimeout(resolve, sleepMs));
   }
@@ -3061,7 +3130,6 @@ module.exports = {
   formatBagButtonLabel,
   formatUnits,
   getPortfolioWallet,
-  groupHashes,
   groupTransfers,
   isAuthorizedChat,
   isEvmAddress,

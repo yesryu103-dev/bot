@@ -1,4 +1,5 @@
 .env
 state.json
+bot.err.log
 node_modules/
 npm-debug.log*
