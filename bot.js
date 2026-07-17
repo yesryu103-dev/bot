@@ -18,6 +18,28 @@ function loadDotenv(filePath = path.join(process.cwd(), ".env")) {
 
 loadDotenv();
 
+const ROBINHOOD_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
+
+function truthy(value) {
+  return ["1", "true", "yes", "y"].includes(String(value || "").toLowerCase());
+}
+
+function httpUrlFromWs(wsUrl) {
+  const raw = String(wsUrl || "").trim();
+  if (!raw) return "";
+  return raw.replace(/^wss:/i, "https:").replace(/^ws:/i, "http:");
+}
+
+function resolveHttpRpcUrl(rpcUrl, rpcWsUrl) {
+  const explicit = String(rpcUrl || "").trim();
+  const fromWs = httpUrlFromWs(rpcWsUrl);
+  const isPublicRobinhood =
+    !explicit || explicit === ROBINHOOD_PUBLIC_RPC || /rpc\.mainnet\.chain\.robinhood\.com/i.test(explicit);
+  // Public Robinhood HTTP often times out on eth_getLogs; reuse Alchemy/QuickNode HTTP sibling of WSS.
+  if (isPublicRobinhood && fromWs) return fromWs;
+  return explicit || fromWs || ROBINHOOD_PUBLIC_RPC;
+}
+
 const config = {
   blockscoutBaseUrl: (process.env.BLOCKSCOUT_BASE_URL || "https://robinhoodchain.blockscout.com").replace(/\/$/, ""),
   dexscreenPairUrl:
@@ -36,6 +58,8 @@ const config = {
   // Only alert swaps younger than this (realtime). Stale txs after sleep/redeploy are ignored.
   maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 90_000),
   rpcSwapLookbackBlocks: Number(process.env.RPC_SWAP_LOOKBACK_BLOCKS || 100),
+  // Alchemy free tier caps eth_getLogs to 10-block windows.
+  rpcGetLogsMaxBlockRange: Number(process.env.RPC_GETLOGS_MAX_BLOCK_RANGE || 10),
   dryRun: truthy(process.env.DRY_RUN),
   backfillOnStart: truthy(process.env.BACKFILL_ON_START),
   fetchTxDetails: truthy(process.env.FETCH_TX_DETAILS),
@@ -47,7 +71,8 @@ const config = {
   // Hardcoded brand — ignore stale Render BOT_TITLE env if set to old names.
   botTitle: "Treasure_tradingbot",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
-  rpcUrl: process.env.RPC_URL || "https://rpc.mainnet.chain.robinhood.com",
+  // Prefer Alchemy/QuickNode HTTP derived from WSS when public Robinhood RPC is flaky.
+  rpcUrl: resolveHttpRpcUrl(process.env.RPC_URL, process.env.RPC_WS_URL),
   // Optional Alchemy/QuickNode WSS — when set, Swap alerts become near-realtime via subscription.
   rpcWsUrl: process.env.RPC_WS_URL || "",
   walletPrivateKey: process.env.WALLET_PRIVATE_KEY || "",
@@ -66,10 +91,6 @@ const config = {
   minBagValueUsd: Number(process.env.MIN_BAG_VALUE_USD || 1),
   portfolioMaxTokens: Number(process.env.PORTFOLIO_MAX_TOKENS || 25),
 };
-
-function truthy(value) {
-  return ["1", "true", "yes", "y"].includes(String(value || "").toLowerCase());
-}
 
 function parseAmountOptions(value) {
   return String(value || "")
@@ -193,9 +214,13 @@ let cachedRpcProvider = null;
 
 function getRpcProvider() {
   const { ethers } = require("ethers");
-  const url = config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com";
+  const url = config.rpcUrl || ROBINHOOD_PUBLIC_RPC;
   if (!cachedRpcProvider || cachedRpcProvider._walletRpcUrl !== url) {
-    cachedRpcProvider = new ethers.JsonRpcProvider(url);
+    // staticNetwork skips eth_chainId on every call; slightly faster + fewer CU.
+    cachedRpcProvider = new ethers.JsonRpcProvider(url, undefined, {
+      staticNetwork: true,
+      batchMaxCount: 3,
+    });
     cachedRpcProvider._walletRpcUrl = url;
   }
   return cachedRpcProvider;
@@ -276,7 +301,7 @@ async function initRpcSwapCursors(state) {
   return latest;
 }
 
-async function pollRpcSwaps(state) {
+async function pollRpcSwaps(state, options = {}) {
   const { ethers } = require("ethers");
   const provider = getRpcProvider();
   const latest = Number(await provider.getBlockNumber());
@@ -288,7 +313,9 @@ async function pollRpcSwaps(state) {
   const topic = iface.getEvent("Swap").topicHash;
   const seen = new Set(state.seen || []);
   const now = Date.now();
-  const lookback = Math.max(20, Number(config.rpcSwapLookbackBlocks || 100));
+  const configuredLookback = Number(config.rpcSwapLookbackBlocks || 100);
+  const lookback = Math.max(20, Number(options.lookbackBlocks ?? configuredLookback));
+  const light = Boolean(options.light);
   const alerted = [];
 
   for (const pair of watchedPairSet()) {
@@ -303,7 +330,10 @@ async function pollRpcSwaps(state) {
     try {
       meta = await getPoolMeta(pair, provider);
     } catch (error) {
-      console.warn(`RPC pool meta failed for ${pair}: ${error.message}`);
+      if (now - (pollRpcSwaps._lastMetaWarnAt || 0) > 60_000) {
+        console.warn(`RPC pool meta failed for ${pair}: ${error.message}`);
+        pollRpcSwaps._lastMetaWarnAt = now;
+      }
       continue;
     }
 
@@ -320,28 +350,42 @@ async function pollRpcSwaps(state) {
     // Keep trading fee aligned with the live tracked pool.
     if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
 
+    // Alchemy free: eth_getLogs max 10-block range — chunk so backup stays reliable.
+    const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
     let logs = [];
+    let scannedTo = fromBlock;
     try {
-      logs = await provider.getLogs({
-        address: pair,
-        fromBlock: fromBlock + 1,
-        toBlock: latest,
-        topics: [topic],
-      });
+      for (let start = fromBlock + 1; start <= latest; start += maxRange) {
+        const end = Math.min(latest, start + maxRange - 1);
+        const chunk = await provider.getLogs({
+          address: pair,
+          fromBlock: start,
+          toBlock: end,
+          topics: [topic],
+        });
+        if (chunk.length) logs = logs.concat(chunk);
+        scannedTo = end;
+      }
     } catch (error) {
-      console.warn(`RPC getLogs failed for ${pair}: ${error.message}`);
+      if (scannedTo > fromBlock) state.swapBlocks[pair] = scannedTo;
+      if (now - (pollRpcSwaps._lastLogsWarnAt || 0) > 60_000) {
+        console.warn(`RPC getLogs failed for ${pair}: ${error.message}`);
+        pollRpcSwaps._lastLogsWarnAt = now;
+      }
       continue;
     }
 
     const blockTs = new Map();
-    for (const log of logs) {
-      const blockNumber = Number(log.blockNumber);
-      if (blockTs.has(blockNumber)) continue;
-      try {
-        const block = await provider.getBlock(blockNumber);
-        blockTs.set(blockNumber, block?.timestamp ? Number(block.timestamp) * 1000 : now);
-      } catch {
-        blockTs.set(blockNumber, now);
+    if (!light) {
+      for (const log of logs) {
+        const blockNumber = Number(log.blockNumber);
+        if (blockTs.has(blockNumber)) continue;
+        try {
+          const block = await provider.getBlock(blockNumber);
+          blockTs.set(blockNumber, block?.timestamp ? Number(block.timestamp) * 1000 : now);
+        } catch {
+          blockTs.set(blockNumber, now);
+        }
       }
     }
 
@@ -354,7 +398,7 @@ async function pollRpcSwaps(state) {
       } catch {
         continue;
       }
-      const tsMs = blockTs.get(Number(log.blockNumber)) || now;
+      const tsMs = light ? now : blockTs.get(Number(log.blockNumber)) || now;
       if (now - tsMs > Number(config.maxAlertAgeMs || 90_000)) {
         seen.add(txHash);
         continue;
@@ -3090,13 +3134,21 @@ async function main() {
     const wsOk = isWsAlertHealthy();
     wsRuntime.stateRef = state;
 
-    // HTTP RPC backup (RPC_URL = robinhood public/private HTTP): always when WSS is down.
-    // When WSS is healthy, still catch up lightly every ~45s via the same HTTP RPC.
+    // HTTP RPC backup: full poll when WSS is down; light catch-up every ~90s when WSS is healthy
+    // (saves Alchemy free-tier CU; realtime alerts already come from WSS).
     const now = Date.now();
-    const shouldHttpPoll = !wsOk || now - lastHttpCatchupAt > 45_000;
+    const httpCatchupMs = wsOk ? 90_000 : 0;
+    const shouldHttpPoll = !wsOk || now - lastHttpCatchupAt > httpCatchupMs;
     if (shouldHttpPoll) {
       try {
-        await withTimeout(pollRpcSwaps(state), 20_000, "HTTP RPC swap poll");
+        await withTimeout(
+          pollRpcSwaps(state, {
+            lookbackBlocks: wsOk ? 40 : config.rpcSwapLookbackBlocks,
+            light: wsOk,
+          }),
+          wsOk ? 15_000 : 25_000,
+          "HTTP RPC swap poll",
+        );
         lastHttpCatchupAt = now;
       } catch (error) {
         if (now - lastRpcWarnAt > 60_000) {
