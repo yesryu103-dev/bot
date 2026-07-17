@@ -137,9 +137,10 @@ async function fetchJson(url, options = {}, retries = 3) {
       if (!response.ok) {
         const text = await response.text();
         const error = new Error(`HTTP ${response.status} ${response.statusText}: ${text.slice(0, 200)}`);
-        if (response.status >= 500 && attempt < retries) {
+        error.status = response.status;
+        if (isRetryableFetchError(error) && attempt < retries) {
           lastError = error;
-          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, retryBackoffMs(attempt, response.status)));
           continue;
         }
         throw error;
@@ -148,15 +149,8 @@ async function fetchJson(url, options = {}, retries = 3) {
       return response.json();
     } catch (error) {
       lastError = error?.name === "AbortError" ? new Error(`Request timed out after ${timeoutMs}ms: ${url}`) : error;
-      const message = String(lastError?.message || "");
-      const retryable =
-        message.includes("timed out") ||
-        message.includes("500") ||
-        message.includes("502") ||
-        message.includes("503") ||
-        message.includes("504");
-      if (retryable && attempt < retries) {
-        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      if (isRetryableFetchError(lastError) && attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, retryBackoffMs(attempt, lastError?.status)));
         continue;
       }
       throw lastError;
@@ -166,6 +160,43 @@ async function fetchJson(url, options = {}, retries = 3) {
   }
 
   throw lastError;
+}
+
+function retryBackoffMs(attempt, status) {
+  const base = Number(status) === 429 ? 2000 : 700;
+  return Math.min(12_000, base * attempt * attempt) + Math.floor(Math.random() * 250);
+}
+
+function isRetryableFetchError(error) {
+  const parts = [];
+  let cur = error;
+  for (let depth = 0; depth < 5 && cur; depth += 1) {
+    parts.push(String(cur.message || ""));
+    parts.push(String(cur.code || ""));
+    parts.push(String(cur.name || ""));
+    if (Number.isFinite(Number(cur.status))) parts.push(String(cur.status));
+    cur = cur.cause;
+  }
+  const blob = parts.join(" ").toLowerCase();
+  return (
+    blob.includes("timed out") ||
+    blob.includes("timeout") ||
+    blob.includes("fetch failed") ||
+    blob.includes("network") ||
+    blob.includes("econnreset") ||
+    blob.includes("econnrefused") ||
+    blob.includes("etimedout") ||
+    blob.includes("enotfound") ||
+    blob.includes("eai_again") ||
+    blob.includes("socket") ||
+    blob.includes("und_err") ||
+    blob.includes("other side closed") ||
+    /\b429\b/.test(blob) ||
+    /\b500\b/.test(blob) ||
+    /\b502\b/.test(blob) ||
+    /\b503\b/.test(blob) ||
+    /\b504\b/.test(blob)
+  );
 }
 
 async function fetchTokenTransfersForPair(pairAddress) {
@@ -436,7 +467,12 @@ async function pollRpcSwaps(state, options = {}) {
 // ============ Fast alert path: Telegram queue + optional WebSocket Swap feed ============
 const alertTgQueue = [];
 let alertTgWorkerRunning = false;
-const ALERT_TG_BACKOFFS_MS = [1000, 3000, 8000];
+// Longer backoffs so transient Telegram/network blips don't drop alerts.
+const ALERT_TG_BACKOFFS_MS = [1000, 3000, 8000, 20_000, 60_000];
+const TRADE_CONFIRM_TIMEOUT_MS = 120_000;
+const TRADE_HANDLER_TIMEOUT_MS = 180_000;
+
+let tradeBusy = false;
 
 const wsRuntime = {
   provider: null,
@@ -475,8 +511,21 @@ async function processAlertTelegramQueue() {
     } catch (error) {
       item.attempts += 1;
       if (item.attempts > ALERT_TG_BACKOFFS_MS.length) {
-        console.error(`Dropping alert after retries: ${error.message}`);
-        alertTgQueue.shift();
+        console.error(`Alert still failing after retries — re-queueing later: ${error.message}`);
+        const deferred = alertTgQueue.shift();
+        // Keep trying forever for alerts (don't silently drop); push to end with reset attempts after long wait.
+        setTimeout(() => {
+          if (deferred) {
+            deferred.attempts = 0;
+            alertTgQueue.push(deferred);
+            if (!alertTgWorkerRunning) {
+              processAlertTelegramQueue().catch((err) => {
+                console.error(`Alert Telegram queue crashed: ${err.message}`);
+                alertTgWorkerRunning = false;
+              });
+            }
+          }
+        }, 120_000);
         continue;
       }
       const wait = ALERT_TG_BACKOFFS_MS[item.attempts - 1];
@@ -914,13 +963,15 @@ async function quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn
   let lastError = "";
   for (const fee of feeCandidates) {
     try {
-      const result = await quoter.quoteExactInputSingle.staticCall({
-        tokenIn,
-        tokenOut,
-        amountIn,
-        fee,
-        sqrtPriceLimitX96: 0,
-      });
+      const result = await rpcCall(`quote fee=${fee}`, () =>
+        quoter.quoteExactInputSingle.staticCall({
+          tokenIn,
+          tokenOut,
+          amountIn,
+          fee,
+          sqrtPriceLimitX96: 0,
+        }),
+      );
       const amountOut = BigInt(result.amountOut ?? result[0]);
       if (amountOut > 0n) return { amountOut, fee };
       lastError = "zero amount out";
@@ -931,11 +982,60 @@ async function quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn
   throw new Error(lastError || "quoter failed");
 }
 
+async function rpcCall(label, fn, retries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (isRetryableFetchError(error) && attempt < retries) {
+        const wait = retryBackoffMs(attempt);
+        console.warn(`RPC ${label} retry ${attempt}/${retries} in ${wait}ms: ${error.message || error}`);
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
+}
+
+async function withTradeLock(fn) {
+  if (tradeBusy) {
+    throw new Error("Trade đang chạy. Đợi xong rồi bấm lại (tránh double-send).");
+  }
+  tradeBusy = true;
+  try {
+    return await fn();
+  } finally {
+    tradeBusy = false;
+  }
+}
+
+function explorerTxUrl(hash) {
+  return `${config.blockscoutBaseUrl}/tx/${hash}`;
+}
+
+function formatTradeFailureMessage(error, broadcastHash = "") {
+  const detail = escapeHtml(formatSwapError(error));
+  if (broadcastHash) {
+    const txUrl = explorerTxUrl(broadcastHash);
+    return [
+      `<b>Trade đã broadcast — chưa confirm chắc chắn</b>`,
+      `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(broadcastHash))}</a>`,
+      detail,
+      `<i>Kiểm tra link trước khi bấm lại — tránh mua/bán 2 lần.</i>`,
+    ].join("\n");
+  }
+  return `<b>Trade not sent</b>\n${detail}`;
+}
+
 async function assertNativeEthForBuy(wallet, amountIn) {
   const { ethers } = require("ethers");
   // Robinhood gas is cheap; keep a small reserve so buy amount + gas still fit.
   const gasReserve = ethers.parseEther("0.001");
-  const nativeBal = await wallet.provider.getBalance(wallet.address);
+  const nativeBal = await rpcCall("getBalance(buy)", () => wallet.provider.getBalance(wallet.address));
   if (nativeBal < amountIn + gasReserve) {
     throw new Error(
       [
@@ -951,7 +1051,7 @@ async function assertNativeEthForBuy(wallet, amountIn) {
 async function assertEthForGas(wallet, label = "trade") {
   const { ethers } = require("ethers");
   const gasReserve = ethers.parseEther("0.001");
-  const nativeBal = await wallet.provider.getBalance(wallet.address);
+  const nativeBal = await rpcCall("getBalance(gas)", () => wallet.provider.getBalance(wallet.address));
   if (nativeBal < gasReserve) {
     throw new Error(
       `Not enough ETH for gas (${label}). Need ~0.001 ETH, have ${ethers.formatEther(nativeBal)} ETH.`,
@@ -961,6 +1061,13 @@ async function assertEthForGas(wallet, label = "trade") {
 
 function formatSwapError(error) {
   const raw = String(error?.shortMessage || error?.reason || error?.message || error || "");
+  if (/Trade đang chạy|double-send/i.test(raw)) return raw;
+  if (/timed out|timeout|fetch failed|ECONNRESET|ETIMEDOUT|network/i.test(raw)) {
+    return `Mạng/RPC chập chờn: ${raw.slice(0, 120)}. Thử lại sau vài giây.`;
+  }
+  if (/nonce|replacement|already known/i.test(raw)) {
+    return `Nonce/tx conflict — đợi tx cũ xong rồi thử lại. (${raw.slice(0, 100)})`;
+  }
   if (/STF|transfer amount exceeds|insufficient allowance/i.test(raw)) {
     return "Token transfer/approve failed (balance hoặc allowance). Thử Sell lại hoặc Approve.";
   }
@@ -973,7 +1080,7 @@ function formatSwapError(error) {
   if (/execution reverted/i.test(raw) && raw.length > 160) {
     return `Swap reverted: ${raw.slice(0, 120)}…`;
   }
-  return raw;
+  return raw.length > 220 ? `${raw.slice(0, 220)}…` : raw;
 }
 
 function isQuoteWethToken(tokenAddress) {
@@ -1044,7 +1151,7 @@ async function executeSwap(side, amountText, overrides = {}) {
   let amountIn;
   const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
   if (side === "SELL" && sellPercent !== null) {
-    const balance = await inputToken.balanceOf(wallet.address);
+    const balance = await rpcCall("balanceOf(sell%)", () => inputToken.balanceOf(wallet.address));
     amountIn = balancePercent(balance, sellPercent);
     // Leave 1 wei dust on 100% sells so fee-on-transfer / rounding can't brick the swap.
     if (sellPercent >= 100 && amountIn > 1n) amountIn -= 1n;
@@ -1077,17 +1184,21 @@ async function executeSwap(side, amountText, overrides = {}) {
   const payValue = buyWithNativeEth ? amountIn : 0n;
 
   if (!buyWithNativeEth) {
-    const balance = await inputToken.balanceOf(wallet.address);
+    const balance = await rpcCall("balanceOf", () => inputToken.balanceOf(wallet.address));
     if (balance < amountIn) {
       throw new Error(
         `Not enough ${tokenInSymbol}. Need ${amountText}, wallet has ${ethers.formatUnits(balance, decimalsIn)} ${tokenInSymbol}`,
       );
     }
 
-    const allowance = await inputToken.allowance(wallet.address, config.swapRouterAddress);
+    const allowance = await rpcCall("allowance", () => inputToken.allowance(wallet.address, config.swapRouterAddress));
     if (allowance < amountIn) {
-      const approveTx = await inputToken.approve(config.swapRouterAddress, ethers.MaxUint256);
-      const approveReceipt = await approveTx.wait(1);
+      const approveTx = await rpcCall("approve", () => inputToken.approve(config.swapRouterAddress, ethers.MaxUint256));
+      const approveReceipt = await withTimeout(
+        approveTx.wait(1),
+        TRADE_CONFIRM_TIMEOUT_MS,
+        `approve ${approveTx.hash}`,
+      );
       if (!approveReceipt || approveReceipt.status !== 1) {
         throw new Error("Approve transaction failed.");
       }
@@ -1109,14 +1220,16 @@ async function executeSwap(side, amountText, overrides = {}) {
   try {
     if (sellToNativeEth) {
       swapParams.recipient = config.swapRouterAddress;
-      tx = await router.multicall([
-        router.interface.encodeFunctionData("exactInputSingle", [swapParams]),
-        router.interface.encodeFunctionData("unwrapWETH9", [minOut, wallet.address]),
-      ]);
+      tx = await rpcCall("swap multicall", () =>
+        router.multicall([
+          router.interface.encodeFunctionData("exactInputSingle", [swapParams]),
+          router.interface.encodeFunctionData("unwrapWETH9", [minOut, wallet.address]),
+        ]),
+      );
     } else if (buyWithNativeEth) {
-      tx = await router.exactInputSingle(swapParams, { value: payValue });
+      tx = await rpcCall("swap exactInputSingle", () => router.exactInputSingle(swapParams, { value: payValue }));
     } else {
-      tx = await router.exactInputSingle(swapParams);
+      tx = await rpcCall("swap exactInputSingle", () => router.exactInputSingle(swapParams));
     }
   } catch (error) {
     throw new Error(formatSwapError(error));
@@ -1132,7 +1245,7 @@ async function executeSwap(side, amountText, overrides = {}) {
     receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
     // Confirm separately so Telegram can show the tx hash immediately (OKX-like feel).
     confirm: async () => {
-      const receipt = await tx.wait(1);
+      const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `confirm ${tx.hash}`);
       if (!receipt || receipt.status !== 1) {
         throw new Error(`Swap reverted on-chain. Tx: ${tx.hash}`);
       }
@@ -1152,7 +1265,10 @@ function parseBuyAmountText(text) {
 function getPendingBuyPrompt(state, chatId) {
   const pending = state?.pendingBuyPrompt;
   if (!pending || String(pending.chatId) !== String(chatId)) return null;
-  if (Date.now() - Number(pending.createdAt || 0) > 300_000) return null;
+  if (Date.now() - Number(pending.createdAt || 0) > 300_000) {
+    clearPendingBuyPrompt(state);
+    return null;
+  }
   return pending;
 }
 
@@ -1971,11 +2087,18 @@ async function telegramRequest(method, payload) {
     body.set(key, typeof value === "string" ? value : JSON.stringify(value));
   }
 
-  const result = await fetchJson(telegramUrl(method), {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body,
-  });
+  // getUpdates long-polls ~10s server-side; sendMessage needs more network retries.
+  const isLongPoll = method === "getUpdates";
+  const result = await fetchJson(
+    telegramUrl(method),
+    {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+      timeoutMs: isLongPoll ? 45_000 : 25_000,
+    },
+    isLongPoll ? 3 : 5,
+  );
 
   if (!result.ok) throw new Error(`Telegram error: ${JSON.stringify(result)}`);
   return result;
@@ -2519,11 +2642,16 @@ async function sendTelegram(text, replyMarkup = null) {
   });
   if (replyMarkup) body.set("reply_markup", JSON.stringify(replyMarkup));
 
-  const payload = await fetchJson(url, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body,
-  });
+  const payload = await fetchJson(
+    url,
+    {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+      timeoutMs: 25_000,
+    },
+    5,
+  );
 
   if (!payload.ok) throw new Error(`Telegram error: ${JSON.stringify(payload)}`);
 }
@@ -2552,10 +2680,12 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
     `<b>Sending ${escapeHtml(side)} ${escapeHtml(config.baseSymbol)}...</b>\nAmount: ${escapeHtml(amount)} ${escapeHtml(inputSymbol)}`,
   ).catch(() => {});
 
+  let broadcastHash = "";
   try {
-    const result = await executeSwap(side, amount);
+    const result = await withTradeLock(() => executeSwap(side, amount));
+    broadcastHash = result.hash;
     await pending;
-    const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    const txUrl = explorerTxUrl(result.hash);
     const state = loadState();
     await editTradeMessage(
       callbackQuery,
@@ -2585,15 +2715,15 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
         .filter(Boolean)
         .join("\n"),
       mainMenuKeyboard(state.portfolioSnapshot),
-    );
+    ).catch(() => {});
   } catch (error) {
     await pending;
     const state = loadState();
     await editTradeMessage(
       callbackQuery,
-      `<b>Trade not sent</b>\n${escapeHtml(error.message)}`,
+      formatTradeFailureMessage(error, broadcastHash),
       mainMenuKeyboard(state.portfolioSnapshot),
-    );
+    ).catch(() => {});
   }
 }
 
@@ -2604,9 +2734,9 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
   } catch (error) {
     await editTradeMessage(
       callbackQuery,
-      `<b>Bag sell failed</b>\n${escapeHtml(error.message)}`,
+      `<b>Bag sell failed</b>\n${escapeHtml(formatSwapError(error))}`,
       mainMenuKeyboard(state.portfolioSnapshot),
-    );
+    ).catch(() => {});
     return;
   }
 
@@ -2615,10 +2745,12 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
     `<b>Sending SELL ${escapeHtml(ctx.baseSymbol)}...</b>\nAmount: ${escapeHtml(amount)} ${escapeHtml(ctx.baseSymbol)}`,
   ).catch(() => {});
 
+  let broadcastHash = "";
   try {
-    const result = await executeSwap("SELL", amount, ctx);
+    const result = await withTradeLock(() => executeSwap("SELL", amount, ctx));
+    broadcastHash = result.hash;
     await pending;
-    const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    const txUrl = explorerTxUrl(result.hash);
     await editTradeMessage(
       callbackQuery,
       [
@@ -2642,7 +2774,7 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
         `Track alerts vẫn: <b>${escapeHtml(config.baseSymbol)}</b>`,
       ].join("\n"),
       mainMenuKeyboard(state.portfolioSnapshot),
-    );
+    ).catch(() => {});
   } catch (error) {
     await pending;
     const item = findBagItem(state, tokenAddress) || {
@@ -2652,9 +2784,9 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
     };
     await editTradeMessage(
       callbackQuery,
-      `<b>Bag sell not sent</b>\n${escapeHtml(error.message)}`,
+      formatTradeFailureMessage(error, broadcastHash).replace("<b>Trade not sent</b>", "<b>Bag sell not sent</b>"),
       bagSellKeyboard(item),
-    );
+    ).catch(() => {});
   }
 }
 
@@ -2692,10 +2824,13 @@ async function sendTextTrade(chatId, state, side, amount) {
     text: `<b>Sending ${escapeHtml(side)} ${escapeHtml(config.baseSymbol)}...</b>\nAmount: <b>${escapeHtml(amount)}</b>`,
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-  });
+  }).catch(() => {});
+
+  let broadcastHash = "";
   try {
-    const result = await executeSwap(side, amount);
-    const txUrl = `${config.blockscoutBaseUrl}/tx/${result.hash}`;
+    const result = await withTradeLock(() => executeSwap(side, amount));
+    broadcastHash = result.hash;
+    const txUrl = explorerTxUrl(result.hash);
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: [
@@ -2723,15 +2858,15 @@ async function sendTextTrade(chatId, state, side, amount) {
       parse_mode: "HTML",
       disable_web_page_preview: "true",
       reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
-    });
+    }).catch(() => {});
   } catch (error) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text: `<b>Trade not sent</b>\n${escapeHtml(error.message)}`,
+      text: formatTradeFailureMessage(error, broadcastHash),
       parse_mode: "HTML",
       disable_web_page_preview: "true",
       reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
-    });
+    }).catch(() => {});
   }
 }
 
@@ -2768,6 +2903,7 @@ async function handleCallbackQueryInner(callbackQuery, state) {
   }
 
   if (data === "menu") {
+    clearPendingBuyPrompt(state);
     await renderMainMenuFast(callbackQuery, state);
     return;
   }
@@ -2846,6 +2982,8 @@ async function handleTelegramMessage(message, state) {
     await handleTelegramMessageInner(message, state);
   } catch (error) {
     console.error(`Telegram message failed: ${error.message}`);
+    // Transient network blips — don't spam the user with a second failing send.
+    if (isRetryableFetchError(error)) return;
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: `<b>Lỗi bot</b>\n${escapeHtml(error.message)}\n\nThử /menu hoặc Update Price.`,
@@ -2942,7 +3080,7 @@ async function processTelegramUpdates(state) {
           if (update.message) await handleTelegramMessage(update.message, state);
           if (update.callback_query) await handleCallbackQuery(update.callback_query, state);
         })(),
-        60_000,
+        TRADE_HANDLER_TIMEOUT_MS,
         `Telegram update ${update.update_id}`,
       );
     } catch (error) {
@@ -3117,6 +3255,7 @@ async function main() {
   console.log("Entering poll loop.");
   let lastRpcWarnAt = 0;
   let lastHttpCatchupAt = 0;
+  let lastTelegramPollWarnAt = 0;
   while (true) {
     try {
       await withTimeout(processTelegramUpdates(state), 90_000, "Telegram poll cycle");
@@ -3127,7 +3266,15 @@ async function main() {
         );
         await new Promise((resolve) => setTimeout(resolve, 10000));
       } else {
-        console.error(`Telegram poll error: ${error.message || error}`);
+        const nowWarn = Date.now();
+        // Network blips ("fetch failed") are retried inside fetchJson — don't spam the console.
+        if (nowWarn - lastTelegramPollWarnAt > 30_000) {
+          console.error(`Telegram poll error: ${error.message || error}`);
+          lastTelegramPollWarnAt = nowWarn;
+        }
+        if (isRetryableFetchError(error)) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
       }
     }
 
@@ -3137,7 +3284,7 @@ async function main() {
     // HTTP RPC backup: full poll when WSS is down; light catch-up every ~90s when WSS is healthy
     // (saves Alchemy free-tier CU; realtime alerts already come from WSS).
     const now = Date.now();
-    const httpCatchupMs = wsOk ? 90_000 : 0;
+    const httpCatchupMs = wsOk ? 30_000 : 0;
     const shouldHttpPoll = !wsOk || now - lastHttpCatchupAt > httpCatchupMs;
     if (shouldHttpPoll) {
       try {
@@ -3168,6 +3315,12 @@ async function main() {
 }
 
 if (require.main === module) {
+  process.on("unhandledRejection", (reason) => {
+    console.error(`Unhandled rejection: ${reason?.message || reason}`);
+  });
+  process.on("uncaughtException", (error) => {
+    console.error(`Uncaught exception: ${error?.message || error}`);
+  });
   main().catch((error) => {
     console.error(error);
     process.exitCode = 1;
@@ -3192,6 +3345,8 @@ module.exports = {
   isFreshTrade,
   isMessageNotModifiedError,
   isPollingConflictError,
+  isRetryableFetchError,
+  formatSwapError,
   isTradeablePortfolioItem,
   mainMenuKeyboard,
   normalizeAddress,

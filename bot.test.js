@@ -330,6 +330,21 @@ test("Telegram polling conflict errors are recognized", () => {
   assert.equal(bot.isPollingConflictError(error), true);
 });
 
+test("transient Telegram network errors are retryable", () => {
+  const fetchFailed = new Error("fetch failed");
+  fetchFailed.cause = { code: "ECONNRESET", message: "read ECONNRESET" };
+  assert.equal(bot.isRetryableFetchError(fetchFailed), true);
+  assert.equal(bot.isRetryableFetchError(new Error("Request timed out after 25000ms: https://api.telegram.org")), true);
+  assert.equal(bot.isRetryableFetchError(Object.assign(new Error("HTTP 429 Too Many Requests"), { status: 429 })), true);
+  assert.equal(bot.isRetryableFetchError(new Error("HTTP 400 Bad Request: chat not found")), false);
+});
+
+test("swap error formatter softens network and busy messages", () => {
+  assert.match(bot.formatSwapError(new Error("fetch failed")), /Mạng\/RPC/i);
+  assert.match(bot.formatSwapError(new Error("Trade đang chạy. Đợi xong rồi bấm lại (tránh double-send).")), /Trade đang chạy/);
+  assert.match(bot.formatSwapError(new Error("nonce too low")), /Nonce/i);
+});
+
 test("authorized chat IDs support comma-separated values", () => {
   const ids = bot.parseTelegramChatIds("123456789, -1001234567890");
   assert.deepEqual(ids, ["123456789", "-1001234567890"]);
