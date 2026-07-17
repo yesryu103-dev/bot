@@ -345,6 +345,70 @@ test("swap error formatter softens network and busy messages", () => {
   assert.match(bot.formatSwapError(new Error("nonce too low")), /Nonce/i);
 });
 
+test("gas shortage is not mislabeled as slippage", () => {
+  const gasErr = new Error(
+    "Không đủ ETH gas để SELL. Cần ~0.0001 ETH, còn 0.000818069059511026 ETH. Nạp thêm ETH rồi Sell lại.",
+  );
+  const formatted = bot.formatSwapError(gasErr);
+  assert.match(formatted, /Không đủ ETH gas/i);
+  assert.equal(/slippage/i.test(formatted), false);
+
+  // Legacy English gas message must also stay clear (old bug: /AS/ matched inside "gas").
+  const legacy = bot.formatSwapError(
+    new Error("Not enough ETH for gas (SELL). Need ~0.001 ETH, have 0.000818069059511026 ETH."),
+  );
+  assert.match(legacy, /Not enough ETH for gas/i);
+  assert.equal(/slippage/i.test(legacy), false);
+
+  assert.match(bot.formatSwapError(new Error("Too little received")), /Slippage/i);
+});
+
+test("tracking multiple tokens keeps max 3 and unions watched pools", () => {
+  const prevTracked = bot.config.trackedPairs;
+  const state = {};
+  const mk = (n) => ({
+    pairAddress: `0x${String(n).repeat(40).slice(0, 40)}`,
+    pairUrl: `https://dexscreener.com/robinhood/pair${n}`,
+    baseTokenAddress: `0x${String(n + 4).repeat(40).slice(0, 40)}`,
+    baseSymbol: `TK${n}`,
+    quoteTokenAddress: bot.config.quoteTokenAddress,
+    quoteSymbol: "WETH",
+    watchPairAddresses: [`0x${String(n).repeat(40).slice(0, 40)}`],
+  });
+
+  bot.upsertTrackedPair(state, mk(1));
+  bot.upsertTrackedPair(state, mk(2));
+  bot.upsertTrackedPair(state, mk(3));
+  assert.equal(state.trackedPairs.length, 3);
+
+  // 4th token evicts the oldest (TK1).
+  bot.upsertTrackedPair(state, mk(4));
+  assert.equal(state.trackedPairs.length, 3);
+  assert.equal(state.trackedPairs.some((entry) => entry.baseSymbol === "TK1"), false);
+  assert.equal(state.trackedPairs[0].baseSymbol, "TK4");
+
+  // Re-pasting an existing token moves it to front without duplicating.
+  bot.upsertTrackedPair(state, mk(2));
+  assert.equal(state.trackedPairs.length, 3);
+  assert.equal(state.trackedPairs[0].baseSymbol, "TK2");
+
+  // Watched pools = union of all tracked tokens' pools.
+  const watched = bot.watchedPairSet();
+  for (const entry of state.trackedPairs) {
+    assert.equal(watched.has(entry.pairAddress), true);
+  }
+
+  // Pool meta resolves back to the right tracked token.
+  const entry3 = state.trackedPairs.find((item) => item.baseSymbol === "TK3");
+  const found = bot.findTrackedForPool({
+    token0: entry3.baseTokenAddress,
+    token1: entry3.quoteTokenAddress,
+  });
+  assert.equal(found.baseSymbol, "TK3");
+
+  bot.config.trackedPairs = prevTracked;
+});
+
 test("authorized chat IDs support comma-separated values", () => {
   const ids = bot.parseTelegramChatIds("123456789, -1001234567890");
   assert.deepEqual(ids, ["123456789", "-1001234567890"]);

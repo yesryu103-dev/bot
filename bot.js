@@ -90,6 +90,11 @@ const config = {
   // Bag list / sell buttons: only show tokens above this USD value.
   minBagValueUsd: Number(process.env.MIN_BAG_VALUE_USD || 1),
   portfolioMaxTokens: Number(process.env.PORTFOLIO_MAX_TOKENS || 25),
+  // Robinhood gas is cheap; default 0.0001 ETH reserve (was 0.001 and blocked real sells).
+  gasReserveEth: Number(process.env.GAS_RESERVE_ETH || 0.0001),
+  // Track up to N tokens at once; paste thêm contract sẽ thêm vào list thay vì thay thế.
+  maxTrackedTokens: Math.max(1, Number(process.env.MAX_TRACKED_TOKENS || 3)),
+  trackedPairs: [],
 };
 
 function parseAmountOptions(value) {
@@ -368,18 +373,20 @@ async function pollRpcSwaps(state, options = {}) {
       continue;
     }
 
-    if (
-      !(
-        (meta.token0 === config.baseTokenAddress || meta.token0 === config.quoteTokenAddress) &&
-        (meta.token1 === config.baseTokenAddress || meta.token1 === config.quoteTokenAddress)
-      )
-    ) {
+    const tracked = findTrackedForPool(meta);
+    if (!tracked) {
       state.swapBlocks[pair] = latest;
       continue;
     }
 
-    // Keep trading fee aligned with the live tracked pool.
-    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
+    // Keep trading fee aligned with the live pool of the ACTIVE token only.
+    if (
+      normalizeAddress(tracked.baseTokenAddress) === config.baseTokenAddress &&
+      Number.isFinite(meta.fee) &&
+      meta.fee > 0
+    ) {
+      config.uniswapV3Fee = meta.fee;
+    }
 
     // Alchemy free: eth_getLogs max 10-block range — chunk so backup stays reliable.
     const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
@@ -439,8 +446,8 @@ async function pollRpcSwaps(state, options = {}) {
         amount1: parsed.args.amount1,
         token0: meta.token0,
         token1: meta.token1,
-        quoteToken: config.quoteTokenAddress,
-        baseToken: config.baseTokenAddress,
+        quoteToken: tracked.quoteTokenAddress,
+        baseToken: tracked.baseTokenAddress,
         txHash,
         blockNumber: Number(log.blockNumber),
         timestampMs: tsMs,
@@ -453,7 +460,7 @@ async function pollRpcSwaps(state, options = {}) {
       alerted.push(txHash);
       seen.add(txHash);
       // Non-blocking: enrich + Telegram queue so RPC poll stays fast.
-      emitTradeAlertAsync(trade);
+      emitTradeAlertAsync(tagTradeWithTracked(trade, tracked));
     }
 
     state.swapBlocks[pair] = latest;
@@ -538,9 +545,10 @@ async function processAlertTelegramQueue() {
 
 function emitTradeAlertAsync(trade) {
   // Instant: use cached Dex price only — never block the Swap hot path.
+  const cache = priceCacheFor(trade?.pairAddress || config.pairAddress);
   const priced = applyTradeUsd(trade, {
-    priceUsd: dexTradePriceCache.priceUsd,
-    ethUsd: dexTradePriceCache.ethUsd,
+    priceUsd: cache.priceUsd,
+    ethUsd: Number.isFinite(cache.ethUsd) ? cache.ethUsd : dexTradePriceCache.ethUsd,
   });
   enqueueTelegramAlert(tradeMessage(priced), mainMenuKeyboard());
   // Refresh price cache in background for the next alert.
@@ -564,23 +572,23 @@ function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockN
 
   const cached = poolMetaCache.get(normalizeAddress(pair));
   const run = (meta) => {
+    const tracked = findTrackedForPool(meta);
+    if (!tracked) return;
     if (
-      !(
-        (meta.token0 === config.baseTokenAddress || meta.token0 === config.quoteTokenAddress) &&
-        (meta.token1 === config.baseTokenAddress || meta.token1 === config.quoteTokenAddress)
-      )
+      normalizeAddress(tracked.baseTokenAddress) === config.baseTokenAddress &&
+      Number.isFinite(meta.fee) &&
+      meta.fee > 0
     ) {
-      return;
+      config.uniswapV3Fee = meta.fee;
     }
-    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
 
     const trade = tradeFromV3SwapLog({
       amount0,
       amount1,
       token0: meta.token0,
       token1: meta.token1,
-      quoteToken: config.quoteTokenAddress,
-      baseToken: config.baseTokenAddress,
+      quoteToken: tracked.quoteTokenAddress,
+      baseToken: tracked.baseTokenAddress,
       txHash: hash,
       blockNumber: Number(blockNumber || 0),
       timestampMs: Date.now(),
@@ -599,7 +607,7 @@ function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockN
     if (bn > 0) state.swapBlocks[key] = Math.max(Number(state.swapBlocks[key] || 0), bn);
     saveState(state);
 
-    emitTradeAlertAsync(trade);
+    emitTradeAlertAsync(tagTradeWithTracked(trade, tracked));
   };
 
   if (cached) {
@@ -809,7 +817,17 @@ async function fetchDexPairByAddress(pairAddress) {
   return payload.pair || payload.pairs?.[0] || null;
 }
 
+// Keyed by pair address so 3 tracked tokens don't overwrite each other's price.
+const dexTradePriceCacheMap = new Map();
 const dexTradePriceCache = { at: 0, priceUsd: Number.NaN, ethUsd: Number.NaN };
+
+function priceCacheFor(pairAddress) {
+  const key = normalizeAddress(pairAddress) || "default";
+  if (!dexTradePriceCacheMap.has(key)) {
+    dexTradePriceCacheMap.set(key, { at: 0, priceUsd: Number.NaN, ethUsd: Number.NaN });
+  }
+  return dexTradePriceCacheMap.get(key);
+}
 
 function applyTradeUsd(trade, { priceUsd, ethUsd } = {}) {
   const quoteAmount = Number(trade?.quoteAmount);
@@ -834,15 +852,17 @@ function applyTradeUsd(trade, { priceUsd, ethUsd } = {}) {
 
 async function enrichTradePrices(trade) {
   const now = Date.now();
+  const pairAddress = trade?.pairAddress || config.pairAddress;
+  const cache = priceCacheFor(pairAddress);
   let priceUsd = Number.NaN;
   let ethUsd = Number.NaN;
 
-  if (now - dexTradePriceCache.at < 15_000) {
-    priceUsd = dexTradePriceCache.priceUsd;
-    ethUsd = dexTradePriceCache.ethUsd;
+  if (now - cache.at < 15_000) {
+    priceUsd = cache.priceUsd;
+    ethUsd = cache.ethUsd;
   } else {
     try {
-      const pair = await fetchDexPair();
+      const pair = await fetchDexPairByAddress(pairAddress);
       priceUsd = Number(pair?.priceUsd);
       const priceNative = Number(pair?.priceNative);
       if (Number.isFinite(priceUsd) && Number.isFinite(priceNative) && priceNative > 0) {
@@ -858,9 +878,15 @@ async function enrichTradePrices(trade) {
         ethUsd = Number.NaN;
       }
     }
-    dexTradePriceCache.at = now;
-    dexTradePriceCache.priceUsd = priceUsd;
-    dexTradePriceCache.ethUsd = ethUsd;
+    cache.at = now;
+    cache.priceUsd = priceUsd;
+    cache.ethUsd = ethUsd;
+    // Keep legacy single-token cache in sync for the active pair.
+    if (normalizeAddress(pairAddress) === normalizeAddress(config.pairAddress)) {
+      dexTradePriceCache.at = now;
+      dexTradePriceCache.priceUsd = priceUsd;
+      dexTradePriceCache.ethUsd = ethUsd;
+    }
   }
 
   return applyTradeUsd(trade, { priceUsd, ethUsd });
@@ -1031,17 +1057,33 @@ function formatTradeFailureMessage(error, broadcastHash = "") {
   return `<b>Trade not sent</b>\n${detail}`;
 }
 
-async function assertNativeEthForBuy(wallet, amountIn) {
+function gasReserveWei() {
   const { ethers } = require("ethers");
-  // Robinhood gas is cheap; keep a small reserve so buy amount + gas still fit.
-  const gasReserve = ethers.parseEther("0.001");
+  // Robinhood gas is tiny; 0.001 was blocking sells when wallet had ~0.0008 ETH.
+  const eth = Number(process.env.GAS_RESERVE_ETH || config.gasReserveEth || 0.0001);
+  const safe = Number.isFinite(eth) && eth > 0 ? eth : 0.0001;
+  return ethers.parseEther(String(safe));
+}
+
+function formatEthShort(wei) {
+  const { ethers } = require("ethers");
+  const text = ethers.formatEther(wei);
+  const num = Number(text);
+  if (!Number.isFinite(num)) return text;
+  if (num >= 0.01) return num.toFixed(4);
+  if (num >= 0.0001) return num.toFixed(6);
+  return text.replace(/0+$/, "").replace(/\.$/, "") || "0";
+}
+
+async function assertNativeEthForBuy(wallet, amountIn) {
+  const gasReserve = gasReserveWei();
   const nativeBal = await rpcCall("getBalance(buy)", () => wallet.provider.getBalance(wallet.address));
   if (nativeBal < amountIn + gasReserve) {
     throw new Error(
       [
-        `Not enough ETH for buy.`,
-        `Need ${ethers.formatEther(amountIn)} ETH (+~0.001 gas).`,
-        `Have ${ethers.formatEther(nativeBal)} ETH.`,
+        `Không đủ ETH để mua.`,
+        `Cần ${formatEthShort(amountIn)} ETH + ~${formatEthShort(gasReserve)} gas.`,
+        `Wallet còn ${formatEthShort(nativeBal)} ETH.`,
       ].join(" "),
     );
   }
@@ -1049,12 +1091,11 @@ async function assertNativeEthForBuy(wallet, amountIn) {
 }
 
 async function assertEthForGas(wallet, label = "trade") {
-  const { ethers } = require("ethers");
-  const gasReserve = ethers.parseEther("0.001");
+  const gasReserve = gasReserveWei();
   const nativeBal = await rpcCall("getBalance(gas)", () => wallet.provider.getBalance(wallet.address));
   if (nativeBal < gasReserve) {
     throw new Error(
-      `Not enough ETH for gas (${label}). Need ~0.001 ETH, have ${ethers.formatEther(nativeBal)} ETH.`,
+      `Không đủ ETH gas để ${label}. Cần ~${formatEthShort(gasReserve)} ETH, còn ${formatEthShort(nativeBal)} ETH. Nạp thêm ETH rồi Sell lại.`,
     );
   }
 }
@@ -1062,20 +1103,28 @@ async function assertEthForGas(wallet, label = "trade") {
 function formatSwapError(error) {
   const raw = String(error?.shortMessage || error?.reason || error?.message || error || "");
   if (/Trade đang chạy|double-send/i.test(raw)) return raw;
+  // Gas / balance first — never mislabel as slippage ("gas" used to match /AS/).
+  if (/không đủ eth gas|not enough eth for gas|need ~.*gas|nạp thêm eth/i.test(raw)) {
+    return raw;
+  }
+  if (/không đủ eth để mua|not enough eth for buy/i.test(raw)) {
+    return raw;
+  }
+  if (/insufficient funds/i.test(raw)) {
+    return "Không đủ ETH cho value + gas. Nạp thêm ETH rồi thử lại.";
+  }
   if (/timed out|timeout|fetch failed|ECONNRESET|ETIMEDOUT|network/i.test(raw)) {
     return `Mạng/RPC chập chờn: ${raw.slice(0, 120)}. Thử lại sau vài giây.`;
   }
   if (/nonce|replacement|already known/i.test(raw)) {
     return `Nonce/tx conflict — đợi tx cũ xong rồi thử lại. (${raw.slice(0, 100)})`;
   }
-  if (/STF|transfer amount exceeds|insufficient allowance/i.test(raw)) {
+  if (/\bSTF\b|transfer amount exceeds|insufficient allowance/i.test(raw)) {
     return "Token transfer/approve failed (balance hoặc allowance). Thử Sell lại hoặc Approve.";
   }
-  if (/AS|amount|slippage|Too little|TOO_LITTLE|Price slippage/i.test(raw)) {
+  // Match Uniswap codes carefully — bare "AS" used to match the letters inside "gas".
+  if (/\bAS\b|Too little received|TOO_LITTLE|Price slippage|slippage/i.test(raw)) {
     return `Slippage/price moved. Tăng SLIPPAGE_BPS hoặc thử lại. (${raw.slice(0, 80)})`;
-  }
-  if (/insufficient funds/i.test(raw)) {
-    return "Not enough ETH for value + gas.";
   }
   if (/execution reverted/i.test(raw) && raw.length > 160) {
     return `Swap reverted: ${raw.slice(0, 120)}…`;
@@ -1421,7 +1470,60 @@ function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") 
   return watched;
 }
 
+function trackedPairsList() {
+  if (Array.isArray(config.trackedPairs) && config.trackedPairs.length) return config.trackedPairs;
+  // Legacy single-token fallback built from active config.
+  return [
+    {
+      pairAddress: normalizeAddress(config.pairAddress),
+      pairUrl: config.dexscreenPairUrl,
+      baseTokenAddress: normalizeAddress(config.baseTokenAddress),
+      baseSymbol: config.baseSymbol,
+      quoteTokenAddress: normalizeAddress(config.quoteTokenAddress),
+      quoteSymbol: config.quoteSymbol,
+      watchPairAddresses: (config.watchPairAddresses || []).map(normalizeAddress).filter(Boolean),
+    },
+  ];
+}
+
+function findTrackedForPool(meta) {
+  for (const entry of trackedPairsList()) {
+    const base = normalizeAddress(entry.baseTokenAddress);
+    const quote = normalizeAddress(entry.quoteTokenAddress);
+    if (
+      (meta.token0 === base || meta.token0 === quote) &&
+      (meta.token1 === base || meta.token1 === quote)
+    ) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function tagTradeWithTracked(trade, entry) {
+  if (!trade || !entry) return trade;
+  trade.baseSymbol = entry.baseSymbol;
+  trade.quoteSymbol = entry.quoteSymbol;
+  trade.pairUrl = entry.pairUrl;
+  trade.baseTokenAddress = normalizeAddress(entry.baseTokenAddress);
+  trade.pairAddress = normalizeAddress(entry.pairAddress);
+  return trade;
+}
+
 function watchedPairSet(settings = config) {
+  if (settings === config) {
+    // Union of every tracked token's pools so alerts cover all of them.
+    const set = new Set();
+    for (const entry of trackedPairsList()) {
+      const list = entry.watchPairAddresses?.length ? entry.watchPairAddresses : [entry.pairAddress];
+      for (const address of list || []) {
+        const normalized = normalizeAddress(address);
+        if (normalized) set.add(normalized);
+      }
+    }
+    if (!set.size && config.pairAddress) set.add(normalizeAddress(config.pairAddress));
+    return set;
+  }
   const list = settings.watchPairAddresses?.length
     ? settings.watchPairAddresses
     : [settings.pairAddress];
@@ -1445,8 +1547,58 @@ function applyTrackedPair(trackedPair) {
   }
 }
 
-function applyStateConfig(state) {
+function upsertTrackedPair(state, trackedPair) {
+  const token = normalizeAddress(trackedPair.baseTokenAddress);
+  const current = Array.isArray(state.trackedPairs) && state.trackedPairs.length
+    ? state.trackedPairs
+    : state.trackedPair
+      ? [state.trackedPair]
+      : [];
+  const withoutDup = current.filter((entry) => normalizeAddress(entry?.baseTokenAddress) !== token);
+  withoutDup.unshift(trackedPair);
+  state.trackedPairs = withoutDup.slice(0, config.maxTrackedTokens);
+  state.trackedPair = trackedPair;
+  config.trackedPairs = state.trackedPairs;
+  applyTrackedPair(trackedPair);
+  return state.trackedPairs;
+}
+
+function removeTrackedPair(state, tokenAddress) {
+  const token = normalizeAddress(tokenAddress);
+  const current = Array.isArray(state.trackedPairs) && state.trackedPairs.length
+    ? state.trackedPairs
+    : state.trackedPair
+      ? [state.trackedPair]
+      : [];
+  if (current.length <= 1) {
+    return { removed: false, reason: "last", list: current };
+  }
+
+  const next = current.filter((entry) => normalizeAddress(entry?.baseTokenAddress) !== token);
+  if (next.length === current.length) {
+    return { removed: false, reason: "missing", list: current };
+  }
+
+  state.trackedPairs = next;
+  config.trackedPairs = next;
+  const activeRemoved = normalizeAddress(state.trackedPair?.baseTokenAddress) === token;
+  if (activeRemoved || !next.some((entry) =>
+    normalizeAddress(entry.baseTokenAddress) === normalizeAddress(state.trackedPair?.baseTokenAddress))) {
+    state.trackedPair = next[0];
+  }
   applyTrackedPair(state.trackedPair);
+  saveState(state);
+  return { removed: true, activeRemoved, list: next };
+}
+
+function applyStateConfig(state) {
+  const list = Array.isArray(state.trackedPairs) && state.trackedPairs.length
+    ? state.trackedPairs
+    : state.trackedPair
+      ? [state.trackedPair]
+      : [];
+  config.trackedPairs = list.filter((entry) => entry?.pairAddress && entry?.baseTokenAddress);
+  applyTrackedPair(state.trackedPair || config.trackedPairs[0]);
 }
 
 
@@ -1855,14 +2007,70 @@ function tradeActionRows() {
   return [...chunkButtons(buyButtons, 2), ...chunkButtons(sellButtons, 4)];
 }
 
+function trackedSwitchRows() {
+  const list = trackedPairsList();
+  if (list.length <= 1) return [];
+  const active = normalizeAddress(config.baseTokenAddress);
+  const buttons = list.map((entry) => {
+    const token = normalizeAddress(entry.baseTokenAddress);
+    return {
+      text: `${token === active ? "🎯 " : ""}${entry.baseSymbol || "TOKEN"}`,
+      callback_data: `switch:${token}`,
+    };
+  });
+  return chunkButtons(buttons, 3);
+}
+
+function manageTrackedText() {
+  const list = trackedPairsList();
+  const active = normalizeAddress(config.baseTokenAddress);
+  return [
+    `<b>Manage tracked tokens</b>`,
+    `Đang track <b>${list.length}/${config.maxTrackedTokens}</b> token.`,
+    "",
+    ...list.map((entry, index) => {
+      const token = normalizeAddress(entry.baseTokenAddress);
+      const marker = token === active ? "🎯 ACTIVE" : `${index + 1}.`;
+      return `${marker} <b>${escapeHtml(entry.baseSymbol || "TOKEN")}</b> · <code>${escapeHtml(compactAddress(token))}</code>`;
+    }),
+    "",
+    `Use = chuyển token cho Buy/Sell nhanh.`,
+    `Remove = ngừng alert token đó.`,
+  ].join("\n");
+}
+
+function manageTrackedKeyboard() {
+  const active = normalizeAddress(config.baseTokenAddress);
+  const list = trackedPairsList();
+  const rows = [];
+  for (const entry of list) {
+    const token = normalizeAddress(entry.baseTokenAddress);
+    const symbol = entry.baseSymbol || "TOKEN";
+    rows.push([
+      {
+        text: token === active ? `🎯 ${symbol}` : `Use ${symbol}`,
+        callback_data: `switch:${token}`,
+      },
+      {
+        text: list.length <= 1 ? "Last token" : `❌ Remove ${symbol}`,
+        callback_data: `trackremove:${token}`,
+      },
+    ]);
+  }
+  rows.push([{ text: "← Main Menu", callback_data: "menu" }]);
+  return { inline_keyboard: rows };
+}
+
 function mainMenuKeyboard(portfolio = null) {
   return {
     inline_keyboard: [
+      ...trackedSwitchRows(),
       ...tradeActionRows(),
       [
         { text: "Chart", url: config.dexscreenPairUrl },
         { text: "Update Price", callback_data: "portfolio:refresh" },
       ],
+      [{ text: `Manage Track (${trackedPairsList().length}/${config.maxTrackedTokens})`, callback_data: "trackmanage" }],
       ...bagButtonRows(portfolio),
     ],
   };
@@ -2289,9 +2497,8 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
   const trackedPair = trackedPairFromDexPair(pair, tokenAddress);
   trackedPair.watchPairAddresses = chooseWatchPairAddresses(pairs, tokenAddress, trackedPair.pairAddress);
-  applyTrackedPair(trackedPair);
-  state.trackedPair = trackedPair;
-  state.seen = [];
+  // Add to tracked list (max N) — keep other tokens' alerts and seen history intact.
+  upsertTrackedPair(state, trackedPair);
 
   try {
     // Mark current history as seen — do NOT backfill old buys/sells.
@@ -2320,10 +2527,14 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   saveState(state);
   refreshWsSwapListener(state);
 
+  const trackedNames = (state.trackedPairs || [trackedPair])
+    .map((entry) => entry.baseSymbol || "TOKEN")
+    .join(", ");
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
-      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b>`,
+      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active)`,
+      `Đang track <b>${state.trackedPairs?.length || 1}/${config.maxTrackedTokens}</b>: ${escapeHtml(trackedNames)}`,
       `Chỉ theo dõi buy/sell realtime (≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}).`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
       trackedPair.watchPairAddresses?.length > 1
@@ -2533,14 +2744,17 @@ function tradeSideLabel(side) {
 function tradeMessage(trade) {
   const txUrl = `${config.blockscoutBaseUrl}/tx/${trade.txHash}`;
   const sideLabel = tradeSideLabel(trade.side);
+  const baseSymbol = trade.baseSymbol || config.baseSymbol;
+  const quoteSymbol = trade.quoteSymbol || config.quoteSymbol;
+  const pairUrl = trade.pairUrl || config.dexscreenPairUrl;
   return [
-    `<b>${sideLabel} ${escapeHtml(config.baseSymbol)}</b> on Robinhood Uniswap`,
-    `Amount: <b>${escapeHtml(formatUnits(trade.baseRaw, trade.baseDecimals, 4))} ${escapeHtml(config.baseSymbol)}</b>`,
-    `Quote: <b>${escapeHtml(formatUnits(trade.quoteRaw, trade.quoteDecimals, 6))} ${escapeHtml(config.quoteSymbol)}</b> (${escapeHtml(formatUsd(trade.quoteUsdValue))})`,
+    `<b>${sideLabel} ${escapeHtml(baseSymbol)}</b> on Robinhood Uniswap`,
+    `Amount: <b>${escapeHtml(formatUnits(trade.baseRaw, trade.baseDecimals, 4))} ${escapeHtml(baseSymbol)}</b>`,
+    `Quote: <b>${escapeHtml(formatUnits(trade.quoteRaw, trade.quoteDecimals, 6))} ${escapeHtml(quoteSymbol)}</b> (${escapeHtml(formatUsd(trade.quoteUsdValue))})`,
     `Price: <b>${escapeHtml(formatUsd(trade.priceUsd))}</b>`,
     `Trader: <code>${escapeHtml(compactAddress(trade.trader))}</code>`,
     `Block: <code>${trade.blockNumber}</code>`,
-    `<a href="${escapeHtml(txUrl)}">Tx</a> | <a href="${escapeHtml(config.dexscreenPairUrl)}">Dexscreener</a>`,
+    `<a href="${escapeHtml(txUrl)}">Tx</a> | <a href="${escapeHtml(pairUrl)}">Dexscreener</a>`,
   ].join("\n");
 }
 
@@ -2884,7 +3098,13 @@ async function handleCallbackQueryInner(callbackQuery, state) {
             ? "Tracking…"
             : data === "buy:custom"
               ? "Buy…"
-              : "";
+              : data.startsWith("switch:")
+                ? "Switching…"
+                : data.startsWith("trackremove:")
+                  ? "Removing…"
+                  : data === "trackmanage"
+                    ? "Manage…"
+                : "";
   await answerCallback(callbackQuery, toast);
 
   if (data === "buy:custom") {
@@ -2905,6 +3125,60 @@ async function handleCallbackQueryInner(callbackQuery, state) {
   if (data === "menu") {
     clearPendingBuyPrompt(state);
     await renderMainMenuFast(callbackQuery, state);
+    return;
+  }
+
+  if (data === "trackmanage") {
+    await editTradeMessage(callbackQuery, manageTrackedText(), manageTrackedKeyboard());
+    return;
+  }
+
+  if (data.startsWith("switch:")) {
+    const token = normalizeAddress(data.slice("switch:".length));
+    const entry = trackedPairsList().find(
+      (item) => normalizeAddress(item.baseTokenAddress) === token,
+    );
+    if (entry) {
+      state.trackedPair = entry;
+      applyTrackedPair(entry);
+      saveState(state);
+    }
+    if (callbackQuery.message?.text?.includes("Manage tracked tokens")) {
+      await editTradeMessage(callbackQuery, manageTrackedText(), manageTrackedKeyboard());
+    } else {
+      await renderMainMenuFast(callbackQuery, state);
+    }
+    return;
+  }
+
+  if (data.startsWith("trackremove:")) {
+    const token = normalizeAddress(data.slice("trackremove:".length));
+    const entry = trackedPairsList().find(
+      (item) => normalizeAddress(item.baseTokenAddress) === token,
+    );
+    const result = removeTrackedPair(state, token);
+    if (result.removed) {
+      refreshWsSwapListener(state);
+      await editTradeMessage(
+        callbackQuery,
+        [
+          `<b>Removed ${escapeHtml(entry?.baseSymbol || compactAddress(token))}</b>`,
+          `Còn track: <b>${escapeHtml(result.list.map((item) => item.baseSymbol || "TOKEN").join(", "))}</b>`,
+          "",
+          manageTrackedText(),
+        ].join("\n"),
+        manageTrackedKeyboard(),
+      );
+    } else {
+      const reason = result.reason === "last"
+        ? "Không thể remove token cuối cùng. Paste contract mới trước rồi remove token này."
+        : "Token không còn trong danh sách track.";
+      await editTradeMessage(
+        callbackQuery,
+        `<b>Không remove được</b>\n${escapeHtml(reason)}\n\n${manageTrackedText()}`,
+        manageTrackedKeyboard(),
+      );
+    }
     return;
   }
 
@@ -3347,6 +3621,12 @@ module.exports = {
   isPollingConflictError,
   isRetryableFetchError,
   formatSwapError,
+  findTrackedForPool,
+  manageTrackedKeyboard,
+  removeTrackedPair,
+  trackedPairsList,
+  upsertTrackedPair,
+  watchedPairSet,
   isTradeablePortfolioItem,
   mainMenuKeyboard,
   normalizeAddress,
