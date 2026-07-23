@@ -132,8 +132,22 @@ test("sniper keyboard exposes buy amounts and sell percents", () => {
   assert(callbacks.includes("qtrade:SELL:ALL"));
 });
 
-test("slippage default is two percent", () => {
-  assert.equal(bot.config.slippageBps, 200);
+test("slippage default is five percent", () => {
+  assert.equal(bot.config.slippageBps, 500);
+});
+
+test("v4 hub slippage defaults tighter than global", () => {
+  assert.equal(bot.config.v4SlippageBps, 150);
+  assert.ok(bot.config.v4SlippageBps < bot.config.slippageBps);
+  assert.ok(bot.config.v4HopSlippageBps <= 100);
+});
+
+test("v2 FOT buffer defaults high enough for taxed tokens", () => {
+  assert.ok(bot.config.v2FotBufferBps >= 3000);
+});
+
+test("on-chain swap revert message is recognized", () => {
+  assert.match(bot.formatSwapError(new Error("Swap reverted on-chain. Tx: 0xabc")), /Tx reverted on-chain/i);
 });
 
 test("all trades execute immediately on button tap", () => {
@@ -409,6 +423,51 @@ test("tracking multiple tokens keeps max 3 and unions watched pools", () => {
   bot.config.trackedPairs = prevTracked;
 });
 
+test("invalid pools are skipped from watched set", () => {
+  const prevTracked = bot.config.trackedPairs;
+  const bad = "0x234e1c24ffe6b365ab83e545e453525df4554e9e";
+  const good = "0x90c8c09dd4a6bf3b0a2dcf179c72a2c8c6e09fee";
+  bot.config.trackedPairs = [
+    {
+      pairAddress: bad,
+      baseTokenAddress: "0x1111111111111111111111111111111111111111",
+      quoteTokenAddress: bot.config.quoteTokenAddress,
+      baseSymbol: "BAD",
+      quoteSymbol: "WETH",
+      watchPairAddresses: [bad, good],
+    },
+  ];
+  bot.markInvalidPool(bad, "not a Uniswap v3 pool");
+  const watched = bot.watchedPairSet();
+  assert.equal(watched.has(bad), false);
+  assert.equal(watched.has(good), true);
+  assert.equal(bot.isInvalidPool(bad), true);
+  bot.config.trackedPairs = prevTracked;
+});
+
+test("v2 swap log decoder flags buy when quote enters pool", () => {
+  const quote = bot.config.quoteTokenAddress;
+  const base = "0x9264df4bca9ac77f9c8583b177b36f0a97259999";
+  const trade = bot.tradeFromV2SwapLog({
+    amount0In: 2n * 10n ** 18n, // 2 WETH in (token0)
+    amount1In: 0n,
+    amount0Out: 0n,
+    amount1Out: 1000n * 10n ** 18n,
+    token0: quote,
+    token1: base,
+    quoteToken: quote,
+    baseToken: base,
+    txHash: "0xabc",
+    blockNumber: 1,
+    timestampMs: Date.now(),
+    recipient: "0xuser",
+  });
+  assert.ok(trade);
+  assert.equal(trade.side, "BUY");
+  assert.equal(trade.version, "v2");
+  assert.ok(trade.quoteAmount >= 1.9);
+});
+
 test("authorized chat IDs support comma-separated values", () => {
   const ids = bot.parseTelegramChatIds("123456789, -1001234567890");
   assert.deepEqual(ids, ["123456789", "-1001234567890"]);
@@ -485,6 +544,39 @@ test("near-threshold 1 ETH buy is still alerted", () => {
   assert.ok(trade);
   assert.equal(trade.side, "BUY");
   assert.ok(trade.quoteAmount >= 0.95);
+});
+
+test("v4 trade route prefers thick stock hub via USDG", () => {
+  const v4trade = require("./v4trade");
+  const token = "0xc2362AfF2A2a4CC1f48cF3Dab2C4e2605eb94BA3";
+  const stock = v4trade.STOCK_GME;
+  const route = v4trade.pickV4TradeRoute(
+    [
+      {
+        chainId: "robinhood",
+        pairAddress: "0x227c74b4c187335bc914b7d951ac795617e9ee2f753f68a974c111655df47354",
+        liquidity: { usd: 12000 },
+        labels: ["v4"],
+        baseToken: { address: token, symbol: "GME" },
+        quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" },
+      },
+      {
+        chainId: "robinhood",
+        pairAddress: "0x3623694d2613d7a543903b93226ed020d2fddbe00ed93ebd21aec098b10211c2",
+        liquidity: { usd: 1400000 },
+        labels: ["v4"],
+        baseToken: { address: token, symbol: "GME" },
+        quoteToken: { address: stock, symbol: "GME" },
+      },
+    ],
+    token,
+    bot.config.quoteTokenAddress,
+  );
+  assert.equal(route.mode, "usdg");
+  assert.equal(route.bridgeToken.toLowerCase(), stock.toLowerCase());
+  const path = v4trade.buildUsdgBridgePath(bot.config.quoteTokenAddress, stock);
+  assert.match(path, /^0x[0-9a-f]+$/);
+  assert.ok(path.toLowerCase().includes(v4trade.USDG.slice(2).toLowerCase()));
 });
 
 test("watch pair list keeps primary and extra WETH pools", () => {

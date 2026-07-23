@@ -78,9 +78,29 @@ const config = {
   walletPrivateKey: process.env.WALLET_PRIVATE_KEY || "",
   walletAddress: process.env.WALLET_ADDRESS || "",
   swapRouterAddress: process.env.SWAP_ROUTER_ADDRESS || "0xCaf681a66D020601342297493863E78C959E5cb2",
+  // UniswapV2Router02 on Robinhood Chain.
+  swapRouterV2Address: process.env.SWAP_ROUTER_V2_ADDRESS || "0x89e5DB8B5aA49aA85AC63f691524311AEB649eba",
+  // Uniswap v4 UniversalRouter + Permit2 (prefer ETH→USDG→bridge→token hub).
+  universalRouterAddress:
+    process.env.UNIVERSAL_ROUTER_ADDRESS || "0x8876789976dEcBfCbBbe364623C63652db8C0904",
+  permit2Address: process.env.PERMIT2_ADDRESS || "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+  v4PoolManagerAddress:
+    process.env.V4_POOL_MANAGER_ADDRESS || "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+  v4RouteMode: "",
+  v4BridgeToken: "",
+  v4TradeKey: null,
+  v4TradePoolId: "",
+  v4AlertPoolId: "",
   quoterAddress: process.env.QUOTER_ADDRESS || "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
   uniswapV3Fee: Number(process.env.UNISWAP_V3_FEE || 10000),
-  slippageBps: Number(process.env.SLIPPAGE_BPS || 200),
+  slippageBps: Number(process.env.SLIPPAGE_BPS || 500),
+  // Tighter default for thick v4 USDG-hub routes (spot quote + preflight). Override via V4_SLIPPAGE_BPS.
+  v4SlippageBps: Number(process.env.V4_SLIPPAGE_BPS || 150),
+  // Extra buffer on intermediate hops only (price move between quote and inclusion).
+  v4HopSlippageBps: Number(process.env.V4_HOP_SLIPPAGE_BPS || 50),
+  // Extra buffer for Uniswap v2 fee-on-transfer / buy-tax tokens (getAmountsOut ignores tax).
+  // RH-like tokens can deliver ~65–70% of getAmountsOut — 10% was not enough.
+  v2FotBufferBps: Number(process.env.V2_FOT_BUFFER_BPS || 4000),
   buyAmountsQuote: parseAmountOptions(process.env.BUY_AMOUNTS_QUOTE || "0.01,0.05,0.1,0.2,0.25"),
   sellPercents: parseAmountOptions(process.env.SELL_PERCENTS || "25,50,70")
     .map((value) => Number(value))
@@ -246,7 +266,20 @@ async function fetchTokenTransfers() {
 }
 
 const poolMetaCache = new Map();
+const invalidPoolCache = new Map(); // pair -> reason (not a Uniswap v2/v3 pool)
 let cachedRpcProvider = null;
+
+function markInvalidPool(pairAddress, reason = "not a Uniswap v2/v3 pool") {
+  const pair = normalizeAddress(pairAddress);
+  if (!pair || invalidPoolCache.has(pair)) return;
+  invalidPoolCache.set(pair, reason);
+  poolMetaCache.delete(pair);
+  console.warn(`Skipping invalid pool ${pair}: ${reason}`);
+}
+
+function isInvalidPool(pairAddress) {
+  return invalidPoolCache.has(normalizeAddress(pairAddress));
+}
 
 function getRpcProvider() {
   const { ethers } = require("ethers");
@@ -262,28 +295,100 @@ function getRpcProvider() {
   return cachedRpcProvider;
 }
 
+function v3SwapInterface() {
+  const { ethers } = require("ethers");
+  return new ethers.Interface([
+    "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
+  ]);
+}
+
+function v2SwapInterface() {
+  const { ethers } = require("ethers");
+  return new ethers.Interface([
+    "event Swap(address indexed sender,uint256 amount0In,uint256 amount1In,uint256 amount0Out,uint256 amount1Out,address indexed to)",
+  ]);
+}
+
 async function getPoolMeta(pairAddress, provider = null) {
   const { ethers } = require("ethers");
-  const pair = normalizeAddress(pairAddress);
+  const raw = String(pairAddress || "").trim();
+  const pair = normalizeAddress(raw);
+  if (isV4PoolId(raw)) {
+    for (const entry of trackedPairsList()) {
+      if (
+        normalizeAddress(entry.pairAddress) === pair ||
+        normalizeAddress(entry.v4AlertPoolId) === pair ||
+        normalizeAddress(entry.v4TradePoolId) === pair
+      ) {
+        if (entry.v4Meta) return { ...entry.v4Meta, version: "v4" };
+      }
+    }
+    throw new Error("v4 pool meta missing — re-paste token to refresh track.");
+  }
+  if (!isEvmAddress(pair)) throw new Error("Invalid pool address.");
+  if (isInvalidPool(pair)) {
+    throw new Error(invalidPoolCache.get(pair) || "not a Uniswap v2/v3 pool");
+  }
   if (poolMetaCache.has(pair)) return poolMetaCache.get(pair);
   const rpc = provider || getRpcProvider();
-  const pool = new ethers.Contract(
-    pair,
-    [
-      "function token0() view returns (address)",
-      "function token1() view returns (address)",
-      "function fee() view returns (uint24)",
-    ],
-    rpc,
-  );
-  const [token0, token1, fee] = await Promise.all([pool.token0(), pool.token1(), pool.fee()]);
-  const meta = {
-    token0: normalizeAddress(token0),
-    token1: normalizeAddress(token1),
-    fee: Number(fee),
-  };
-  poolMetaCache.set(pair, meta);
-  return meta;
+
+  // Prefer Uniswap v3 (fee + token0/token1).
+  try {
+    const poolV3 = new ethers.Contract(
+      pair,
+      [
+        "function token0() view returns (address)",
+        "function token1() view returns (address)",
+        "function fee() view returns (uint24)",
+      ],
+      rpc,
+    );
+    const [token0, token1, fee] = await Promise.all([poolV3.token0(), poolV3.token1(), poolV3.fee()]);
+    const feeNum = Number(fee);
+    if (Number.isFinite(feeNum) && feeNum > 0) {
+      const meta = {
+        token0: normalizeAddress(token0),
+        token1: normalizeAddress(token1),
+        fee: feeNum,
+        version: "v3",
+      };
+      poolMetaCache.set(pair, meta);
+      return meta;
+    }
+  } catch {
+    // fall through to v2
+  }
+
+  // Uniswap v2 pair: getReserves + token0/token1.
+  try {
+    const poolV2 = new ethers.Contract(
+      pair,
+      [
+        "function token0() view returns (address)",
+        "function token1() view returns (address)",
+        "function getReserves() view returns (uint112 reserve0,uint112 reserve1,uint32 blockTimestampLast)",
+      ],
+      rpc,
+    );
+    const [token0, token1, reserves] = await Promise.all([
+      poolV2.token0(),
+      poolV2.token1(),
+      poolV2.getReserves(),
+    ]);
+    const meta = {
+      token0: normalizeAddress(token0),
+      token1: normalizeAddress(token1),
+      fee: 3000, // unused for v2 swaps; placeholder for UI/compat
+      version: "v2",
+      reserve0: BigInt(reserves.reserve0 ?? reserves[0]),
+      reserve1: BigInt(reserves.reserve1 ?? reserves[1]),
+    };
+    poolMetaCache.set(pair, meta);
+    return meta;
+  } catch (error) {
+    markInvalidPool(pair, "not a Uniswap v2/v3 pool");
+    throw new Error(invalidPoolCache.get(pair));
+  }
 }
 
 function tradeFromV3SwapLog({ amount0, amount1, token0, token1, quoteToken, baseToken, txHash, blockNumber, timestampMs, recipient }) {
@@ -323,6 +428,77 @@ function tradeFromV3SwapLog({ amount0, amount1, token0, token1, quoteToken, base
     quoteAmount,
     quoteUsdValue: Number.NaN,
     priceUsd: Number.NaN,
+    version: "v3",
+  };
+}
+
+function tradeFromV2SwapLog({
+  amount0In,
+  amount1In,
+  amount0Out,
+  amount1Out,
+  token0,
+  token1,
+  quoteToken,
+  baseToken,
+  txHash,
+  blockNumber,
+  timestampMs,
+  recipient,
+}) {
+  const quote = normalizeAddress(quoteToken);
+  const base = normalizeAddress(baseToken);
+  const t0 = normalizeAddress(token0);
+  const t1 = normalizeAddress(token1);
+  const quoteIs0 = t0 === quote;
+  const baseIs0 = t0 === base;
+  if (!(quoteIs0 || t1 === quote) || !(baseIs0 || t1 === base)) return null;
+
+  const a0In = BigInt(amount0In || 0);
+  const a1In = BigInt(amount1In || 0);
+  const a0Out = BigInt(amount0Out || 0);
+  const a1Out = BigInt(amount1Out || 0);
+  const quoteIn = quoteIs0 ? a0In : a1In;
+  const quoteOut = quoteIs0 ? a0Out : a1Out;
+  const baseIn = baseIs0 ? a0In : a1In;
+  const baseOut = baseIs0 ? a0Out : a1Out;
+
+  let side;
+  let quoteRaw;
+  let baseRaw;
+  if (quoteIn > 0n && baseOut > 0n) {
+    side = "BUY";
+    quoteRaw = quoteIn;
+    baseRaw = baseOut;
+  } else if (baseIn > 0n && quoteOut > 0n) {
+    side = "SELL";
+    quoteRaw = quoteOut;
+    baseRaw = baseIn;
+  } else {
+    return null;
+  }
+
+  const { ethers } = require("ethers");
+  const quoteAmount = Number(ethers.formatUnits(quoteRaw, 18));
+  const baseAmount = Number(ethers.formatUnits(baseRaw, 18));
+  const minQuote = Number(config.minQuoteAmount);
+  if (Number.isFinite(minQuote) && minQuote > 0 && quoteAmount < minQuote * 0.95) return null;
+
+  return {
+    txHash: String(txHash || "").toLowerCase(),
+    blockNumber: Number(blockNumber || 0),
+    timestamp: new Date(timestampMs || Date.now()).toISOString(),
+    side,
+    trader: normalizeAddress(recipient) || "",
+    baseRaw,
+    quoteRaw,
+    baseDecimals: 18,
+    quoteDecimals: 18,
+    baseAmount,
+    quoteAmount,
+    quoteUsdValue: Number.NaN,
+    priceUsd: Number.NaN,
+    version: "v2",
   };
 }
 
@@ -343,10 +519,10 @@ async function pollRpcSwaps(state, options = {}) {
   const latest = Number(await provider.getBlockNumber());
   if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
 
-  const iface = new ethers.Interface([
-    "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
-  ]);
-  const topic = iface.getEvent("Swap").topicHash;
+  const ifaceV3 = v3SwapInterface();
+  const ifaceV2 = v2SwapInterface();
+  const topicV3 = ifaceV3.getEvent("Swap").topicHash;
+  const topicV2 = ifaceV2.getEvent("Swap").topicHash;
   const seen = new Set(state.seen || []);
   const now = Date.now();
   const configuredLookback = Number(config.rpcSwapLookbackBlocks || 100);
@@ -366,6 +542,7 @@ async function pollRpcSwaps(state, options = {}) {
     try {
       meta = await getPoolMeta(pair, provider);
     } catch (error) {
+      pruneInvalidWatchPairs(state);
       if (now - (pollRpcSwaps._lastMetaWarnAt || 0) > 60_000) {
         console.warn(`RPC pool meta failed for ${pair}: ${error.message}`);
         pollRpcSwaps._lastMetaWarnAt = now;
@@ -379,14 +556,28 @@ async function pollRpcSwaps(state, options = {}) {
       continue;
     }
 
-    // Keep trading fee aligned with the live pool of the ACTIVE token only.
+    // Keep trading fee aligned with the live v3 pool of the ACTIVE token only.
     if (
+      meta.version === "v3" &&
       normalizeAddress(tracked.baseTokenAddress) === config.baseTokenAddress &&
       Number.isFinite(meta.fee) &&
       meta.fee > 0
     ) {
       config.uniswapV3Fee = meta.fee;
     }
+
+    const iface = meta.version === "v2" ? ifaceV2 : ifaceV3;
+    const topic = meta.version === "v2" ? topicV2 : topicV3;
+    const logAddress = meta.version === "v4" ? config.v4PoolManagerAddress : pair;
+    const logTopics =
+      meta.version === "v4"
+        ? [
+            new (require("ethers").Interface)([
+              "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)",
+            ]).getEvent("Swap").topicHash,
+            pair.length === 66 ? pair : tracked.v4AlertPoolId || pair,
+          ]
+        : [topic];
 
     // Alchemy free: eth_getLogs max 10-block range — chunk so backup stays reliable.
     const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
@@ -396,10 +587,10 @@ async function pollRpcSwaps(state, options = {}) {
       for (let start = fromBlock + 1; start <= latest; start += maxRange) {
         const end = Math.min(latest, start + maxRange - 1);
         const chunk = await provider.getLogs({
-          address: pair,
+          address: logAddress,
           fromBlock: start,
           toBlock: end,
-          topics: [topic],
+          topics: logTopics,
         });
         if (chunk.length) logs = logs.concat(chunk);
         scannedTo = end;
@@ -432,7 +623,14 @@ async function pollRpcSwaps(state, options = {}) {
       if (!txHash || seen.has(txHash)) continue;
       let parsed;
       try {
-        parsed = iface.parseLog(log);
+        if (meta.version === "v4") {
+          const ifaceV4 = new (require("ethers").Interface)([
+            "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)",
+          ]);
+          parsed = ifaceV4.parseLog(log);
+        } else {
+          parsed = iface.parseLog(log);
+        }
       } catch {
         continue;
       }
@@ -441,18 +639,39 @@ async function pollRpcSwaps(state, options = {}) {
         seen.add(txHash);
         continue;
       }
-      const trade = tradeFromV3SwapLog({
-        amount0: parsed.args.amount0,
-        amount1: parsed.args.amount1,
-        token0: meta.token0,
-        token1: meta.token1,
-        quoteToken: tracked.quoteTokenAddress,
-        baseToken: tracked.baseTokenAddress,
-        txHash,
-        blockNumber: Number(log.blockNumber),
-        timestampMs: tsMs,
-        recipient: parsed.args.recipient,
-      });
+      const alertQuote =
+        meta.version === "v4"
+          ? meta.v4AlertQuote || tracked.v4Meta?.v4AlertQuote || tracked.quoteTokenAddress
+          : tracked.quoteTokenAddress;
+      const trade =
+        meta.version === "v2"
+          ? tradeFromV2SwapLog({
+              amount0In: parsed.args.amount0In,
+              amount1In: parsed.args.amount1In,
+              amount0Out: parsed.args.amount0Out,
+              amount1Out: parsed.args.amount1Out,
+              token0: meta.token0,
+              token1: meta.token1,
+              quoteToken: alertQuote,
+              baseToken: tracked.baseTokenAddress,
+              txHash,
+              blockNumber: Number(log.blockNumber),
+              timestampMs: tsMs,
+              recipient: parsed.args.to,
+            })
+          : tradeFromV3SwapLog({
+              amount0: parsed.args.amount0,
+              amount1: parsed.args.amount1,
+              token0: meta.token0,
+              token1: meta.token1,
+              quoteToken: alertQuote,
+              baseToken: tracked.baseTokenAddress,
+              txHash,
+              blockNumber: Number(log.blockNumber),
+              timestampMs: tsMs,
+              recipient: parsed.args.sender,
+            });
+      if (trade && meta.version === "v4") trade.version = "v4";
       if (!trade) {
         seen.add(txHash);
         continue;
@@ -565,16 +784,18 @@ function claimSwapAlert(state, txHash) {
   return true;
 }
 
-function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockNumber }, state) {
-  const hash = String(txHash || "").toLowerCase();
+function handleLiveSwapEvent(event, state) {
+  const hash = String(event.txHash || "").toLowerCase();
   if (!hash) return;
   if ((state.seen || []).includes(hash)) return;
+  const pair = normalizeAddress(event.pair);
 
-  const cached = poolMetaCache.get(normalizeAddress(pair));
+  const cached = poolMetaCache.get(pair);
   const run = (meta) => {
     const tracked = findTrackedForPool(meta);
     if (!tracked) return;
     if (
+      meta.version === "v3" &&
       normalizeAddress(tracked.baseTokenAddress) === config.baseTokenAddress &&
       Number.isFinite(meta.fee) &&
       meta.fee > 0
@@ -582,18 +803,34 @@ function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockN
       config.uniswapV3Fee = meta.fee;
     }
 
-    const trade = tradeFromV3SwapLog({
-      amount0,
-      amount1,
-      token0: meta.token0,
-      token1: meta.token1,
-      quoteToken: tracked.quoteTokenAddress,
-      baseToken: tracked.baseTokenAddress,
-      txHash: hash,
-      blockNumber: Number(blockNumber || 0),
-      timestampMs: Date.now(),
-      recipient,
-    });
+    const trade =
+      meta.version === "v2"
+        ? tradeFromV2SwapLog({
+            amount0In: event.amount0In,
+            amount1In: event.amount1In,
+            amount0Out: event.amount0Out,
+            amount1Out: event.amount1Out,
+            token0: meta.token0,
+            token1: meta.token1,
+            quoteToken: tracked.quoteTokenAddress,
+            baseToken: tracked.baseTokenAddress,
+            txHash: hash,
+            blockNumber: Number(event.blockNumber || 0),
+            timestampMs: Date.now(),
+            recipient: event.recipient,
+          })
+        : tradeFromV3SwapLog({
+            amount0: event.amount0,
+            amount1: event.amount1,
+            token0: meta.token0,
+            token1: meta.token1,
+            quoteToken: tracked.quoteTokenAddress,
+            baseToken: tracked.baseTokenAddress,
+            txHash: hash,
+            blockNumber: Number(event.blockNumber || 0),
+            timestampMs: Date.now(),
+            recipient: event.recipient,
+          });
     if (!trade) {
       // Below threshold / invalid — mark seen so HTTP catch-up does not re-alert junk.
       claimSwapAlert(state, hash);
@@ -602,9 +839,8 @@ function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockN
     if (!claimSwapAlert(state, hash)) return;
 
     if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
-    const bn = Number(blockNumber || 0);
-    const key = normalizeAddress(pair);
-    if (bn > 0) state.swapBlocks[key] = Math.max(Number(state.swapBlocks[key] || 0), bn);
+    const bn = Number(event.blockNumber || 0);
+    if (bn > 0) state.swapBlocks[pair] = Math.max(Number(state.swapBlocks[pair] || 0), bn);
     saveState(state);
 
     emitTradeAlertAsync(tagTradeWithTracked(trade, tracked));
@@ -720,30 +956,73 @@ function startWsSwapListener(state) {
   const provider = new ethers.WebSocketProvider(config.rpcWsUrl);
   wsRuntime.provider = provider;
 
-  const abi = [
+  const v3Abi = [
     "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
   ];
+  const v2Abi = [
+    "event Swap(address indexed sender,uint256 amount0In,uint256 amount1In,uint256 amount0Out,uint256 amount1Out,address indexed to)",
+  ];
 
-  for (const pair of watchedPairSet()) {
-    const pool = new ethers.Contract(pair, abi, provider);
-    pool.on("Swap", (_sender, recipient, amount0, amount1, _sqrt, _liq, _tick, event) => {
-      if (wsRuntime.generation !== myGeneration) return;
-      const st = wsRuntime.stateRef || state;
-      const txHash = event?.log?.transactionHash || event?.transactionHash || "";
-      const blockNumber = event?.log?.blockNumber || event?.blockNumber || 0;
-      try {
-        handleLiveSwapEvent(
-          { pair, amount0, amount1, recipient, txHash, blockNumber },
-          st,
-        );
-      } catch (error) {
-        console.error(`WS Swap handler error: ${error.message}`);
-      }
-    });
+  const subscribePair = async (pair) => {
+    let meta;
+    try {
+      meta = await getPoolMeta(pair, getRpcProvider());
+    } catch (error) {
+      console.warn(`WS skip ${pair}: ${error.message}`);
+      return;
+    }
+    if (wsRuntime.generation !== myGeneration || !wsRuntime.provider) return;
+
+    if (meta.version === "v2") {
+      const pool = new ethers.Contract(pair, v2Abi, provider);
+      pool.on("Swap", (_sender, amount0In, amount1In, amount0Out, amount1Out, to, event) => {
+        if (wsRuntime.generation !== myGeneration) return;
+        const st = wsRuntime.stateRef || state;
+        const txHash = event?.log?.transactionHash || event?.transactionHash || "";
+        const blockNumber = event?.log?.blockNumber || event?.blockNumber || 0;
+        try {
+          handleLiveSwapEvent(
+            {
+              pair,
+              amount0In,
+              amount1In,
+              amount0Out,
+              amount1Out,
+              recipient: to,
+              txHash,
+              blockNumber,
+            },
+            st,
+          );
+        } catch (error) {
+          console.error(`WS V2 Swap handler error: ${error.message}`);
+        }
+      });
+    } else {
+      const pool = new ethers.Contract(pair, v3Abi, provider);
+      pool.on("Swap", (_sender, recipient, amount0, amount1, _sqrt, _liq, _tick, event) => {
+        if (wsRuntime.generation !== myGeneration) return;
+        const st = wsRuntime.stateRef || state;
+        const txHash = event?.log?.transactionHash || event?.transactionHash || "";
+        const blockNumber = event?.log?.blockNumber || event?.blockNumber || 0;
+        try {
+          handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockNumber }, st);
+        } catch (error) {
+          console.error(`WS V3 Swap handler error: ${error.message}`);
+        }
+      });
+    }
     wsRuntime.listenedPairs.add(pair);
-    // Pre-warm meta so the first Swap does not wait on RPC.
-    getPoolMeta(pair, getRpcProvider()).catch(() => {});
-  }
+  };
+
+  Promise.all([...watchedPairSet()].map((pair) => subscribePair(pair)))
+    .then(() => {
+      if (wsRuntime.generation !== myGeneration) return;
+      console.log(`✅ WS Swap listener active on ${wsRuntime.listenedPairs.size} pool(s).`);
+    })
+    .catch((error) => {
+      console.warn(`WS subscribe error: ${error.message}`);
+    });
 
   const rawSocket = provider.websocket;
   if (rawSocket?.on) {
@@ -781,7 +1060,6 @@ function startWsSwapListener(state) {
   wsRuntime.healthy = true;
   wsRuntime.httpFallback = false;
   wsRuntime.reconnectAttempts = 0;
-  console.log(`✅ WS Swap listener active on ${wsRuntime.listenedPairs.size} pool(s).`);
   return true;
 }
 
@@ -966,6 +1244,10 @@ function isEvmAddress(value) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(value || "").trim());
 }
 
+function isV4PoolId(value) {
+  return /^0x[a-fA-F0-9]{64}$/.test(String(value || "").trim());
+}
+
 function shouldTradeImmediately() {
   return true;
 }
@@ -1119,12 +1401,21 @@ function formatSwapError(error) {
   if (/nonce|replacement|already known/i.test(raw)) {
     return `Nonce/tx conflict — đợi tx cũ xong rồi thử lại. (${raw.slice(0, 100)})`;
   }
-  if (/\bSTF\b|transfer amount exceeds|insufficient allowance/i.test(raw)) {
-    return "Token transfer/approve failed (balance hoặc allowance). Thử Sell lại hoặc Approve.";
+  if (/\bSTF\b|TRANSFER_FROM_FAILED|transfer amount exceeds|insufficient allowance|Permit2/i.test(raw)) {
+    return "Token transfer/approve failed (balance hoặc Permit2 hết hạn). Bấm Sell lại — bot sẽ Approve lại; nếu vẫn lỗi thì paste lại contract meme GME.";
   }
   // Match Uniswap codes carefully — bare "AS" used to match the letters inside "gas".
+  if (/INSUFFICIENT_OUTPUT_AMOUNT/i.test(raw)) {
+    return "Slippage/thuế token: nhận ít hơn minOut. Tăng SLIPPAGE_BPS hoặc V2_FOT_BUFFER_BPS rồi thử lại.";
+  }
   if (/\bAS\b|Too little received|TOO_LITTLE|Price slippage|slippage/i.test(raw)) {
-    return `Slippage/price moved. Tăng SLIPPAGE_BPS hoặc thử lại. (${raw.slice(0, 80)})`;
+    return `Slippage/price moved (hoặc token có thuế). Tăng SLIPPAGE_BPS / V2_FOT_BUFFER_BPS hoặc thử lại. (${raw.slice(0, 80)})`;
+  }
+  if (/Swap reverted on-chain/i.test(raw)) {
+    return "Tx reverted on-chain (thường do slippage/thuế token). Kiểm tra link Tx — không bấm lại nếu đã thành công.";
+  }
+  if (/transaction execution reverted|execution reverted/i.test(raw) && raw.length < 80) {
+    return "Tx reverted on-chain (thường do slippage/thuế token). Kiểm tra link Tx — không bấm lại nếu đã thành công.";
   }
   if (/execution reverted/i.test(raw) && raw.length > 160) {
     return `Swap reverted: ${raw.slice(0, 120)}…`;
@@ -1153,6 +1444,521 @@ async function readTokenDecimals(tokenAddress, provider, fallback = 18) {
   return fallback;
 }
 
+async function quoteV2AmountOut(provider, amountIn, path) {
+  const { ethers } = require("ethers");
+  const router = new ethers.Contract(
+    config.swapRouterV2Address,
+    ["function getAmountsOut(uint256 amountIn, address[] path) view returns (uint256[] amounts)"],
+    provider,
+  );
+  const amounts = await rpcCall("getAmountsOut", () => router.getAmountsOut(amountIn, path));
+  return BigInt(amounts[amounts.length - 1]);
+}
+
+function extractRevertReason(error) {
+  const raw = String(error?.shortMessage || error?.reason || error?.message || error || "");
+  const data = error?.data || error?.info?.error?.data;
+  if (typeof data === "string" && data.startsWith("0x08c379a0") && data.length >= 138) {
+    try {
+      const { ethers } = require("ethers");
+      return ethers.AbiCoder.defaultAbiCoder().decode(["string"], `0x${data.slice(10)}`)[0];
+    } catch {
+      // fall through
+    }
+  }
+  const match = raw.match(/UniswapV2Router:\s*([A-Z0-9_]+)/i);
+  if (match) return `UniswapV2Router: ${match[1]}`;
+  return raw;
+}
+
+/** getAmountsOut ignores FOT/buy-tax — preflight eth_call and lower minOut until it passes. */
+async function resolveV2MinOut({
+  provider,
+  router,
+  side,
+  amountIn,
+  path,
+  to,
+  deadline,
+  quotedOut,
+  totalSlipBps,
+  payValue = 0n,
+}) {
+  let minOut = (quotedOut * BigInt(10000 - totalSlipBps)) / 10000n;
+  if (minOut <= 0n) throw new Error("Quote minOut is zero — amount too small or pool illiquid.");
+
+  const tryMinOut = async (candidate) => {
+    if (side === "BUY" && payValue > 0n) {
+      await provider.call({
+        to: await router.getAddress(),
+        from: to,
+        data: router.interface.encodeFunctionData(
+          "swapExactETHForTokensSupportingFeeOnTransferTokens",
+          [candidate, path, to, deadline],
+        ),
+        value: payValue,
+      });
+      return;
+    }
+    if (side === "SELL" && path.length >= 2) {
+      // Prefer ETH-out path when quote is WETH; otherwise tokens-for-tokens.
+      const ethOut = isQuoteWethToken(path[path.length - 1]);
+      const fn = ethOut
+        ? "swapExactTokensForETHSupportingFeeOnTransferTokens"
+        : "swapExactTokensForTokensSupportingFeeOnTransferTokens";
+      await provider.call({
+        to: await router.getAddress(),
+        from: to,
+        data: router.interface.encodeFunctionData(fn, [amountIn, candidate, path, to, deadline]),
+      });
+      return;
+    }
+    throw new Error("Unsupported v2 preflight side.");
+  };
+
+  try {
+    await tryMinOut(minOut);
+    return minOut;
+  } catch (error) {
+    const reason = extractRevertReason(error);
+    if (!/INSUFFICIENT_OUTPUT_AMOUNT/i.test(reason)) {
+      throw new Error(formatSwapError(error));
+    }
+  }
+
+  // Binary-search the highest minOut that still simulates successfully, then haircut 5% for inclusion lag.
+  let lo = 0n;
+  let hi = minOut;
+  let best = 0n;
+  while (lo <= hi) {
+    const mid = (lo + hi) / 2n;
+    try {
+      await tryMinOut(mid);
+      best = mid;
+      lo = mid + 1n;
+    } catch {
+      hi = mid - 1n;
+    }
+  }
+  minOut = (best * 9500n) / 10000n;
+  console.warn(
+    `V2 FOT preflight: lowered minOut (quote ignored ~${Math.round(
+      (1 - Number(best) / Math.max(Number(quotedOut), 1)) * 100,
+    )}% tax/impact). Using ${minOut.toString()}`,
+  );
+  return minOut;
+}
+
+async function decodeFailedSwapReason(provider, tx, blockNumber) {
+  try {
+    await provider.call(
+      {
+        to: tx.to,
+        from: tx.from,
+        data: tx.data,
+        value: tx.value || 0n,
+      },
+      blockNumber,
+    );
+    return "Swap reverted on-chain (no revert data).";
+  } catch (error) {
+    return formatSwapError(error);
+  }
+}
+
+async function executeSwapV2(side, amountText, overrides = {}) {
+  const baseTokenAddress = normalizeAddress(overrides.baseTokenAddress || config.baseTokenAddress);
+  const baseSymbol = overrides.baseSymbol || config.baseSymbol;
+  const quoteTokenAddress = normalizeAddress(overrides.quoteTokenAddress || config.quoteTokenAddress);
+  const quoteSymbol = overrides.quoteSymbol || config.quoteSymbol;
+  let decimalsIn = Number.isFinite(Number(overrides.decimals)) ? Number(overrides.decimals) : 18;
+  const decimalsOut = 18;
+
+  const { ethers } = require("ethers");
+  const provider = getRpcProvider();
+  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
+  const tokenIn = side === "BUY" ? quoteTokenAddress : baseTokenAddress;
+  const tokenOut = side === "BUY" ? baseTokenAddress : quoteTokenAddress;
+  const tokenInSymbol = side === "BUY" ? displayQuoteSymbol(quoteSymbol) : baseSymbol;
+  const tokenOutSymbol = side === "BUY" ? baseSymbol : displayQuoteSymbol(quoteSymbol);
+  const buyWithNativeEth = side === "BUY" && isQuoteWethToken(tokenIn);
+  const sellToNativeEth = side === "SELL" && isQuoteWethToken(tokenOut);
+
+  if (!buyWithNativeEth && side === "SELL" && !Number.isFinite(Number(overrides.decimals))) {
+    decimalsIn = await readTokenDecimals(tokenIn, provider, 18);
+  }
+
+  const erc20Abi = [
+    "function allowance(address owner,address spender) view returns (uint256)",
+    "function approve(address spender,uint256 amount) returns (bool)",
+    "function balanceOf(address owner) view returns (uint256)",
+  ];
+  const routerAbi = [
+    "function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable",
+    "function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)",
+    "function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)",
+  ];
+  const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
+  const router = new ethers.Contract(config.swapRouterV2Address, routerAbi, wallet);
+  const path = [tokenIn, tokenOut];
+
+  let amountIn;
+  const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
+  if (side === "SELL" && sellPercent !== null) {
+    const balance = await rpcCall("balanceOf(sell% v2)", () => inputToken.balanceOf(wallet.address));
+    amountIn = balancePercent(balance, sellPercent);
+    if (sellPercent >= 100 && amountIn > 1n) amountIn -= 1n;
+    if (amountIn <= 0n) throw new Error(`No ${baseSymbol} balance to sell.`);
+    amountText = ethers.formatUnits(amountIn, decimalsIn);
+  } else {
+    amountIn = ethers.parseUnits(String(amountText), decimalsIn);
+  }
+
+  const [amountOutQuoted] = await Promise.all([
+    quoteV2AmountOut(provider, amountIn, path),
+    buyWithNativeEth ? assertNativeEthForBuy(wallet, amountIn) : assertEthForGas(wallet, side),
+  ]);
+  // Re-quote right before broadcast — RH/meme pools move fast.
+  const amountOut = await quoteV2AmountOut(provider, amountIn, path).catch(() => amountOutQuoted);
+  // SupportingFeeOnTransfer uses getAmountsOut which ignores buy/sell tax → need extra buffer + preflight.
+  const totalSlipBps = Math.min(
+    9900,
+    Math.max(0, Number(config.slippageBps || 0) + Number(config.v2FotBufferBps || 0)),
+  );
+  const payValue = buyWithNativeEth ? amountIn : 0n;
+  const deadline = Math.floor(Date.now() / 1000) + 600;
+
+  // Approve before preflight so sell simulations can transfer.
+  if (!buyWithNativeEth) {
+    const balance = await rpcCall("balanceOf v2", () => inputToken.balanceOf(wallet.address));
+    if (balance < amountIn) {
+      throw new Error(
+        `Not enough ${tokenInSymbol}. Need ${amountText}, wallet has ${ethers.formatUnits(balance, decimalsIn)} ${tokenInSymbol}`,
+      );
+    }
+    const allowance = await rpcCall("allowance v2", () =>
+      inputToken.allowance(wallet.address, config.swapRouterV2Address),
+    );
+    if (allowance < amountIn) {
+      const approveTx = await rpcCall("approve v2", () =>
+        inputToken.approve(config.swapRouterV2Address, ethers.MaxUint256),
+      );
+      const approveReceipt = await withTimeout(
+        approveTx.wait(1),
+        TRADE_CONFIRM_TIMEOUT_MS,
+        `approve v2 ${approveTx.hash}`,
+      );
+      if (!approveReceipt || approveReceipt.status !== 1) {
+        throw new Error("Approve transaction failed.");
+      }
+    }
+  }
+
+  const minOut = await resolveV2MinOut({
+    provider,
+    router,
+    side,
+    amountIn,
+    path,
+    to: wallet.address,
+    deadline,
+    quotedOut: amountOut,
+    totalSlipBps,
+    payValue,
+  });
+
+  let tx;
+  try {
+    if (buyWithNativeEth) {
+      tx = await rpcCall("swapExactETHForTokens v2", () =>
+        router.swapExactETHForTokensSupportingFeeOnTransferTokens(
+          minOut,
+          path,
+          wallet.address,
+          deadline,
+          { value: payValue },
+        ),
+      );
+    } else if (sellToNativeEth) {
+      tx = await rpcCall("swapExactTokensForETH v2", () =>
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+          amountIn,
+          minOut,
+          path,
+          wallet.address,
+          deadline,
+        ),
+      );
+    } else {
+      tx = await rpcCall("swapExactTokensForTokens v2", () =>
+        router.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+          amountIn,
+          minOut,
+          path,
+          wallet.address,
+          deadline,
+        ),
+      );
+    }
+  } catch (error) {
+    throw new Error(formatSwapError(error));
+  }
+
+  return {
+    hash: tx.hash,
+    wallet: wallet.address,
+    tokenInSymbol,
+    tokenOutSymbol: sellToNativeEth ? "ETH" : tokenOutSymbol,
+    minOut: ethers.formatUnits(minOut, decimalsOut),
+    paidNative: buyWithNativeEth ? ethers.formatEther(payValue) : "",
+    receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
+    confirm: async () => {
+      const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `confirm ${tx.hash}`);
+      if (!receipt || receipt.status !== 1) {
+        const detail = await decodeFailedSwapReason(provider, tx, receipt?.blockNumber);
+        throw new Error(`${detail} Tx: ${tx.hash}`);
+      }
+      return receipt;
+    },
+  };
+}
+
+async function executeSwapV4(side, amountText, overrides = {}) {
+  const v4trade = require("./v4trade");
+  const { ethers } = require("ethers");
+  const baseTokenAddress = normalizeAddress(overrides.baseTokenAddress || config.baseTokenAddress);
+  const baseSymbol = overrides.baseSymbol || config.baseSymbol;
+  const provider = getRpcProvider();
+  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
+
+  const key = overrides.v4TradeKey || config.v4TradeKey;
+  const tradePoolId = normalizeAddress(overrides.v4TradePoolId || config.v4TradePoolId || "");
+  const routeMode = String(overrides.v4RouteMode || config.v4RouteMode || "").toLowerCase();
+  const bridgeToken = normalizeAddress(overrides.v4BridgeToken || config.v4BridgeToken || "");
+  const useUsdgHub = routeMode === "usdg" && bridgeToken && isEvmAddress(bridgeToken);
+  if (!key?.currency0 || !key?.currency1) {
+    throw new Error("Missing v4 trade pool key — paste token lại để bot resolve pool.");
+  }
+
+  let decimalsIn = 18;
+  let amountIn;
+  const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
+  const token = new ethers.Contract(
+    baseTokenAddress,
+    [
+      "function balanceOf(address) view returns (uint256)",
+      "function decimals() view returns (uint8)",
+    ],
+    wallet,
+  );
+
+  if (side === "SELL") {
+    try {
+      decimalsIn = Number(await token.decimals());
+    } catch {
+      decimalsIn = 18;
+    }
+    if (sellPercent !== null) {
+      const balance = await rpcCall("balanceOf(sell% v4)", () => token.balanceOf(wallet.address));
+      amountIn = balancePercent(balance, sellPercent);
+      if (sellPercent >= 100 && amountIn > 1n) amountIn -= 1n;
+      if (amountIn <= 0n) throw new Error(`No ${baseSymbol} balance to sell.`);
+      amountText = ethers.formatUnits(amountIn, decimalsIn);
+    } else {
+      amountIn = ethers.parseUnits(String(amountText), decimalsIn);
+    }
+  } else {
+    amountIn = ethers.parseEther(String(amountText));
+    await assertNativeEthForBuy(wallet, amountIn);
+  }
+
+  const tokenInKey =
+    normalizeAddress(key.currency0) === baseTokenAddress ||
+    normalizeAddress(key.currency1) === baseTokenAddress;
+  if (!tokenInKey) {
+    throw new Error("v4 pool key does not match tracked token.");
+  }
+
+  let quotedOut;
+  let bridgeAmount = 0n;
+  try {
+    if (useUsdgHub) {
+      const quoted = await v4trade.quoteUsdgHub({
+        provider,
+        quoterAddress: config.quoterAddress,
+        wethAddress: config.quoteTokenAddress,
+        bridgeToken,
+        tokenAddress: baseTokenAddress,
+        hubPoolId: tradePoolId,
+        key,
+        side,
+        amountIn,
+      });
+      quotedOut = quoted.amountOut;
+      bridgeAmount = quoted.bridgeAmount || 0n;
+    } else {
+      quotedOut = await v4trade.quoteViaDexPrice(tradePoolId, baseTokenAddress, side, amountIn);
+    }
+  } catch (error) {
+    throw new Error(`V4 quote failed: ${error.message || error}`);
+  }
+  if (quotedOut <= 0n) throw new Error("V4 quote returned zero — pool illiquid or price unavailable.");
+
+  // Thick USDG hub: tight default (1.5%). Thin ETH v4 / override: use global slippage.
+  const slipBps = Math.min(
+    9900,
+    Math.max(
+      0,
+      useUsdgHub
+        ? Number(config.v4SlippageBps ?? 150)
+        : Number(config.slippageBps || 500),
+    ),
+  );
+  const hopSlipBps = Math.min(2000, Math.max(0, Number(config.v4HopSlippageBps ?? 50)));
+  let minOut = (quotedOut * BigInt(10000 - slipBps)) / 10000n;
+  if (minOut <= 0n) minOut = 1n;
+  let v3MinOut = 0n;
+  let bridgeMinOut = 0n;
+  if (useUsdgHub && bridgeAmount > 0n) {
+    if (side === "BUY") {
+      // V3 quoter is exact — tight hop min is safe and blocks sandwich on USDG leg.
+      v3MinOut = (bridgeAmount * BigInt(10000 - hopSlipBps)) / 10000n;
+    }
+    // SELL: do not set tight bridgeMin from spot (ignores tick impact). Final ETH min is from v3 quoter.
+  }
+
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+  const tokenIn = side === "BUY" ? v4trade.NATIVE_ETH : baseTokenAddress;
+  const tokenOut = side === "BUY" ? baseTokenAddress : v4trade.NATIVE_ETH;
+  const zfo =
+    side === "BUY"
+      ? normalizeAddress(key.currency0) === v4trade.NATIVE_ETH ||
+        (useUsdgHub && normalizeAddress(key.currency0) === bridgeToken)
+      : normalizeAddress(key.currency1) === baseTokenAddress ||
+        (useUsdgHub && normalizeAddress(key.currency0) === baseTokenAddress);
+
+  if (side === "SELL") {
+    await v4trade.ensurePermit2(
+      wallet,
+      baseTokenAddress,
+      config.universalRouterAddress,
+      amountIn,
+      config.permit2Address,
+    );
+  }
+
+  const buildData = (finalMin, hopV3 = v3MinOut, hopBridge = bridgeMinOut) => {
+    if (useUsdgHub) {
+      return v4trade.encodeUsdgHubSwap({
+        side,
+        key,
+        tokenAddress: baseTokenAddress,
+        bridgeToken,
+        wethAddress: config.quoteTokenAddress,
+        amountIn,
+        minAmountOut: finalMin,
+        v3MinOut: hopV3,
+        bridgeMinOut: hopBridge,
+        recipient: wallet.address,
+        deadline,
+      });
+    }
+    return v4trade.encodeExactInputSingle({
+      key,
+      zeroForOne: zfo,
+      tokenIn,
+      tokenOut,
+      amountIn,
+      minAmountOut: finalMin,
+      deadline,
+    });
+  };
+
+  const tryCall = async (data) => {
+    await provider.call({
+      to: config.universalRouterAddress,
+      from: wallet.address,
+      data,
+      value: side === "BUY" ? amountIn : 0n,
+    });
+  };
+
+  // Preflight: keep the tightest minOut that still simulates — never collapse to 1 (MEV).
+  const floorOut = quotedOut / 2n > 0n ? quotedOut / 2n : 1n;
+  try {
+    await tryCall(buildData(minOut));
+  } catch {
+    let lo = floorOut;
+    let hi = minOut;
+    let best = 0n;
+    // Also relax intermediate hop mins once if needed.
+    let hopV3 = v3MinOut;
+    let hopBridge = bridgeMinOut;
+    for (let pass = 0; pass < 2; pass++) {
+      lo = floorOut;
+      hi = minOut;
+      best = 0n;
+      while (lo <= hi) {
+        const mid = (lo + hi) / 2n;
+        try {
+          await tryCall(buildData(mid, hopV3, hopBridge));
+          best = mid;
+          lo = mid + 1n;
+        } catch {
+          hi = mid - 1n;
+        }
+      }
+      if (best > 0n) break;
+      // Second pass: loosen hop mins (still keep final floor).
+      hopV3 = (hopV3 * 9500n) / 10000n;
+      hopBridge = (hopBridge * 9500n) / 10000n;
+    }
+    if (best <= 0n) {
+      throw new Error(
+        "V4 preflight failed — quote/pool moved too far. Thử lại hoặc tăng V4_SLIPPAGE_BPS nhẹ.",
+      );
+    }
+    // 1% haircut for inclusion lag (not 5% — quotes are on-chain).
+    minOut = (best * 9900n) / 10000n;
+    if (minOut < floorOut) minOut = floorOut;
+    v3MinOut = hopV3;
+    bridgeMinOut = hopBridge;
+    console.warn(`V4 preflight: adjusted minOut to ${minOut.toString()} (slip ${slipBps}bps)`);
+  }
+
+  const finalData = buildData(minOut, v3MinOut, bridgeMinOut);
+  let tx;
+  try {
+    tx = await rpcCall("v4 universalRouter execute", () =>
+      wallet.sendTransaction({
+        to: config.universalRouterAddress,
+        data: finalData,
+        value: side === "BUY" ? amountIn : 0n,
+      }),
+    );
+  } catch (error) {
+    throw new Error(formatSwapError(error));
+  }
+
+  return {
+    hash: tx.hash,
+    wallet: wallet.address,
+    tokenInSymbol: side === "BUY" ? "ETH" : baseSymbol,
+    tokenOutSymbol: side === "BUY" ? baseSymbol : "ETH",
+    minOut: ethers.formatUnits(minOut, side === "SELL" ? 18 : decimalsIn),
+    paidNative: side === "BUY" ? ethers.formatEther(amountIn) : "",
+    receivedNative: side === "SELL" ? ethers.formatEther(minOut) : "",
+    confirm: async () => {
+      const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `confirm ${tx.hash}`);
+      if (!receipt || receipt.status !== 1) {
+        const detail = await decodeFailedSwapReason(provider, tx, receipt?.blockNumber);
+        throw new Error(`${detail} Tx: ${tx.hash}`);
+      }
+      return receipt;
+    },
+  };
+}
+
 async function executeSwap(side, amountText, overrides = {}) {
   if (!config.tradeEnabled) {
     throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 sau khi cấu hình RPC_URL và WALLET_PRIVATE_KEY.");
@@ -1160,6 +1966,30 @@ async function executeSwap(side, amountText, overrides = {}) {
 
   if (!config.rpcUrl || !config.walletPrivateKey) {
     throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
+  }
+
+  const pairAddress = normalizeAddress(overrides.pairAddress || config.pairAddress || "");
+  let poolVersion = String(overrides.version || config.poolVersion || "").toLowerCase();
+  if (!poolVersion && (isEvmAddress(pairAddress) || isV4PoolId(overrides.pairAddress || config.pairAddress || ""))) {
+    try {
+      const meta = await getPoolMeta(overrides.pairAddress || config.pairAddress);
+      poolVersion = meta.version || "v3";
+      if (overrides && meta.version) overrides.version = meta.version;
+      if (meta.v4TradeKey) {
+        overrides.v4TradeKey = meta.v4TradeKey;
+        overrides.v4TradePoolId = meta.v4TradePoolId;
+        if (meta.v4RouteMode) overrides.v4RouteMode = meta.v4RouteMode;
+        if (meta.v4BridgeToken) overrides.v4BridgeToken = meta.v4BridgeToken;
+      }
+    } catch {
+      poolVersion = "v3";
+    }
+  }
+  if (poolVersion === "v2") {
+    return executeSwapV2(side, amountText, overrides);
+  }
+  if (poolVersion === "v4") {
+    return executeSwapV4(side, amountText, overrides);
   }
 
   const baseTokenAddress = normalizeAddress(overrides.baseTokenAddress || config.baseTokenAddress);
@@ -1195,7 +2025,6 @@ async function executeSwap(side, amountText, overrides = {}) {
     "function multicall(bytes[] data) payable returns (bytes[] results)",
   ];
   const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
-  const pairAddress = normalizeAddress(overrides.pairAddress || config.pairAddress || "");
 
   let amountIn;
   const sellPercent = side === "SELL" ? parseSellPercent(amountText) : null;
@@ -1215,6 +2044,9 @@ async function executeSwap(side, amountText, overrides = {}) {
     : Promise.resolve(null);
 
   const meta = await metaPromise;
+  if (meta?.version === "v2") {
+    return executeSwapV2(side, amountText, { ...overrides, version: "v2" });
+  }
   if (meta) {
     const matches =
       (meta.token0 === tokenIn && meta.token1 === tokenOut) ||
@@ -1401,16 +2233,124 @@ function chooseBestPairForToken(pairs, tokenAddress) {
       const base = normalizeAddress(pair.baseToken?.address);
       const quote = normalizeAddress(pair.quoteToken?.address);
       return base === token || quote === token;
-    });
+    })
+    .filter((pair) => !isInvalidPool(pair.pairAddress))
+    .filter((pair) => isTradeableDexPair(pair));
 
   validPairs.sort((a, b) => {
-    const aQuote = normalizeAddress(a.quoteToken?.address) === config.quoteTokenAddress || a.quoteToken?.symbol === "WETH";
-    const bQuote = normalizeAddress(b.quoteToken?.address) === config.quoteTokenAddress || b.quoteToken?.symbol === "WETH";
+    const aQuote =
+      normalizeAddress(a.quoteToken?.address) === config.quoteTokenAddress ||
+      String(a.quoteToken?.symbol || "").toUpperCase() === "WETH" ||
+      String(a.quoteToken?.address || "").toLowerCase() === "0x0000000000000000000000000000000000000000";
+    const bQuote =
+      normalizeAddress(b.quoteToken?.address) === config.quoteTokenAddress ||
+      String(b.quoteToken?.symbol || "").toUpperCase() === "WETH" ||
+      String(b.quoteToken?.address || "").toLowerCase() === "0x0000000000000000000000000000000000000000";
     if (aQuote !== bQuote) return aQuote ? -1 : 1;
-    return Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0);
+    const liq = (p) => Number(p.liquidity?.usd || 0);
+    if (liq(b) !== liq(a)) return liq(b) - liq(a);
+    const aV3 = isV3Pair(a) ? 1 : 0;
+    const bV3 = isV3Pair(b) ? 1 : 0;
+    if (aV3 !== bV3) return bV3 - aV3;
+    return 0;
   });
 
   return validPairs[0] || null;
+}
+
+async function chooseValidV3PairForToken(pairs, tokenAddress) {
+  return chooseValidPoolForToken(pairs, tokenAddress);
+}
+
+async function chooseValidPoolForToken(pairs, tokenAddress) {
+  const v4trade = require("./v4trade");
+  const token = normalizeAddress(tokenAddress);
+  const candidates = (Array.isArray(pairs) ? pairs : [])
+    .filter((pair) => normalizeAddress(pair.chainId) === "robinhood")
+    .filter((pair) => {
+      const base = normalizeAddress(pair.baseToken?.address);
+      const quote = normalizeAddress(pair.quoteToken?.address);
+      return base === token || quote === token;
+    })
+    .filter((pair) => isTradeableDexPair(pair) && !isInvalidPool(pair.pairAddress))
+    .sort((a, b) => {
+      // Prefer deepest liquidity overall; v3/v2 still fine when liquid.
+      const liq = (p) => Number(p.liquidity?.usd || 0);
+      if (liq(b) !== liq(a)) return liq(b) - liq(a);
+      const aScore = isV3Pair(a) ? 2 : isV2Pair(a) ? 1 : isV4Pair(a) ? 3 : 0;
+      const bScore = isV3Pair(b) ? 2 : isV2Pair(b) ? 1 : isV4Pair(b) ? 3 : 0;
+      return bScore - aScore;
+    });
+
+  const fallback = chooseBestPairForToken(pairs, tokenAddress);
+  const ordered = [];
+  for (const pair of [...candidates, fallback].filter(Boolean)) {
+    const address = normalizeAddress(pair.pairAddress);
+    if (!address || ordered.some((item) => normalizeAddress(item.pairAddress) === address)) continue;
+    ordered.push(pair);
+  }
+
+  for (const pair of ordered) {
+    if (isV4Pair(pair)) {
+      const route = v4trade.pickV4TradeRoute(pairs, token, config.quoteTokenAddress);
+      if (!route?.pair?.pairAddress) continue;
+      const zero = "0x0000000000000000000000000000000000000000";
+      const hookHints = ["0x4e3468951D49f2EEa976eD0D6e75fFCb44a9a544"];
+
+      let tradeKey = null;
+      let bridgeToken = "";
+      let routeMode = "eth";
+      if (route.mode === "usdg") {
+        bridgeToken = normalizeAddress(route.bridgeToken);
+        tradeKey = v4trade.recoverV4PoolKey(route.poolId, bridgeToken, token, hookHints);
+        if (tradeKey) routeMode = "usdg";
+      }
+      if (!tradeKey) {
+        const ethPool = v4trade.pickV4EthPool(pairs, token);
+        if (!ethPool?.pairAddress) continue;
+        tradeKey = v4trade.recoverV4PoolKey(ethPool.pairAddress, zero, token, []);
+        if (!tradeKey) continue;
+        route.pair = ethPool;
+        route.poolId = ethPool.pairAddress;
+        routeMode = "eth";
+        bridgeToken = "";
+      }
+
+      const alertBase = normalizeAddress(pair.baseToken?.address);
+      const alertQuote = normalizeAddress(pair.quoteToken?.address);
+      const alertOther = alertBase === token ? alertQuote : alertBase;
+      let alertKey = tradeKey;
+      if (normalizeAddress(pair.pairAddress) !== normalizeAddress(route.poolId)) {
+        alertKey =
+          v4trade.recoverV4PoolKey(pair.pairAddress, alertOther === zero ? zero : alertOther, token, hookHints) ||
+          tradeKey;
+      }
+
+      return {
+        pair,
+        meta: {
+          version: "v4",
+          token0: normalizeAddress(alertKey.currency0),
+          token1: normalizeAddress(alertKey.currency1),
+          fee: Number(alertKey.fee),
+          v4TradeKey: tradeKey,
+          v4TradePoolId: normalizeAddress(route.poolId),
+          v4AlertPoolId: normalizeAddress(pair.pairAddress),
+          v4AlertQuote:
+            alertOther === zero ? normalizeAddress(config.quoteTokenAddress) : alertOther,
+          v4RouteMode: routeMode,
+          v4BridgeToken: bridgeToken,
+        },
+      };
+    }
+    try {
+      const meta = await getPoolMeta(pair.pairAddress);
+      return { pair, meta };
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
 }
 
 function trackedPairFromDexPair(pair, tokenAddress = pair?.baseToken?.address) {
@@ -1429,13 +2369,29 @@ function trackedPairFromDexPair(pair, tokenAddress = pair?.baseToken?.address) {
     quoteTokenAddress: normalizeAddress(quoteToken?.address),
     quoteSymbol: quoteToken?.symbol || "QUOTE",
     watchPairAddresses: [],
+    version: isV4Pair(pair) ? "v4" : isV2Pair(pair) ? "v2" : isV3Pair(pair) ? "v3" : "",
   };
+}
+
+function isV2Pair(pair) {
+  const labels = (pair?.labels || []).map((item) => String(item).toLowerCase());
+  return labels.includes("v2");
 }
 
 function isV3Pair(pair) {
   const labels = (pair?.labels || []).map((item) => String(item).toLowerCase());
   if (labels.includes("v4")) return false;
   return labels.includes("v3") || labels.length === 0;
+}
+
+function isV4Pair(pair) {
+  const labels = (pair?.labels || []).map((item) => String(item).toLowerCase());
+  return labels.includes("v4");
+}
+
+function isTradeableDexPair(pair) {
+  if (isV4Pair(pair)) return true;
+  return isV2Pair(pair) || isV3Pair(pair);
 }
 
 function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") {
@@ -1459,7 +2415,7 @@ function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") 
         baseSym === "ETH" ||
         quote === config.quoteTokenAddress ||
         base === config.quoteTokenAddress;
-      return isWeth && isV3Pair(pair) && Number(pair.liquidity?.usd || 0) >= 1000;
+      return isWeth && isTradeableDexPair(pair) && Number(pair.liquidity?.usd || 0) >= 1000;
     })
     .sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
 
@@ -1488,6 +2444,17 @@ function trackedPairsList() {
 
 function findTrackedForPool(meta) {
   for (const entry of trackedPairsList()) {
+    if (meta?.version === "v4") {
+      const alertId = normalizeAddress(meta.v4AlertPoolId || "");
+      if (alertId && normalizeAddress(entry.v4AlertPoolId || entry.pairAddress) === alertId) return entry;
+      if (
+        normalizeAddress(entry.baseTokenAddress) === meta.token0 ||
+        normalizeAddress(entry.baseTokenAddress) === meta.token1
+      ) {
+        return entry;
+      }
+      continue;
+    }
     const base = normalizeAddress(entry.baseTokenAddress);
     const quote = normalizeAddress(entry.quoteTokenAddress);
     if (
@@ -1507,6 +2474,7 @@ function tagTradeWithTracked(trade, entry) {
   trade.pairUrl = entry.pairUrl;
   trade.baseTokenAddress = normalizeAddress(entry.baseTokenAddress);
   trade.pairAddress = normalizeAddress(entry.pairAddress);
+  if (entry.version && !trade.version) trade.version = entry.version;
   return trade;
 }
 
@@ -1518,16 +2486,68 @@ function watchedPairSet(settings = config) {
       const list = entry.watchPairAddresses?.length ? entry.watchPairAddresses : [entry.pairAddress];
       for (const address of list || []) {
         const normalized = normalizeAddress(address);
-        if (normalized) set.add(normalized);
+        if (normalized && !isInvalidPool(normalized)) set.add(normalized);
       }
     }
-    if (!set.size && config.pairAddress) set.add(normalizeAddress(config.pairAddress));
+    if (!set.size && config.pairAddress && !isInvalidPool(config.pairAddress)) {
+      set.add(normalizeAddress(config.pairAddress));
+    }
     return set;
   }
   const list = settings.watchPairAddresses?.length
     ? settings.watchPairAddresses
     : [settings.pairAddress];
-  return new Set((list || []).map(normalizeAddress).filter(Boolean));
+  return new Set((list || []).map(normalizeAddress).filter((address) => address && !isInvalidPool(address)));
+}
+
+function pruneInvalidWatchPairs(state = null) {
+  const snapshot = state || {};
+  const list = Array.isArray(snapshot.trackedPairs) && snapshot.trackedPairs.length
+    ? snapshot.trackedPairs
+    : snapshot.trackedPair
+      ? [snapshot.trackedPair]
+      : config.trackedPairs || [];
+  let changed = false;
+  const kept = [];
+  for (const entry of list) {
+    if (!entry) continue;
+    const before = (entry.watchPairAddresses || []).map(normalizeAddress).filter(Boolean);
+    const after = before.filter((address) => !isInvalidPool(address));
+    if (after.length !== before.length) {
+      entry.watchPairAddresses = after;
+      changed = true;
+    }
+    if (isInvalidPool(entry.pairAddress)) {
+      if (after[0]) {
+        entry.pairAddress = after[0];
+        entry.pairUrl = `https://dexscreener.com/robinhood/${after[0]}`;
+        changed = true;
+        kept.push(entry);
+      } else {
+        // No valid v3 pool left for this token — drop from track list.
+        console.warn(`Dropping tracked ${entry.baseSymbol || entry.baseTokenAddress}: no valid Uniswap v2/v3 pool.`);
+        changed = true;
+      }
+      continue;
+    }
+    kept.push(entry);
+  }
+  if (changed && state) {
+    state.trackedPairs = kept;
+    config.trackedPairs = kept;
+    if (kept.length) {
+      const activeStillThere = kept.some(
+        (entry) => normalizeAddress(entry.baseTokenAddress) === normalizeAddress(state.trackedPair?.baseTokenAddress),
+      );
+      if (!activeStillThere) state.trackedPair = kept[0];
+      applyTrackedPair(state.trackedPair);
+    } else {
+      // Keep last known config for Buy/Sell buttons; user can paste a new token.
+      console.warn("All tracked pools invalid — paste a Uniswap v3 token contract to resume alerts.");
+    }
+    saveState(state);
+  }
+  return changed;
 }
 
 function applyTrackedPair(trackedPair) {
@@ -1539,6 +2559,12 @@ function applyTrackedPair(trackedPair) {
   config.baseSymbol = trackedPair.baseSymbol || config.baseSymbol;
   config.quoteTokenAddress = normalizeAddress(trackedPair.quoteTokenAddress);
   config.quoteSymbol = trackedPair.quoteSymbol || config.quoteSymbol;
+  config.poolVersion = trackedPair.version || "";
+  config.v4TradeKey = trackedPair.v4TradeKey || null;
+  config.v4TradePoolId = trackedPair.v4TradePoolId || "";
+  config.v4AlertPoolId = trackedPair.v4AlertPoolId || "";
+  config.v4RouteMode = trackedPair.v4RouteMode || "";
+  config.v4BridgeToken = trackedPair.v4BridgeToken || "";
   config.watchPairAddresses = (trackedPair.watchPairAddresses || [])
     .map(normalizeAddress)
     .filter(Boolean);
@@ -2469,8 +3495,8 @@ async function withTimeout(promise, timeoutMs, label = "operation") {
 
 async function followTokenAddress(tokenAddress, state, chatId) {
   const pairs = await fetchTokenPairs(tokenAddress);
-  const pair = chooseBestPairForToken(pairs, tokenAddress);
-  if (!pair) {
+  const picked = await chooseValidV3PairForToken(pairs, tokenAddress);
+  if (!picked?.pair) {
     try {
       const balances = await fetchWalletTokenBalances(tokenAddress);
       const hasTokens = balances.some((entry) => {
@@ -2487,7 +3513,11 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text: `Không tìm thấy pool Robinhood cho contract:\n<code>${escapeHtml(tokenAddress)}</code>`,
+      text: [
+        `Không tìm thấy pool <b>Uniswap v2/v3/v4</b> hợp lệ cho:`,
+        `<code>${escapeHtml(tokenAddress)}</code>`,
+        `Cần pool v2/v3 hoặc v4 (hub qua USDG khi có thanh khoản dày).`,
+      ].join("\n"),
       parse_mode: "HTML",
       disable_web_page_preview: "true",
       reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
@@ -2495,8 +3525,42 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     return;
   }
 
+  const { pair, meta } = picked;
   const trackedPair = trackedPairFromDexPair(pair, tokenAddress);
-  trackedPair.watchPairAddresses = chooseWatchPairAddresses(pairs, tokenAddress, trackedPair.pairAddress);
+  trackedPair.version = meta.version || trackedPair.version || "v3";
+  if (meta.version === "v4") {
+    trackedPair.v4Meta = meta;
+    trackedPair.v4TradeKey = meta.v4TradeKey;
+    trackedPair.v4TradePoolId = meta.v4TradePoolId;
+    trackedPair.v4AlertPoolId = meta.v4AlertPoolId || normalizeAddress(pair.pairAddress);
+    trackedPair.v4AlertQuote = meta.v4AlertQuote || "";
+    trackedPair.v4RouteMode = meta.v4RouteMode || "eth";
+    trackedPair.v4BridgeToken = meta.v4BridgeToken || "";
+    // Trade settles in native ETH via UniversalRouter; display quote as WETH/ETH.
+    trackedPair.quoteTokenAddress = normalizeAddress(config.quoteTokenAddress);
+    trackedPair.quoteSymbol = "WETH";
+    trackedPair.pairAddress = trackedPair.v4AlertPoolId;
+  }
+  const watchCandidates = chooseWatchPairAddresses(pairs, tokenAddress, trackedPair.pairAddress);
+  const validWatch = [];
+  for (const address of watchCandidates) {
+    if (normalizeAddress(address) === trackedPair.pairAddress || isV4PoolId(address)) {
+      validWatch.push(normalizeAddress(address));
+      continue;
+    }
+    try {
+      await getPoolMeta(address);
+      validWatch.push(normalizeAddress(address));
+    } catch {
+      // skip invalid extra pools
+    }
+  }
+  if (meta.version === "v4" && trackedPair.v4AlertPoolId) {
+    if (!validWatch.includes(trackedPair.v4AlertPoolId)) validWatch.unshift(trackedPair.v4AlertPoolId);
+  }
+  trackedPair.watchPairAddresses = validWatch.length ? validWatch : [trackedPair.pairAddress];
+  if (Number.isFinite(meta.fee) && meta.fee > 0 && meta.version === "v3") config.uniswapV3Fee = meta.fee;
+
   // Add to tracked list (max N) — keep other tokens' alerts and seen history intact.
   upsertTrackedPair(state, trackedPair);
 
@@ -2517,13 +3581,6 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     console.warn(`Could not init RPC swap cursor: ${error.message}`);
   }
 
-  try {
-    const meta = await getPoolMeta(trackedPair.pairAddress);
-    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
-  } catch (error) {
-    console.warn(`Could not read pool fee: ${error.message}`);
-  }
-
   saveState(state);
   refreshWsSwapListener(state);
 
@@ -2533,7 +3590,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
-      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active)`,
+      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active · Uni ${escapeHtml((trackedPair.version || meta.version || "v3").toUpperCase())})`,
       `Đang track <b>${state.trackedPairs?.length || 1}/${config.maxTrackedTokens}</b>: ${escapeHtml(trackedNames)}`,
       `Chỉ theo dõi buy/sell realtime (≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}).`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
@@ -2747,8 +3804,9 @@ function tradeMessage(trade) {
   const baseSymbol = trade.baseSymbol || config.baseSymbol;
   const quoteSymbol = trade.quoteSymbol || config.quoteSymbol;
   const pairUrl = trade.pairUrl || config.dexscreenPairUrl;
+  const uni = String(trade.version || "").toUpperCase() === "V2" ? "Uniswap v2" : "Uniswap v3";
   return [
-    `<b>${sideLabel} ${escapeHtml(baseSymbol)}</b> on Robinhood Uniswap`,
+    `<b>${sideLabel} ${escapeHtml(baseSymbol)}</b> on Robinhood ${uni}`,
     `Amount: <b>${escapeHtml(formatUnits(trade.baseRaw, trade.baseDecimals, 4))} ${escapeHtml(baseSymbol)}</b>`,
     `Quote: <b>${escapeHtml(formatUnits(trade.quoteRaw, trade.quoteDecimals, 6))} ${escapeHtml(quoteSymbol)}</b> (${escapeHtml(formatUsd(trade.quoteUsdValue))})`,
     `Price: <b>${escapeHtml(formatUsd(trade.priceUsd))}</b>`,
@@ -2765,9 +3823,11 @@ async function resolveSellContext(tokenAddress, state = {}) {
   const fromBag = findBagItem(state, token);
   if (fromBag?.pairAddress) {
     let fee = config.uniswapV3Fee;
+    let version = "v3";
     try {
       const meta = await getPoolMeta(fromBag.pairAddress);
       if (Number.isFinite(meta.fee) && meta.fee > 0) fee = meta.fee;
+      if (meta.version) version = meta.version;
     } catch {
       // keep fee
     }
@@ -2779,6 +3839,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
       pairAddress: normalizeAddress(fromBag.pairAddress),
       pairUrl: fromBag.pairUrl || `https://dexscreener.com/robinhood/${fromBag.pairAddress}`,
       fee,
+      version,
       priceNative: Number.NaN,
       priceUsd: Number(fromBag.priceUsd),
       decimals: Number(fromBag.decimals) || 18,
@@ -2813,9 +3874,11 @@ async function resolveSellContext(tokenAddress, state = {}) {
   }
 
   let fee = config.uniswapV3Fee;
+  let version = tracked.version || "v3";
   try {
     const meta = await getPoolMeta(pairAddress);
     if (Number.isFinite(meta.fee) && meta.fee > 0) fee = meta.fee;
+    if (meta.version) version = meta.version;
   } catch {
     // keep current fee
   }
@@ -2828,6 +3891,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
     pairAddress,
     pairUrl,
     fee,
+    version,
     priceNative,
     priceUsd,
     decimals,
@@ -3484,6 +4548,22 @@ async function main() {
   const state = loadState();
   applyStateConfig(state);
 
+  // Probe tracked pools once — drop Dexscreener v4/wrong addresses that fail fee().
+  try {
+    for (const pair of [...watchedPairSet()]) {
+      try {
+        await getPoolMeta(pair);
+      } catch {
+        // markInvalidPool already recorded
+      }
+    }
+    if (pruneInvalidWatchPairs(state)) {
+      refreshWsSwapListener(state);
+    }
+  } catch (error) {
+    console.warn(`Pool probe skipped: ${error.message}`);
+  }
+
   try {
     await validateTelegramConfig();
   } catch (error) {
@@ -3622,6 +4702,8 @@ module.exports = {
   isRetryableFetchError,
   formatSwapError,
   findTrackedForPool,
+  isInvalidPool,
+  markInvalidPool,
   manageTrackedKeyboard,
   removeTrackedPair,
   trackedPairsList,
@@ -3641,6 +4723,7 @@ module.exports = {
   staticMainPanelText,
   trackedPairFromDexPair,
   tradeFromV3SwapLog,
+  tradeFromV2SwapLog,
   tradeMessage,
   tradeTimestampMs,
   bagSellKeyboard,
