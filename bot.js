@@ -103,7 +103,7 @@ const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
   telegramChatIds: parseTelegramChatIds(process.env.TELEGRAM_CHAT_ID || ""),
   telegramChatId: parseTelegramChatIds(process.env.TELEGRAM_CHAT_ID || "")[0] || "",
-  // Hardcoded brand — ignore stale Render BOT_TITLE env if set to old names.
+  // Hardcoded brand — ignore stale BOT_TITLE env if set to old names.
   botTitle: "Treasure_tradingbot",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
   // Prefer Alchemy/QuickNode HTTP derived from WSS when public Robinhood RPC is flaky.
@@ -1068,7 +1068,7 @@ function startHealthServer() {
     res.end("Telegram bot is running.\n");
   });
 
-  // Render Web Services probe 0.0.0.0:$PORT — binding localhost makes deploy hang.
+  // Health probe on 0.0.0.0:$PORT when PORT is set (e.g. cloud VM / container).
   server.listen(port, "0.0.0.0", () => {
     console.log(`Health server listening on 0.0.0.0:${port}.`);
   });
@@ -2259,7 +2259,7 @@ async function notifyUnauthorizedChat(chatId) {
       text: [
         "Chat này chưa được phép dùng bot.",
         `Chat ID của bạn: <code>${escapeHtml(key)}</code>`,
-        "Thêm ID này vào TELEGRAM_CHAT_ID trên Render (có thể nối nhiều ID bằng dấu phẩy).",
+        "Thêm ID này vào TELEGRAM_CHAT_ID trên server (có thể nối nhiều ID bằng dấu phẩy).",
         `Bot hiện chỉ chấp nhận: <code>${escapeHtml(config.telegramChatIds.join(", ") || "(chưa cấu hình)")}</code>`,
       ].join("\n"),
       parse_mode: "HTML",
@@ -2649,7 +2649,7 @@ async function validateTelegramConfig() {
   if (config.dryRun) return;
   if (isPlaceholderTelegramToken(config.telegramBotToken)) {
     throw new Error(
-      "Invalid TELEGRAM_BOT_TOKEN: value is empty or still uses 123456:replace_me. Set the real BotFather token in Render Environment.",
+      "Invalid TELEGRAM_BOT_TOKEN: value is empty or still uses 123456:replace_me. Set the real BotFather token in the server environment.",
     );
   }
   if (!config.telegramChatIds.length) throw new Error("Missing TELEGRAM_CHAT_ID.");
@@ -2662,7 +2662,7 @@ async function validateTelegramConfig() {
   } catch (error) {
     if (String(error.message).includes("401") || String(error.message).includes("Unauthorized")) {
       throw new Error(
-        `Telegram rejected TELEGRAM_BOT_TOKEN (${maskToken(config.telegramBotToken)}). Copy a fresh token from BotFather and update Render Environment.`,
+        `Telegram rejected TELEGRAM_BOT_TOKEN (${maskToken(config.telegramBotToken)}). Copy a fresh token from BotFather and update the server environment.`,
       );
     }
     throw error;
@@ -3913,7 +3913,7 @@ async function main() {
   try {
     await validateTelegramConfig();
   } catch (error) {
-    // Keep process alive so Render health checks can pass; Telegram loop will retry.
+    // Keep process alive so health checks can pass; Telegram loop will retry.
     console.error(`Telegram config validation failed: ${error.message}`);
     console.error("Health server stays up; bot will keep retrying Telegram access.");
   }

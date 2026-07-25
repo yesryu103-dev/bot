@@ -133,7 +133,6 @@ Token vua paste se luon duoc coi la token chinh: token do ra khoi pool = BUY, to
 ## Deploy
 
 - Google Cloud VM: xem `deploy/README_GCP.md`.
-- Render Background Worker: xem `deploy/README_RENDER.md`.
 
 ## Buy/sell mode
 
