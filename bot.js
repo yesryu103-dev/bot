@@ -639,9 +639,33 @@ function emitTradeAlertAsync(trade) {
     priceUsd: cache.priceUsd,
     ethUsd: Number.isFinite(cache.ethUsd) ? cache.ethUsd : dexTradePriceCache.ethUsd,
   });
+  if (!isSaneTradeAlert(priced)) {
+    console.warn(
+      `Skip junk alert ${priced?.txHash || ""} ${priced?.side} ${priced?.baseSymbol}: exec=${priced?.priceUsd} spot=${priced?.spotPriceUsd} quote=${priced?.quoteAmount}`,
+    );
+    return;
+  }
   enqueueTelegramAlert(tradeMessage(priced), mainMenuKeyboard());
   // Refresh price cache in background for the next alert.
   enrichTradePrices(trade).catch(() => {});
+}
+
+/** Drop aggregator mis-parses (e.g. GME/USDG hop labeled as GME/WETH at 10–100x chart price). */
+function isSaneTradeAlert(trade) {
+  const quote = Number(trade?.quoteAmount);
+  const base = Number(trade?.baseAmount);
+  const exec = Number(trade?.execPriceUsd ?? trade?.priceUsd);
+  const spot = Number(trade?.spotPriceUsd);
+  if (!(quote > 0) || !(base > 0)) return false;
+  // Must look like a real ETH size for our min filter.
+  const minQuote = Number(config.minQuoteAmount) || 1;
+  if (quote < minQuote * 0.95) return false;
+  if (Number.isFinite(spot) && spot > 0 && Number.isFinite(exec) && exec > 0) {
+    const ratio = exec / spot;
+    // Real pool swaps stay near spot; multi-hop mislabels often print 10x–100x.
+    if (ratio > 8 || ratio < 1 / 8) return false;
+  }
+  return true;
 }
 
 function claimSwapAlert(state, txHash) {
@@ -2001,10 +2025,10 @@ function findTrackedForPool(meta) {
   for (const entry of trackedPairsList()) {
     const base = normalizeAddress(entry.baseTokenAddress);
     const quote = normalizeAddress(entry.quoteTokenAddress);
-    if (
-      (meta.token0 === base || meta.token0 === quote) &&
-      (meta.token1 === base || meta.token1 === quote)
-    ) {
+    const t0 = normalizeAddress(meta?.token0);
+    const t1 = normalizeAddress(meta?.token1);
+    // Exact pool match only — never attach GME/USDG or other hubs to a GME/WETH track.
+    if ((t0 === base && t1 === quote) || (t0 === quote && t1 === base)) {
       return entry;
     }
   }
@@ -4094,6 +4118,10 @@ async function handleNewGroups(groups, state) {
       }
 
       if (trade) {
+        // Prefer WS Swap alerts; transfer heuristic often misreads UniversalRouter multi-hop.
+        if (isWsAlertHealthy()) {
+          continue;
+        }
         emitTradeAlertAsync(trade);
       }
     } catch (error) {
