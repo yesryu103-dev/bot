@@ -1343,17 +1343,18 @@ async function pickBestTradeRoute({
 }) {
   const { ethers } = require("ethers");
   const bestroute = require("./bestroute");
-  const candidates = [];
 
+  let v3Quote = null;
   try {
     const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, preferredFee);
     if (quoted?.amountOut > 0n) {
-      candidates.push({ kind: "v3", label: "Uni V3 WETH", amountOut: quoted.amountOut, fee: quoted.fee });
+      v3Quote = { kind: "v3", label: "Uni V3 WETH", amountOut: quoted.amountOut, fee: quoted.fee };
     }
   } catch (error) {
     console.warn(`V3 quote failed: ${error.message}`);
   }
 
+  let v4Meta = null;
   if (buyWithNativeEth || sellToNativeEth) {
     try {
       const pairs = await fetchTokenPairs(baseTokenAddress);
@@ -1362,41 +1363,106 @@ async function pickBestTradeRoute({
         const key =
           bestroute.recoverV4PoolKey(v4pool.pairAddress, baseTokenAddress, bestroute.NATIVE_ETH) ||
           bestroute.recoverV4PoolKey(v4pool.pairAddress, bestroute.NATIVE_ETH, baseTokenAddress);
-        let amountOut = 0n;
-        try {
-          amountOut = await bestroute.quoteViaDexPrice(v4pool.pairAddress, baseTokenAddress, side, amountIn);
-        } catch {
-          amountOut = 0n;
-        }
-        if (key && amountOut <= 0n) {
-          const tokenIs0 = normalizeAddress(key.currency0) === normalizeAddress(baseTokenAddress);
-          const zeroForOne = side === "SELL" ? tokenIs0 : !tokenIs0;
-          try {
-            amountOut = await bestroute.quoteV4ExactInSpot(provider, v4pool.pairAddress, zeroForOne, amountIn);
-            amountOut = (amountOut * 9965n) / 10000n;
-          } catch {
-            amountOut = 0n;
-          }
-        }
-        if (key && amountOut > 0n) {
-          candidates.push({
-            kind: "v4",
-            label: "Uni V4 ETH",
-            amountOut,
-            poolId: v4pool.pairAddress,
-            key,
-          });
+        if (key) {
+          v4Meta = { poolId: v4pool.pairAddress, key };
         }
       }
     } catch (error) {
-      console.warn(`V4 quote failed: ${error.message}`);
+      console.warn(`V4 pool lookup failed: ${error.message}`);
+    }
+  }
+
+  async function quoteV4Amount(partIn) {
+    if (!v4Meta || partIn <= 0n) return 0n;
+    let out = 0n;
+    try {
+      out = await bestroute.quoteViaDexPrice(v4Meta.poolId, baseTokenAddress, side, partIn);
+    } catch {
+      out = 0n;
+    }
+    if (out <= 0n) {
+      const tokenIs0 = normalizeAddress(v4Meta.key.currency0) === normalizeAddress(baseTokenAddress);
+      const zeroForOne = side === "SELL" ? tokenIs0 : !tokenIs0;
+      try {
+        out = await bestroute.quoteV4ExactInSpot(provider, v4Meta.poolId, zeroForOne, partIn);
+      } catch {
+        out = 0n;
+      }
+    }
+    return out;
+  }
+
+  async function quoteV3Amount(partIn) {
+    if (!v3Quote || partIn <= 0n) return 0n;
+    if (partIn === amountIn) return v3Quote.amountOut;
+    try {
+      const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, partIn, preferredFee);
+      return quoted?.amountOut > 0n ? quoted.amountOut : 0n;
+    } catch {
+      return 0n;
+    }
+  }
+
+  const candidates = [];
+  // Try pure pools + splits (like Uniswap UI) — pick max ETH/token out.
+  const ratios = buyWithNativeEth || sellToNativeEth ? [0, 25, 50, 75, 100] : [100];
+  for (const pctV3 of ratios) {
+    const part3 = (amountIn * BigInt(pctV3)) / 100n;
+    const part4 = amountIn - part3;
+    if (part3 > 0n && !v3Quote) continue;
+    if (part4 > 0n && !v4Meta) continue;
+    const out3 = await quoteV3Amount(part3);
+    const out4 = await quoteV4Amount(part4);
+    const total = out3 + out4;
+    if (total <= 0n) continue;
+    if (pctV3 === 100) {
+      candidates.push({ ...v3Quote, amountOut: total });
+    } else if (pctV3 === 0) {
+      candidates.push({
+        kind: "v4",
+        label: "Uni V4 ETH",
+        amountOut: total,
+        poolId: v4Meta.poolId,
+        key: v4Meta.key,
+      });
+    } else {
+      // Split: execute the larger leg only for now (atomic split needs more UR wiring).
+      // Prefer the single pool that alone quotes closest to this split total.
+      const pure3 = v3Quote?.amountOut || 0n;
+      const pure4 = await quoteV4Amount(amountIn);
+      if (pure4 >= pure3 && pure4 > 0n) {
+        candidates.push({
+          kind: "v4",
+          label: `Uni V4 ETH (~${100 - pctV3}% split-aware)`,
+          amountOut: pure4 > total ? pure4 : total,
+          poolId: v4Meta.poolId,
+          key: v4Meta.key,
+        });
+      } else if (pure3 > 0n) {
+        candidates.push({
+          kind: "v3",
+          label: `Uni V3 WETH (~${pctV3}% split-aware)`,
+          amountOut: pure3 > total ? pure3 : total,
+          fee: v3Quote.fee,
+        });
+      }
     }
   }
 
   candidates.sort((a, b) => (a.amountOut < b.amountOut ? 1 : a.amountOut > b.amountOut ? -1 : 0));
-  if (!candidates.length) throw new Error("No V3/V4 quote available. Try again in a few seconds.");
-  const best = candidates[0];
-  const alt = candidates[1];
+  // Dedupe by kind keeping highest out
+  const seen = new Set();
+  const uniq = [];
+  for (const c of candidates) {
+    const k = c.kind;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(c);
+  }
+  uniq.sort((a, b) => (a.amountOut < b.amountOut ? 1 : a.amountOut > b.amountOut ? -1 : 0));
+  if (!uniq.length) throw new Error("No V3/V4 quote available. Try again in a few seconds.");
+  const best = uniq[0];
+  const alt = uniq[1];
   console.log(
     alt
       ? `Best route ${best.label} out=${ethers.formatEther(best.amountOut)} > ${alt.label} out=${ethers.formatEther(alt.amountOut)}`

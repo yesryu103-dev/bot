@@ -128,14 +128,14 @@ async function quoteViaDexPrice(poolId, tokenAddress, side, amountIn) {
   if (!(ethPerToken > 0) || !Number.isFinite(ethPerToken)) {
     throw new Error("Invalid v4 ethPerToken quote.");
   }
-  // Mid-price haircut ~0.35% so minOut is not optimistic vs chart.
+  // Mid price — slippage is applied by caller (minOut). Do not double-haircut here.
   if (side === "BUY") {
     const eth = Number(ethers.formatEther(amountIn));
-    const tokens = (eth / ethPerToken) * 0.9965;
+    const tokens = eth / ethPerToken;
     return ethers.parseUnits(Math.max(tokens, 0).toFixed(12), 18);
   }
   const tokens = Number(ethers.formatUnits(amountIn, 18));
-  const eth = tokens * ethPerToken * 0.9965;
+  const eth = tokens * ethPerToken;
   return ethers.parseEther(Math.max(eth, 0).toFixed(18));
 }
 
