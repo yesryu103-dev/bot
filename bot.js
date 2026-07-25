@@ -46,32 +46,41 @@ function normalizeAddress(value) {
 
 /** Official Robinhood Uniswap v3 SwapRouter (exactInputSingle). */
 const SWAP_ROUTER_V3 = "0xcaf681a66d020601342297493863e78c959e5cb2";
-/** Known UniversalRouter — multi-hop / many transfers; never use for bot trades. */
-const UNIVERSAL_ROUTER_BLOCKLIST = new Set(["0x8876789976decbfcbbbe364623c63652db8c0904"]);
+/** UniversalRouter — only for direct Uni V4 ETH single-hop (never USDG multi-hop). */
+const UNIVERSAL_ROUTER_V4 = "0x8876789976decbfcbbbe364623c63652db8c0904";
 
 function resolveSwapRouterAddress() {
   const raw = normalizeAddress(process.env.SWAP_ROUTER_ADDRESS || SWAP_ROUTER_V3);
-  if (!raw || UNIVERSAL_ROUTER_BLOCKLIST.has(raw)) {
-    if (UNIVERSAL_ROUTER_BLOCKLIST.has(raw)) {
-      console.warn(`Blocked UniversalRouter ${raw}; using SwapRouter v3 ${SWAP_ROUTER_V3}`);
+  if (!raw || raw === UNIVERSAL_ROUTER_V4) {
+    if (raw === UNIVERSAL_ROUTER_V4) {
+      console.warn(`SWAP_ROUTER_ADDRESS is UniversalRouter; forcing SwapRouter v3 ${SWAP_ROUTER_V3}`);
     }
     return SWAP_ROUTER_V3;
   }
   return raw;
 }
 
-function assertV3SwapRouterTx(tx) {
+function assertTradeTx(tx, mode = "v3") {
   const to = normalizeAddress(tx?.to);
+  const selector = String(tx?.data || "").slice(0, 10).toLowerCase();
+  if (mode === "v4") {
+    if (to !== UNIVERSAL_ROUTER_V4) {
+      throw new Error(`Trade abort: v4 tx.to=${to || "?"} ≠ UniversalRouter ${UNIVERSAL_ROUTER_V4}`);
+    }
+    if (selector !== "0x3593564c") {
+      throw new Error("Trade abort: v4 route must call UniversalRouter execute.");
+    }
+    if (String(tx?.data || "").toLowerCase().includes("5fc5360d0400a0fd4f2af552add042d716f1d168")) {
+      throw new Error("Trade abort: blocked USDG hub path.");
+    }
+    return;
+  }
   const expected = normalizeAddress(config.swapRouterAddress || SWAP_ROUTER_V3);
   if (!to || to !== expected) {
-    throw new Error(
-      `Trade abort: tx.to=${to || "?"} không phải SwapRouter v3 ${expected}. Không gửi UniversalRouter multi-hop.`,
-    );
+    throw new Error(`Trade abort: tx.to=${to || "?"} is not SwapRouter v3 ${expected}.`);
   }
-  const selector = String(tx?.data || "").slice(0, 10).toLowerCase();
-  // UniversalRouter execute(bytes,bytes[])
   if (selector === "0x3593564c") {
-    throw new Error("Trade abort: calldata là UniversalRouter execute — bot chỉ dùng exactInputSingle/multicall v3.");
+    throw new Error("Trade abort: v3 path must not use UniversalRouter execute.");
   }
 }
 
@@ -1321,6 +1330,81 @@ async function readTokenDecimals(tokenAddress, provider, fallback = 18) {
   return fallback;
 }
 
+async function pickBestTradeRoute({
+  provider,
+  side,
+  baseTokenAddress,
+  tokenIn,
+  tokenOut,
+  amountIn,
+  preferredFee,
+  buyWithNativeEth,
+  sellToNativeEth,
+}) {
+  const { ethers } = require("ethers");
+  const bestroute = require("./bestroute");
+  const candidates = [];
+
+  try {
+    const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, preferredFee);
+    if (quoted?.amountOut > 0n) {
+      candidates.push({ kind: "v3", label: "Uni V3 WETH", amountOut: quoted.amountOut, fee: quoted.fee });
+    }
+  } catch (error) {
+    console.warn(`V3 quote failed: ${error.message}`);
+  }
+
+  if (buyWithNativeEth || sellToNativeEth) {
+    try {
+      const pairs = await fetchTokenPairs(baseTokenAddress);
+      const v4pool = bestroute.pickV4EthPool(pairs, baseTokenAddress);
+      if (v4pool?.pairAddress && bestroute.isV4PoolId(v4pool.pairAddress)) {
+        const key =
+          bestroute.recoverV4PoolKey(v4pool.pairAddress, baseTokenAddress, bestroute.NATIVE_ETH) ||
+          bestroute.recoverV4PoolKey(v4pool.pairAddress, bestroute.NATIVE_ETH, baseTokenAddress);
+        let amountOut = 0n;
+        try {
+          amountOut = await bestroute.quoteViaDexPrice(v4pool.pairAddress, baseTokenAddress, side, amountIn);
+        } catch {
+          amountOut = 0n;
+        }
+        if (key && amountOut <= 0n) {
+          const tokenIs0 = normalizeAddress(key.currency0) === normalizeAddress(baseTokenAddress);
+          const zeroForOne = side === "SELL" ? tokenIs0 : !tokenIs0;
+          try {
+            amountOut = await bestroute.quoteV4ExactInSpot(provider, v4pool.pairAddress, zeroForOne, amountIn);
+            amountOut = (amountOut * 9965n) / 10000n;
+          } catch {
+            amountOut = 0n;
+          }
+        }
+        if (key && amountOut > 0n) {
+          candidates.push({
+            kind: "v4",
+            label: "Uni V4 ETH",
+            amountOut,
+            poolId: v4pool.pairAddress,
+            key,
+          });
+        }
+      }
+    } catch (error) {
+      console.warn(`V4 quote failed: ${error.message}`);
+    }
+  }
+
+  candidates.sort((a, b) => (a.amountOut < b.amountOut ? 1 : a.amountOut > b.amountOut ? -1 : 0));
+  if (!candidates.length) throw new Error("No V3/V4 quote available. Try again in a few seconds.");
+  const best = candidates[0];
+  const alt = candidates[1];
+  console.log(
+    alt
+      ? `Best route ${best.label} out=${ethers.formatEther(best.amountOut)} > ${alt.label} out=${ethers.formatEther(alt.amountOut)}`
+      : `Best route ${best.label} out=${ethers.formatEther(best.amountOut)}`,
+  );
+  return best;
+}
+
 async function executeSwap(side, amountText, overrides = {}) {
   if (!config.tradeEnabled) {
     throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 sau khi cấu hình RPC_URL và WALLET_PRIVATE_KEY.");
@@ -1398,12 +1482,98 @@ async function executeSwap(side, amountText, overrides = {}) {
   if (buyWithNativeEth) await assertNativeEthForBuy(wallet, amountIn);
   else await assertEthForGas(wallet, side);
 
-  // Fresh quote immediately before send — reduces revert from stale price.
-  let quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, swapFee);
-  swapFee = quoted.fee;
-  let minOut = (quoted.amountOut * BigInt(10000 - slipBps)) / 10000n;
+  const best = await pickBestTradeRoute({
+    provider,
+    side,
+    baseTokenAddress,
+    tokenIn,
+    tokenOut,
+    amountIn,
+    preferredFee: swapFee,
+    buyWithNativeEth,
+    sellToNativeEth,
+  });
+  let minOut = (best.amountOut * BigInt(10000 - slipBps)) / 10000n;
   if (minOut <= 0n) throw new Error("Quote minOut is zero — amount too small or pool illiquid.");
   const payValue = buyWithNativeEth ? amountIn : 0n;
+  let routeLabel = best.label;
+
+  if (best.kind === "v4") {
+    const bestroute = require("./bestroute");
+    const key = best.key;
+    const tokenIs0 = normalizeAddress(key.currency0) === normalizeAddress(baseTokenAddress);
+    const zeroForOne = side === "SELL" ? tokenIs0 : !tokenIs0;
+    const v4TokenIn = side === "BUY" ? bestroute.NATIVE_ETH : baseTokenAddress;
+    const v4TokenOut = side === "BUY" ? baseTokenAddress : bestroute.NATIVE_ETH;
+    const deadline = Math.floor(Date.now() / 1000) + 300;
+    let useV4 = true;
+
+    if (side === "SELL") {
+      await bestroute.ensurePermit2(wallet, baseTokenAddress, UNIVERSAL_ROUTER_V4, amountIn);
+    }
+
+    const data = bestroute.encodeExactInputSingle({
+      key,
+      zeroForOne,
+      tokenIn: v4TokenIn,
+      tokenOut: v4TokenOut,
+      amountIn,
+      minAmountOut: minOut,
+      deadline,
+    });
+
+    try {
+      await rpcCall("simulate v4", () =>
+        provider.call({ from: wallet.address, to: UNIVERSAL_ROUTER_V4, data, value: payValue }),
+      );
+    } catch (simError) {
+      console.warn(`V4 simulate failed (${simError.message}); falling back to V3.`);
+      useV4 = false;
+      const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, swapFee);
+      swapFee = quoted.fee;
+      minOut = (quoted.amountOut * BigInt(10000 - slipBps)) / 10000n;
+      routeLabel = "Uni V3 WETH";
+    }
+
+    if (useV4) {
+      const gasOverrides = await resolveTradeGasOverrides(provider, {
+        to: UNIVERSAL_ROUTER_V4,
+        data,
+        from: wallet.address,
+        value: payValue,
+      });
+      const tx = await rpcCall("v4 execute", () =>
+        wallet.sendTransaction({ to: UNIVERSAL_ROUTER_V4, data, value: payValue, ...gasOverrides }),
+      );
+      assertTradeTx(tx, "v4");
+      return {
+        hash: tx.hash,
+        wallet: wallet.address,
+        tokenInSymbol,
+        tokenOutSymbol: sellToNativeEth ? "ETH" : tokenOutSymbol,
+        minOut: ethers.formatUnits(minOut, decimalsOut),
+        paidNative: buyWithNativeEth ? ethers.formatEther(payValue) : "",
+        receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
+        routeLabel,
+        confirm: async () => {
+          try {
+            const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `confirm ${tx.hash}`);
+            if (!receipt || Number(receipt.status) !== 1) {
+              throw new Error(`Swap reverted on-chain. Tx: ${tx.hash}`);
+            }
+            return receipt;
+          } catch (error) {
+            const hash = extractTxHash(tx.hash, error);
+            throw new Error(
+              hash ? `Swap reverted on-chain. Tx: ${hash}. ${formatSwapError(error)}` : formatSwapError(error),
+            );
+          }
+        },
+      };
+    }
+  }
+
+  if (best.kind === "v3" && Number.isFinite(best.fee)) swapFee = best.fee;
 
   if (!buyWithNativeEth) {
     const balance =
@@ -1445,14 +1615,12 @@ async function executeSwap(side, amountText, overrides = {}) {
 
   const buildCalldata = () => {
     if (sellToNativeEth) {
-      // Single-hop v3 swap + unwrap only. Do NOT use UniversalRouter multi-hop (expensive / many transfers).
       const params = { ...swapParams, recipient: config.swapRouterAddress };
       return {
         method: "multicall",
         args: [
           [
             router.interface.encodeFunctionData("exactInputSingle", [params]),
-            // amountMinimum=0: swap already enforced minOut; unwrap whatever WETH arrived.
             router.interface.encodeFunctionData("unwrapWETH9", [0n, wallet.address]),
           ],
         ],
@@ -1481,9 +1649,8 @@ async function executeSwap(side, amountText, overrides = {}) {
       await rpcCall("simulate swap", () => router.exactInputSingle.staticCall(swapParams));
     }
   } catch (simError) {
-    // One retry with a fresher quote at the same slippage.
     try {
-      quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, swapFee);
+      const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, swapFee);
       swapFee = quoted.fee;
       minOut = (quoted.amountOut * BigInt(10000 - slipBps)) / 10000n;
       swapParams.fee = swapFee;
@@ -1524,7 +1691,7 @@ async function executeSwap(side, amountText, overrides = {}) {
         ? router.multicall(...call.args, sendOverrides)
         : router.exactInputSingle(...call.args, sendOverrides),
     );
-    assertV3SwapRouterTx(tx);
+    assertTradeTx(tx, "v3");
   } catch (error) {
     throw new Error(formatSwapError(error));
   }
@@ -1537,6 +1704,7 @@ async function executeSwap(side, amountText, overrides = {}) {
     minOut: ethers.formatUnits(minOut, decimalsOut),
     paidNative: buyWithNativeEth ? ethers.formatEther(payValue) : "",
     receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
+    routeLabel,
     // Confirm separately so Telegram can show the tx hash immediately (OKX-like feel).
     confirm: async () => {
       try {
@@ -3313,6 +3481,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
             result.paidNative ? `Paid: <b>${escapeHtml(result.paidNative)} ETH</b>` : "",
             `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
             `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
+            `Route: <b>${escapeHtml(result.routeLabel || "Uni V3")}</b>`,
             `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
             result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
           ]
@@ -3383,6 +3552,7 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
             `<b>SELL ${escapeHtml(ctx.baseSymbol)} sent</b>`,
             `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
             `Wallet: <code>${escapeHtml(compactAddress(result.wallet))}</code>`,
+            `Route: <b>${escapeHtml(result.routeLabel || "Uni V3")}</b>`,
             `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
             result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
             `Track alerts vẫn: <b>${escapeHtml(config.baseSymbol)}</b>`,
@@ -3479,6 +3649,7 @@ async function sendTextTrade(chatId, state, side, amount) {
             `<b>${escapeHtml(side)} sent</b>`,
             result.paidNative ? `Paid: <b>${escapeHtml(result.paidNative)} ETH</b>` : "",
             `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+            `Route: <b>${escapeHtml(result.routeLabel || "Uni V3")}</b>`,
             `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
             result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
           ]
@@ -3904,7 +4075,7 @@ async function bootState(state) {
 
 async function main() {
   console.log("Starting robinhood-telegram-bot...");
-  console.log(`Trade router: SwapRouter v3 ${config.swapRouterAddress} (exactInputSingle only).`);
+  console.log(`Trade router: best of Uni V3 SwapRouter / Uni V4 ETH (no USDG hub).`);
   startHealthServer();
 
   const state = loadState();
