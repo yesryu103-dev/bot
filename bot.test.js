@@ -857,7 +857,38 @@ test("paste-token trade pair prefers deepest V4 ETH over thinner V3", () => {
   );
 
   const tracked = bot.trackedPairFromDexPair(selected.pair, token);
+  tracked.tradeRoute = "v4";
+  tracked.v4TradePoolId = selected.pair.pairAddress;
+  tracked.pairAddress = selected.pair.pairAddress;
+  tracked.watchPairAddresses = ["0x09a431261eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"];
+  bot.normalizeAlertWatch(tracked);
+  assert.equal(tracked.tradeRoute, "v4");
+  assert.deepEqual(tracked.watchPairAddresses, []);
+  assert.equal(tracked.v4TradePoolId, selected.pair.pairAddress.toLowerCase());
   assert.equal(tracked.baseSymbol, "FRONG");
   assert.equal(tracked.quoteTokenAddress, bot.config.quoteTokenAddress);
   assert.notEqual(tracked.quoteTokenAddress, "0x0000000000000000000000000000000000000000");
+});
+
+test("V4 track is excluded from V3 watch set (deepest pool only)", () => {
+  const prev = bot.config.trackedPairs;
+  const poolId = "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a";
+  const v3 = "0x09a431261eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  bot.config.trackedPairs = [
+    {
+      tradeRoute: "v4",
+      pairAddress: poolId,
+      v4TradePoolId: poolId,
+      baseTokenAddress: "0x6245e67affa44a23077f0ea7f981a8dc743a0c47",
+      baseSymbol: "FRONG",
+      quoteTokenAddress: bot.config.quoteTokenAddress,
+      quoteSymbol: "WETH",
+      watchPairAddresses: [v3],
+    },
+  ];
+  bot.normalizeAlertWatch(bot.config.trackedPairs[0]);
+  const watched = [...bot.watchedPairSet()];
+  assert.equal(watched.includes(v3), false);
+  assert.equal(watched.includes(poolId), false);
+  bot.config.trackedPairs = prev;
 });

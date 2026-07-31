@@ -558,7 +558,7 @@ function handleLiveV4SwapEvent({ poolId, sender, amount0, amount1, txHash, block
     sender,
   });
   if (!trade) {
-    claimSwapAlert(state, hash);
+    // Below min — leave tx unset so a larger hop in the same tx can still alert.
     return;
   }
   if (!claimSwapAlert(state, hash)) return;
@@ -603,6 +603,88 @@ async function pollRpcSwaps(state, options = {}) {
   const lookback = Math.max(20, Number(options.lookbackBlocks ?? configuredLookback));
   const light = Boolean(options.light);
   const alerted = [];
+
+  // Process V4 deepest pools BEFORE thin V3 watches so a multi-hop tx (V3 dust + V4 whale)
+  // alerts on the real size instead of getting poisoned by a below-min V3 hop.
+  const v4Manager = config.v4PoolManagerAddress;
+  const v4Ids = [...watchedV4PoolSet()];
+  if (config.enableV4 && isEvmAddress(v4Manager) && v4Ids.length) {
+    const v4Iface = new ethers.Interface([
+      "event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)",
+    ]);
+    const v4Topic = v4Iface.getEvent("Swap").topicHash;
+    const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
+
+    for (const poolId of v4Ids) {
+      const cursorKey = `v4:${poolId}`;
+      let fromBlock = Number(state.swapBlocks[cursorKey] || 0);
+      if (!fromBlock || fromBlock < latest - lookback) fromBlock = latest - lookback;
+      if (fromBlock >= latest) {
+        state.swapBlocks[cursorKey] = latest;
+        continue;
+      }
+
+      const tracked = findTrackedForV4Pool(poolId);
+      if (!tracked) {
+        state.swapBlocks[cursorKey] = latest;
+        continue;
+      }
+      const key = resolveV4PoolKey(poolId, tracked.baseTokenAddress);
+      if (!key) {
+        state.swapBlocks[cursorKey] = latest;
+        continue;
+      }
+
+      let logs = [];
+      let scannedTo = fromBlock;
+      try {
+        for (let start = fromBlock + 1; start <= latest; start += maxRange) {
+          const end = Math.min(latest, start + maxRange - 1);
+          const chunk = await provider.getLogs({
+            address: v4Manager,
+            fromBlock: start,
+            toBlock: end,
+            topics: [v4Topic, poolId],
+          });
+          if (chunk.length) logs = logs.concat(chunk);
+          scannedTo = end;
+        }
+      } catch (error) {
+        if (scannedTo > fromBlock) state.swapBlocks[cursorKey] = scannedTo;
+        if (now - (pollRpcSwaps._lastLogsWarnAt || 0) > 60_000) {
+          console.warn(`RPC V4 getLogs failed for ${compactAddress(poolId)}: ${error.message}`);
+          pollRpcSwaps._lastLogsWarnAt = now;
+        }
+        continue;
+      }
+
+      for (const log of logs) {
+        const txHash = String(log.transactionHash || "").toLowerCase();
+        if (!txHash || seen.has(txHash)) continue;
+        let parsed;
+        try {
+          parsed = v4Iface.parseLog(log);
+        } catch {
+          continue;
+        }
+        const trade = tradeFromV4SwapLog({
+          amount0: parsed.args.amount0,
+          amount1: parsed.args.amount1,
+          key,
+          baseToken: tracked.baseTokenAddress,
+          txHash,
+          blockNumber: Number(log.blockNumber || 0),
+          timestampMs: now,
+          sender: parsed.args.sender,
+        });
+        if (!trade) continue;
+        alerted.push(txHash);
+        seen.add(txHash);
+        emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
+      }
+      state.swapBlocks[cursorKey] = latest;
+    }
+  }
 
   for (const pair of watchedPairSet()) {
     let fromBlock = Number(state.swapBlocks[pair] || 0);
@@ -703,10 +785,7 @@ async function pollRpcSwaps(state, options = {}) {
         timestampMs: tsMs,
         recipient: parsed.args.recipient,
       });
-      if (!trade) {
-        seen.add(txHash);
-        continue;
-      }
+      if (!trade) continue;
       alerted.push(txHash);
       seen.add(txHash);
       // Non-blocking: enrich + Telegram queue so RPC poll stays fast.
@@ -714,90 +793,6 @@ async function pollRpcSwaps(state, options = {}) {
     }
 
     state.swapBlocks[pair] = latest;
-  }
-
-  // Uni V4 PoolManager swaps for deepest V4 tracks (e.g. FRONG).
-  const v4Manager = config.v4PoolManagerAddress;
-  const v4Ids = [...watchedV4PoolSet()];
-  if (config.enableV4 && isEvmAddress(v4Manager) && v4Ids.length) {
-    const v4Iface = new ethers.Interface([
-      "event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)",
-    ]);
-    const v4Topic = v4Iface.getEvent("Swap").topicHash;
-    const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
-
-    for (const poolId of v4Ids) {
-      const cursorKey = `v4:${poolId}`;
-      let fromBlock = Number(state.swapBlocks[cursorKey] || 0);
-      if (!fromBlock || fromBlock < latest - lookback) fromBlock = latest - lookback;
-      if (fromBlock >= latest) {
-        state.swapBlocks[cursorKey] = latest;
-        continue;
-      }
-
-      const tracked = findTrackedForV4Pool(poolId);
-      if (!tracked) {
-        state.swapBlocks[cursorKey] = latest;
-        continue;
-      }
-      const key = resolveV4PoolKey(poolId, tracked.baseTokenAddress);
-      if (!key) {
-        state.swapBlocks[cursorKey] = latest;
-        continue;
-      }
-
-      let logs = [];
-      let scannedTo = fromBlock;
-      try {
-        for (let start = fromBlock + 1; start <= latest; start += maxRange) {
-          const end = Math.min(latest, start + maxRange - 1);
-          const chunk = await provider.getLogs({
-            address: v4Manager,
-            fromBlock: start,
-            toBlock: end,
-            topics: [v4Topic, poolId],
-          });
-          if (chunk.length) logs = logs.concat(chunk);
-          scannedTo = end;
-        }
-      } catch (error) {
-        if (scannedTo > fromBlock) state.swapBlocks[cursorKey] = scannedTo;
-        if (now - (pollRpcSwaps._lastLogsWarnAt || 0) > 60_000) {
-          console.warn(`RPC V4 getLogs failed for ${compactAddress(poolId)}: ${error.message}`);
-          pollRpcSwaps._lastLogsWarnAt = now;
-        }
-        continue;
-      }
-
-      for (const log of logs) {
-        const txHash = String(log.transactionHash || "").toLowerCase();
-        if (!txHash || seen.has(txHash)) continue;
-        let parsed;
-        try {
-          parsed = v4Iface.parseLog(log);
-        } catch {
-          continue;
-        }
-        const trade = tradeFromV4SwapLog({
-          amount0: parsed.args.amount0,
-          amount1: parsed.args.amount1,
-          key,
-          baseToken: tracked.baseTokenAddress,
-          txHash,
-          blockNumber: Number(log.blockNumber || 0),
-          timestampMs: now,
-          sender: parsed.args.sender,
-        });
-        if (!trade) {
-          seen.add(txHash);
-          continue;
-        }
-        alerted.push(txHash);
-        seen.add(txHash);
-        emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
-      }
-      state.swapBlocks[cursorKey] = latest;
-    }
   }
 
   if (alerted.length) addSeen(state, alerted);
@@ -988,8 +983,8 @@ function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockN
       recipient,
     });
     if (!trade) {
-      // Below threshold / invalid — mark seen so HTTP catch-up does not re-alert junk.
-      claimSwapAlert(state, hash);
+      // Below min size — do NOT mark tx seen. Same tx often also hits a deeper V4 pool
+      // (e.g. FRONG V3 dust hop + V4 1+ ETH) and must still alert.
       return;
     }
     if (!claimSwapAlert(state, hash)) return;
@@ -2400,6 +2395,43 @@ function isV4PoolId(value) {
   return /^0x[a-fA-F0-9]{64}$/.test(String(value || "").trim());
 }
 
+/** One alert feed per token: deepest V4 ETH pool XOR one Uni V3 WETH pool — never both. */
+function normalizeAlertWatch(trackedPair) {
+  if (!trackedPair) return trackedPair;
+  const route =
+    trackedPair.tradeRoute === "v4" ||
+    isV4PoolId(trackedPair.pairAddress) ||
+    isV4PoolId(trackedPair.v4TradePoolId)
+      ? "v4"
+      : "v3";
+  trackedPair.tradeRoute = route;
+
+  if (route === "v4") {
+    const poolId = normalizeAddress(
+      isV4PoolId(trackedPair.v4TradePoolId)
+        ? trackedPair.v4TradePoolId
+        : isV4PoolId(trackedPair.pairAddress)
+          ? trackedPair.pairAddress
+          : "",
+    );
+    trackedPair.v4TradePoolId = poolId;
+    if (poolId) trackedPair.pairAddress = poolId;
+    // Never also listen a thin V3 hop — same tx used to poison seen[] and drop the whale.
+    trackedPair.watchPairAddresses = [];
+  } else {
+    trackedPair.v4TradePoolId = "";
+    const primary = normalizeAddress(trackedPair.pairAddress);
+    const fromWatch = (trackedPair.watchPairAddresses || [])
+      .map(normalizeAddress)
+      .filter((address) => isEvmAddress(address) && !isV4PoolId(address));
+    const one =
+      (isEvmAddress(primary) && !isV4PoolId(primary) ? primary : "") || fromWatch[0] || "";
+    trackedPair.watchPairAddresses = one ? [one] : [];
+    if (one) trackedPair.pairAddress = one;
+  }
+  return trackedPair;
+}
+
 function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") {
   const token = normalizeAddress(tokenAddress);
   const primary = normalizeAddress(primaryPairAddress);
@@ -2492,22 +2524,45 @@ function watchedPairSet(settings = config) {
   if (settings === config) {
     const set = new Set();
     for (const entry of trackedPairsList()) {
-      const list = entry.watchPairAddresses?.length ? entry.watchPairAddresses : [entry.pairAddress];
-      for (const address of list || []) addSafe(set, address);
+      // V4 deepest tracks listen only on PoolManager (watchedV4PoolSet) — skip V3.
+      if (
+        entry?.tradeRoute === "v4" ||
+        isV4PoolId(entry?.pairAddress) ||
+        isV4PoolId(entry?.v4TradePoolId)
+      ) {
+        continue;
+      }
+      const primary = normalizeAddress(entry?.pairAddress);
+      if (isEvmAddress(primary) && !isV4PoolId(primary)) {
+        addSafe(set, primary);
+        continue;
+      }
+      const first = (entry?.watchPairAddresses || [])
+        .map(normalizeAddress)
+        .find((address) => isEvmAddress(address) && !isV4PoolId(address));
+      if (first) addSafe(set, first);
     }
     if (!set.size) addSafe(set, config.pairAddress);
     return set;
   }
-  const list = settings.watchPairAddresses?.length
-    ? settings.watchPairAddresses
-    : [settings.pairAddress];
+  if (settings?.tradeRoute === "v4" || isV4PoolId(settings?.pairAddress) || isV4PoolId(settings?.v4TradePoolId)) {
+    return new Set();
+  }
+  const primary = normalizeAddress(settings?.pairAddress);
   const set = new Set();
-  for (const address of list || []) addSafe(set, address);
+  if (isEvmAddress(primary) && !isV4PoolId(primary)) addSafe(set, primary);
+  else {
+    const first = (settings?.watchPairAddresses || [])
+      .map(normalizeAddress)
+      .find((address) => isEvmAddress(address) && !isV4PoolId(address));
+    if (first) addSafe(set, first);
+  }
   return set;
 }
 
 function applyTrackedPair(trackedPair) {
   if (!trackedPair?.pairAddress || !trackedPair?.baseTokenAddress) return;
+  normalizeAlertWatch(trackedPair);
   const wrappedQuote = resolveWrappedQuote(trackedPair.quoteTokenAddress, trackedPair.quoteSymbol);
   if (!wrappedQuote.address) return;
 
@@ -2525,17 +2580,18 @@ function applyTrackedPair(trackedPair) {
   config.v4TradePoolId = normalizeAddress(
     trackedPair.v4TradePoolId || (isV4PoolId(trackedPair.pairAddress) ? trackedPair.pairAddress : ""),
   );
-  config.watchPairAddresses = (trackedPair.watchPairAddresses || [])
-    .map(normalizeAddress)
-    .filter((address) => isEvmAddress(address) && !isV4PoolId(address));
-  if (isEvmAddress(config.pairAddress) && !isV4PoolId(config.pairAddress)) {
-    if (!config.watchPairAddresses.includes(config.pairAddress)) {
-      config.watchPairAddresses = [config.pairAddress, ...config.watchPairAddresses];
-    }
-  }
+  // Active token: at most one V3 watch address (empty when V4 deepest).
+  config.watchPairAddresses =
+    config.tradeRoute === "v4"
+      ? []
+      : (trackedPair.watchPairAddresses || [])
+          .map(normalizeAddress)
+          .filter((address) => isEvmAddress(address) && !isV4PoolId(address))
+          .slice(0, 1);
 }
 
 function upsertTrackedPair(state, trackedPair) {
+  normalizeAlertWatch(trackedPair);
   const token = normalizeAddress(trackedPair.baseTokenAddress);
   const current = Array.isArray(state.trackedPairs) && state.trackedPairs.length
     ? state.trackedPairs
@@ -2585,7 +2641,10 @@ function applyStateConfig(state) {
     : state.trackedPair
       ? [state.trackedPair]
       : [];
-  config.trackedPairs = list.filter((entry) => entry?.pairAddress && entry?.baseTokenAddress);
+  for (const entry of list) normalizeAlertWatch(entry);
+  state.trackedPairs = list.filter((entry) => entry?.pairAddress && entry?.baseTokenAddress);
+  if (state.trackedPair) normalizeAlertWatch(state.trackedPair);
+  config.trackedPairs = state.trackedPairs;
   applyTrackedPair(state.trackedPair || config.trackedPairs[0]);
 }
 
@@ -3767,7 +3826,7 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
   trackedPair.tradeRoute = tradeRoute;
   const dexVer =
     options.dexVer ||
-    (forced ? "Uni V3 · forced pool" : tradeRoute === "v4" ? "Uni V4 ETH · deepest" : "Uni V3");
+    (forced ? "Uni V3 · forced pool" : tradeRoute === "v4" ? "Uni V4 ETH · deepest" : "Uni V3 · deepest");
 
   if (tradeRoute === "v4") {
     trackedPair.v4TradePoolId = isV4PoolId(trackedPair.pairAddress)
@@ -3779,9 +3838,6 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
     trackedPair.v4AlertQuote = "";
     trackedPair.v4RouteMode = "eth";
     trackedPair.v4BridgeToken = "";
-    trackedPair.watchPairAddresses = (trackedPair.watchPairAddresses || [])
-      .map(normalizeAddress)
-      .filter((address) => isEvmAddress(address) && !isV4PoolId(address));
   } else {
     trackedPair.v4Meta = null;
     trackedPair.v4TradeKey = null;
@@ -3794,6 +3850,7 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
       trackedPair.watchPairAddresses = isEvmAddress(trackedPair.pairAddress) ? [trackedPair.pairAddress] : [];
     }
   }
+  normalizeAlertWatch(trackedPair);
 
   upsertTrackedPair(state, trackedPair);
 
@@ -3821,22 +3878,19 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
   const liqNote = Number.isFinite(Number(options.liquidityUsd)) && Number(options.liquidityUsd) > 0
     ? ` · liq ~$${Math.round(Number(options.liquidityUsd)).toLocaleString("en-US")}`
     : "";
+  const listenLine =
+    tradeRoute === "v4"
+      ? `Listen: <b>1 pool</b> Uni V4 ETH (deepest)${escapeHtml(liqNote)}`
+      : `Listen: <b>1 pool</b> Uni V3 WETH (deepest)${escapeHtml(liqNote)}`;
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
       `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active · ${escapeHtml(dexVer)}${escapeHtml(liqNote)})`,
       `Đang track <b>${state.trackedPairs?.length || 1}/${config.maxTrackedTokens}</b>: ${escapeHtml(trackedNames)}`,
-      tradeRoute === "v4"
-        ? `Buy/Sell qua <b>Uni V4 ETH</b> pool thanh khoản lớn nhất.`
-        : `Chỉ theo dõi buy/sell realtime (≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}).`,
+      listenLine,
+      `Chỉ alert buy/sell ≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol || "ETH")} trên pool này.`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
       forced ? "Buy/Sell dùng đúng pool này." : "",
-      tradeRoute === "v3" && trackedPair.watchPairAddresses?.length
-        ? `Watching <b>${trackedPair.watchPairAddresses.length}</b> WETH v3 pool(s)`
-        : "",
-      tradeRoute === "v4" && trackedPair.watchPairAddresses?.length
-        ? `Alerts (nếu có): watch V3 phụ <code>${escapeHtml(compactAddress(trackedPair.watchPairAddresses[0]))}</code>`
-        : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
     ]
       .filter(Boolean)
@@ -4025,8 +4079,8 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     trackedPair.pairAddress = poolId;
     trackedPair.pairUrl =
       selected.pair.url || `https://dexscreener.com/${config.chainId}/${poolId}`;
-    const v3Watch = chooseBestPairForToken(pairs, followAddress);
-    trackedPair.watchPairAddresses = v3Watch?.pairAddress ? [normalizeAddress(v3Watch.pairAddress)] : [];
+    // Do not also watch thin V3 — same tx often has a dust V3 hop that used to poison seen[].
+    trackedPair.watchPairAddresses = [];
     await activateTrackedPair(trackedPair, state, chatId, {
       tradeRoute: "v4",
       liquidityUsd: selected.liquidityUsd,
@@ -5207,6 +5261,7 @@ module.exports = {
   chooseBestTradePairForToken,
   chooseBestPortfolioPairForToken,
   chooseWatchPairAddresses,
+  normalizeAlertWatch,
   classifyFromTransaction,
   config,
   activeChain,
