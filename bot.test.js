@@ -701,3 +701,31 @@ test("buy fill records entry and DCA average", () => {
   assert.equal(bot.formatPnlPct(0.15, 0.18), "+20.0%");
   assert.ok(bot.positionEntryLines(second.position, { fillEntryUsd: 0.1, isDca: true }).length >= 2);
 });
+
+test("GME is pinned to clean Uni V3 WETH pool", () => {
+  const gme = "0xc2362AfF2A2a4CC1f48cF3Dab2C4e2605eb94BA3";
+  const pool = "0xb7eedf33d02c743507c38e1ee20ef421e60661c6";
+  assert.equal(bot.preferredV3PoolForToken(gme), pool);
+  const picked = bot.chooseBestPairForToken(
+    [
+      {
+        chainId: "robinhood",
+        pairAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        labels: ["v3"],
+        liquidity: { usd: 999999 },
+        baseToken: { address: gme, symbol: "GME" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        pairAddress: pool,
+        labels: ["v3"],
+        liquidity: { usd: 100 },
+        baseToken: { address: gme, symbol: "GME" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+    ],
+    gme,
+  );
+  assert.equal(picked.pairAddress, pool);
+});

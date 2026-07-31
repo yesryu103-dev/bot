@@ -53,6 +53,28 @@ function normalizeAddress(value) {
 /** UniversalRouter — only for Robinhood Uni V4 ETH single-hop (never USDG multi-hop). */
 const UNIVERSAL_ROUTER_V4 = "0x8876789976decbfcbbbe364623c63652db8c0904";
 
+/**
+ * Pin known tokens to clean Uni V3 WETH pools so Buy/Sell never hit V4 Doppler hooks.
+ * (Hook paths skim extra token fees — see RehypeDopplerHookInitializer.)
+ * Override/extend via FORCE_V3_POOLS=token:pool,token:pool
+ */
+const FORCE_V3_WETH_POOLS = {
+  // Robinhood meme GME → Uni V3 GME/WETH
+  "0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3": "0xb7eedf33d02c743507c38e1ee20ef421e60661c6",
+};
+
+function preferredV3PoolForToken(tokenAddress) {
+  const token = normalizeAddress(tokenAddress);
+  if (!isEvmAddress(token)) return "";
+  if (FORCE_V3_WETH_POOLS[token]) return FORCE_V3_WETH_POOLS[token];
+  const raw = String(process.env.FORCE_V3_POOLS || "");
+  for (const part of raw.split(",")) {
+    const [left, right] = part.split(":").map((item) => normalizeAddress(String(item || "").trim()));
+    if (left === token && isEvmAddress(right)) return right;
+  }
+  return "";
+}
+
 function resolveSwapRouterAddress() {
   const fallback = normalizeAddress(activeChain.swapRouter);
   const raw = normalizeAddress(process.env.SWAP_ROUTER_ADDRESS || fallback);
@@ -1456,6 +1478,7 @@ async function pickBestTradeRoute({
   preferredFee,
   buyWithNativeEth,
   sellToNativeEth,
+  allowV4 = true,
 }) {
   const { ethers } = require("ethers");
   const bestroute = require("./bestroute");
@@ -1476,7 +1499,7 @@ async function pickBestTradeRoute({
   }
 
   let v4Meta = null;
-  if (config.enableV4 && (buyWithNativeEth || sellToNativeEth)) {
+  if (allowV4 && config.enableV4 && (buyWithNativeEth || sellToNativeEth)) {
     try {
       const pairs = await fetchTokenPairs(baseTokenAddress);
       const v4pool = bestroute.pickV4EthPool(pairs, baseTokenAddress);
@@ -1586,7 +1609,13 @@ async function executeSwap(side, amountText, overrides = {}) {
   ];
   const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
   const baseTokenContract = new ethers.Contract(baseTokenAddress, erc20Abi, wallet);
-  const pairAddress = normalizeAddress(overrides.pairAddress || config.pairAddress || "");
+  const forcedV3Pool = preferredV3PoolForToken(baseTokenAddress);
+  const pairAddress =
+    forcedV3Pool || normalizeAddress(overrides.pairAddress || config.pairAddress || "");
+  const allowV4 = !forcedV3Pool && !overrides.v3Only && Boolean(config.enableV4);
+  if (forcedV3Pool) {
+    console.log(`Trade ${side} pinned to V3 pool ${compactAddress(forcedV3Pool)} (no V4/hook).`);
+  }
   const preBaseBalance = await rpcCall("balanceOf(base)", () => baseTokenContract.balanceOf(wallet.address));
 
   const buildTradeResult = (tx, routeLabelFinal) => {
@@ -1669,6 +1698,7 @@ async function executeSwap(side, amountText, overrides = {}) {
     preferredFee: swapFee,
     buyWithNativeEth,
     sellToNativeEth,
+    allowV4,
   });
   let minOut = (best.amountOut * BigInt(10000 - slipBps)) / 10000n;
   if (minOut <= 0n) throw new Error("Quote minOut is zero — amount too small or pool illiquid.");
@@ -1913,6 +1943,7 @@ function balancePercent(balance, percent) {
 
 function chooseBestPairForToken(pairs, tokenAddress) {
   const token = normalizeAddress(tokenAddress);
+  const forced = preferredV3PoolForToken(token);
   const validPairs = (Array.isArray(pairs) ? pairs : [])
     .filter((pair) => normalizeAddress(pair.chainId) === config.chainId)
     .filter((pair) => {
@@ -1920,6 +1951,11 @@ function chooseBestPairForToken(pairs, tokenAddress) {
       const quote = normalizeAddress(pair.quoteToken?.address);
       return base === token || quote === token;
     });
+
+  if (forced) {
+    const pinned = validPairs.find((pair) => normalizeAddress(pair.pairAddress) === forced && isV3Pair(pair));
+    if (pinned) return pinned;
+  }
 
   const isWethPair = (pair) => {
     const base = normalizeAddress(pair.baseToken?.address);
@@ -3746,6 +3782,41 @@ async function resolveSellContext(tokenAddress, state = {}) {
   if (!isEvmAddress(token)) throw new Error("Invalid bag token address.");
 
   const fromBag = findBagItem(state, token);
+  const forcedPool = preferredV3PoolForToken(token);
+
+  async function decimalsForToken(fallback = 18) {
+    const fromBagDecimals = Number(fromBag?.decimals);
+    if (Number.isFinite(fromBagDecimals) && fromBagDecimals >= 0) return fromBagDecimals;
+    try {
+      return await readTokenDecimals(token, getRpcProvider(), fallback);
+    } catch {
+      return fallback;
+    }
+  }
+
+  if (forcedPool) {
+    let fee = config.uniswapV3Fee;
+    try {
+      const meta = await getPoolMeta(forcedPool);
+      if (Number.isFinite(meta.fee) && meta.fee > 0) fee = meta.fee;
+    } catch {
+      // keep fee
+    }
+    return {
+      baseTokenAddress: token,
+      baseSymbol: fromBag?.symbol || "TOKEN",
+      quoteTokenAddress: config.quoteTokenAddress,
+      quoteSymbol: config.quoteSymbol,
+      pairAddress: forcedPool,
+      pairUrl: `https://dexscreener.com/${config.chainId}/${forcedPool}`,
+      fee,
+      priceNative: Number.NaN,
+      priceUsd: Number(fromBag?.priceUsd),
+      decimals: await decimalsForToken(18),
+      v3Only: true,
+    };
+  }
+
   if (fromBag?.pairAddress) {
     let fee = config.uniswapV3Fee;
     try {
@@ -3753,14 +3824,6 @@ async function resolveSellContext(tokenAddress, state = {}) {
       if (Number.isFinite(meta.fee) && meta.fee > 0) fee = meta.fee;
     } catch {
       // keep fee
-    }
-    let decimals = Number(fromBag.decimals);
-    if (!Number.isFinite(decimals) || decimals < 0) {
-      try {
-        decimals = await readTokenDecimals(token, getRpcProvider(), 18);
-      } catch {
-        decimals = 18;
-      }
     }
     return {
       baseTokenAddress: token,
@@ -3772,7 +3835,8 @@ async function resolveSellContext(tokenAddress, state = {}) {
       fee,
       priceNative: Number.NaN,
       priceUsd: Number(fromBag.priceUsd),
-      decimals,
+      decimals: await decimalsForToken(18),
+      v3Only: true,
     };
   }
 
@@ -3811,11 +3875,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
     // keep current fee
   }
 
-  try {
-    decimals = await readTokenDecimals(token, getRpcProvider(), 18);
-  } catch {
-    decimals = 18;
-  }
+  decimals = await decimalsForToken(18);
 
   return {
     baseTokenAddress: token,
@@ -3828,6 +3888,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
     priceNative,
     priceUsd,
     decimals,
+    v3Only: true,
   };
 }
 
@@ -4705,6 +4766,7 @@ module.exports = {
   tradeFromV3SwapLog,
   tradeMessage,
   tradeTimestampMs,
+  preferredV3PoolForToken,
   recordBuyFill,
   recordSellFill,
   getPosition,
