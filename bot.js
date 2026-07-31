@@ -441,7 +441,12 @@ function tradeFromV3SwapLog({ amount0, amount1, token0, token1, quoteToken, base
   };
 }
 
-/** Uni V4 PoolManager Swap → same alert shape as V3 (quote = native ETH/BNB leg). */
+/** Uni V4 PoolManager Swap → same alert shape as V3 (quote = native ETH/BNB leg).
+ * V4 amount0/amount1 are from the USER perspective (unlike V3 pool deltas):
+ *   positive = user receives that currency from the pool
+ *   negative = user pays that currency into the pool
+ * So user receives ETH (quoteDelta > 0) ⇒ SELL base; user pays ETH ⇒ BUY base.
+ */
 function tradeFromV4SwapLog({ amount0, amount1, key, baseToken, txHash, blockNumber, timestampMs, sender }) {
   if (!key) return null;
   const { ethers } = require("ethers");
@@ -459,7 +464,8 @@ function tradeFromV4SwapLog({ amount0, amount1, key, baseToken, txHash, blockNum
   const baseDelta = baseIs0 ? BigInt(amount0) : BigInt(amount1);
   if (quoteDelta === 0n) return null;
 
-  const side = quoteDelta > 0n ? "BUY" : "SELL";
+  // User-perspective: +ETH in = user received ETH = sold base.
+  const side = quoteDelta > 0n ? "SELL" : "BUY";
   const quoteRaw = quoteDelta < 0n ? -quoteDelta : quoteDelta;
   const baseRaw = baseDelta < 0n ? -baseDelta : baseDelta;
   const quoteAmount = Number(ethers.formatUnits(quoteRaw, 18));
