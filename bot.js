@@ -646,22 +646,56 @@ async function processAlertTelegramQueue() {
   alertTgWorkerRunning = false;
 }
 
+function resolveAlertEthUsd(cache) {
+  if (Number.isFinite(cache?.ethUsd) && cache.ethUsd > 0) return cache.ethUsd;
+  if (Number.isFinite(dexTradePriceCache.ethUsd) && dexTradePriceCache.ethUsd > 0) {
+    return dexTradePriceCache.ethUsd;
+  }
+  if (Number.isFinite(ethPriceCache.value) && ethPriceCache.value > 0) return ethPriceCache.value;
+  return Number.NaN;
+}
+
 function emitTradeAlertAsync(trade) {
-  // Instant: use cached Dex price only — never block the Swap hot path.
   const cache = priceCacheFor(trade?.pairAddress || config.pairAddress);
-  const priced = applyTradeUsd(trade, {
-    priceUsd: cache.priceUsd,
-    ethUsd: Number.isFinite(cache.ethUsd) ? cache.ethUsd : dexTradePriceCache.ethUsd,
-  });
-  if (!isSaneTradeAlert(priced)) {
-    console.warn(
-      `Skip junk alert ${priced?.txHash || ""} ${priced?.side} ${priced?.baseSymbol}: exec=${priced?.priceUsd} spot=${priced?.spotPriceUsd} quote=${priced?.quoteAmount}`,
+  const ethUsdCached = resolveAlertEthUsd(cache);
+  const warm =
+    (Number.isFinite(cache.priceUsd) && cache.priceUsd > 0) ||
+    (Number.isFinite(ethUsdCached) && ethUsdCached > 0);
+
+  const sendPriced = (priced) => {
+    if (!isSaneTradeAlert(priced)) {
+      console.warn(
+        `Skip junk alert ${priced?.txHash || ""} ${priced?.side} ${priced?.baseSymbol}: exec=${priced?.priceUsd} spot=${priced?.spotPriceUsd} quote=${priced?.quoteAmount}`,
+      );
+      return;
+    }
+    enqueueTelegramAlert(tradeMessage(priced), mainMenuKeyboard());
+  };
+
+  if (warm) {
+    // Hot path: cached Dex/ETH price — do not block WS handler.
+    sendPriced(
+      applyTradeUsd(trade, {
+        priceUsd: cache.priceUsd,
+        ethUsd: ethUsdCached,
+      }),
     );
+    enrichTradePrices(trade).catch(() => {});
     return;
   }
-  enqueueTelegramAlert(tradeMessage(priced), mainMenuKeyboard());
-  // Refresh price cache in background for the next alert.
-  enrichTradePrices(trade).catch(() => {});
+
+  // Cold cache: fetch Dex/ETH price first so Quote USD + Price aren't n/a.
+  withTimeout(enrichTradePrices(trade), 2_500, "Alert price enrich")
+    .then((priced) => sendPriced(priced))
+    .catch((error) => {
+      console.warn(`Alert enrich failed: ${error.message}`);
+      sendPriced(
+        applyTradeUsd(trade, {
+          priceUsd: cache.priceUsd,
+          ethUsd: resolveAlertEthUsd(cache),
+        }),
+      );
+    });
 }
 
 /** Drop aggregator mis-parses (e.g. GME/USDG hop labeled as GME/WETH at 10–100x chart price). */
