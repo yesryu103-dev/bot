@@ -67,9 +67,9 @@ function recoverV4PoolKey(poolId, currencyA, currencyB, hookHints = []) {
     ...hookHints.map((h) => (h && h !== NATIVE_ETH ? ethers.getAddress(h) : NATIVE_ETH)),
     NATIVE_ETH,
   ];
-  const fees = [DYNAMIC_FEE_FLAG, 10000, 3000, 500, 100, 7000, 1];
+  const fees = [DYNAMIC_FEE_FLAG, 2500, 3000, 10000, 500, 100, 7000, 2000, 4000, 5000, 1];
   const target = String(poolId).toLowerCase();
-  const spacings = [1, 10, 60, 200, 500, 1000, 20, 30, 50, 100, 250];
+  const spacings = [1, 10, 60, 200, 500, 1000, 20, 30, 50, 100, 250, 2, 5, 8, 15, 25];
   for (const fee of fees) {
     for (const hooks of hooksList) {
       for (const tickSpacing of spacings) {

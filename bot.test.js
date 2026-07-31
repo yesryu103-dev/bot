@@ -729,3 +729,41 @@ test("GME is pinned to clean Uni V3 WETH pool", () => {
   );
   assert.equal(picked.pairAddress, pool);
 });
+
+test("paste-token trade pair prefers deepest V4 ETH over thinner V3", () => {
+  const token = "0x6245e67affa44a23077f0ea7f981a8dc743a0c47";
+  const selected = bot.chooseBestTradePairForToken(
+    [
+      {
+        chainId: "robinhood",
+        pairAddress: "0x09a431261eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        labels: ["v3"],
+        liquidity: { usd: 16000 },
+        baseToken: { address: token, symbol: "FRONG" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        pairAddress: "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a",
+        labels: ["v4"],
+        liquidity: { usd: 260000 },
+        baseToken: { address: token, symbol: "FRONG" },
+        quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" },
+      },
+      {
+        chainId: "robinhood",
+        pairAddress: "0x20d317b609bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        labels: ["v4"],
+        liquidity: { usd: 40000 },
+        baseToken: { address: token, symbol: "FRONG" },
+        quoteToken: { address: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", symbol: "USDG" },
+      },
+    ],
+    token,
+  );
+  assert.equal(selected.kind, "v4");
+  assert.equal(
+    selected.pair.pairAddress,
+    "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a",
+  );
+});
