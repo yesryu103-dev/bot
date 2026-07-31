@@ -110,14 +110,20 @@ function recoverV4PoolKeyEither(poolId, tokenAddress, hookHints = []) {
 /**
  * Classify a V4 ETH pool for hook-fee safety.
  * clean = hooks is zero; hooked = known non-zero hook; unsafe = cannot recover.
+ * Pass detectHooked=false for fast paste/select (only prove hooks=0).
  */
-function classifyV4EthPool(poolId, tokenAddress) {
+function classifyV4EthPool(poolId, tokenAddress, options = {}) {
+  const detectHooked = options.detectHooked !== false;
   const id = String(poolId || "").toLowerCase();
   if (!isV4PoolId(id)) return { status: "unsafe", key: null, clean: false, hooked: false };
 
   const cleanKey = recoverV4PoolKeyEither(id, tokenAddress, []);
   if (cleanKey && String(cleanKey.hooks).toLowerCase() === NATIVE_ETH) {
     return { status: "clean", key: cleanKey, clean: true, hooked: false };
+  }
+
+  if (!detectHooked) {
+    return { status: "unsafe", key: null, clean: false, hooked: false };
   }
 
   const hookedKey = recoverV4PoolKeyEither(id, tokenAddress, knownV4HookHints());
@@ -131,7 +137,8 @@ function classifyV4EthPool(poolId, tokenAddress) {
 /** Deepest V4 native-ETH pool with hooks=0x0 (skips Doppler/Rehype fee skims). */
 function pickCleanV4EthPool(pairs, tokenAddress) {
   for (const pair of listV4EthPools(pairs, tokenAddress)) {
-    const classified = classifyV4EthPool(pair.pairAddress, tokenAddress);
+    // Fast path: only prove hooks=0 — do not brute-force known Doppler hooks on every candidate.
+    const classified = classifyV4EthPool(pair.pairAddress, tokenAddress, { detectHooked: false });
     if (classified.clean) {
       return { pair, key: classified.key, liquidityUsd: Number(pair.liquidity?.usd || 0) };
     }

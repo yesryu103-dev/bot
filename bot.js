@@ -1240,7 +1240,8 @@ async function fetchDexPair() {
 
 async function fetchDexPairByAddress(pairAddress) {
   const pair = normalizeAddress(pairAddress);
-  if (!isEvmAddress(pair)) return null;
+  // Uni V3 pool address (20 bytes) or Uni V4 pool id (32 bytes).
+  if (!isEvmAddress(pair) && !isV4PoolId(pair)) return null;
   const url = `https://api.dexscreener.com/latest/dex/pairs/${config.chainId}/${pair}`;
   const payload = await fetchJson(url);
   return payload.pair || payload.pairs?.[0] || null;
@@ -3361,12 +3362,14 @@ function tradeActionRows() {
 
 function trackedSwitchRows() {
   const list = trackedPairsList();
-  if (list.length <= 1) return [];
+  // Always show tracked token(s) so paste-track is visible even with a single token.
+  if (!list.length) return [];
   const active = normalizeAddress(config.baseTokenAddress);
   const buttons = list.map((entry) => {
     const token = normalizeAddress(entry.baseTokenAddress);
+    const route = entry.tradeRoute === "v4" || isV4PoolId(entry.pairAddress) ? "V4" : "V3";
     return {
-      text: `${token === active ? "🎯 " : ""}${entry.baseSymbol || "TOKEN"}`,
+      text: `${token === active ? "🎯 " : ""}${entry.baseSymbol || "TOKEN"} · ${route}`,
       callback_data: `switch:${token}`,
     };
   });
@@ -3901,6 +3904,12 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
   saveState(state);
   refreshWsSwapListener(state);
 
+  const v4Watch = [...watchedV4PoolSet()];
+  const v3Watch = [...watchedPairSet()];
+  console.log(
+    `Track ${trackedPair.baseSymbol}: route=${tradeRoute} pair=${compactAddress(trackedPair.pairAddress)} v4Listen=${v4Watch.length} v3Listen=${v3Watch.length}`,
+  );
+
   const trackedNames = (state.trackedPairs || [trackedPair])
     .map((entry) => entry.baseSymbol || "TOKEN")
     .join(", ");
@@ -3911,22 +3920,28 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
     tradeRoute === "v4"
       ? `Listen: <b>1 pool</b> Uni V4 ETH sạch (no hook fee)${escapeHtml(liqNote)}`
       : `Listen: <b>1 pool</b> Uni V3 WETH sạch${escapeHtml(liqNote)}`;
+  const keyboard = mainMenuKeyboard(state.portfolioSnapshot);
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
       `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active · ${escapeHtml(dexVer)}${escapeHtml(liqNote)})`,
       `Đang track <b>${state.trackedPairs?.length || 1}/${config.maxTrackedTokens}</b>: ${escapeHtml(trackedNames)}`,
       listenLine,
+      tradeRoute === "v4" && !v4Watch.length
+        ? "⚠️ V4 listen set trống — restart bot nếu alert không về."
+        : "",
       `Tự bỏ pool V4 có Doppler/Rehype hook. Alert ≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol || "ETH")} trên pool này.`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
       forced ? "Buy/Sell dùng đúng pool này." : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
+      "",
+      "Nút 🎯 trên menu = token đang track.",
     ]
       .filter(Boolean)
       .join("\n"),
     parse_mode: "HTML",
     disable_web_page_preview: "true",
-    reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    reply_markup: keyboard,
   });
 }
 
