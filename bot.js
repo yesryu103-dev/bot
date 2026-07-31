@@ -2169,23 +2169,27 @@ function tagTradeWithTracked(trade, entry, poolAddress = "") {
 }
 
 function watchedPairSet(settings = config) {
+  const addSafe = (set, address) => {
+    const normalized = normalizeAddress(address);
+    // Only Uni V3 pool contracts (20-byte) — never V4 poolIds.
+    if (isEvmAddress(normalized) && !isV4PoolId(normalized)) set.add(normalized);
+  };
+
   if (settings === config) {
-    // Union of every tracked token's pools so alerts cover all of them.
     const set = new Set();
     for (const entry of trackedPairsList()) {
       const list = entry.watchPairAddresses?.length ? entry.watchPairAddresses : [entry.pairAddress];
-      for (const address of list || []) {
-        const normalized = normalizeAddress(address);
-        if (normalized) set.add(normalized);
-      }
+      for (const address of list || []) addSafe(set, address);
     }
-    if (!set.size && config.pairAddress) set.add(normalizeAddress(config.pairAddress));
+    if (!set.size) addSafe(set, config.pairAddress);
     return set;
   }
   const list = settings.watchPairAddresses?.length
     ? settings.watchPairAddresses
     : [settings.pairAddress];
-  return new Set((list || []).map(normalizeAddress).filter(Boolean));
+  const set = new Set();
+  for (const address of list || []) addSafe(set, address);
+  return set;
 }
 
 function applyTrackedPair(trackedPair) {
