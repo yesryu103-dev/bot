@@ -2839,10 +2839,28 @@ async function resolveMenuPortfolio(state = {}, { forceRefresh = false } = {}) {
     return cachePortfolioSnapshot(state, {
       wallet,
       items: [],
+      bagItems: [],
       skipped: 0,
       totalUsd: 0,
-      error: error.message,
+      error: error.message || String(error),
     });
+  }
+}
+
+function invalidatePortfolioCache(state) {
+  nativeBalanceCache.at = 0;
+  if (!state) return;
+  delete state.portfolioSnapshot;
+  delete state.portfolioCache;
+}
+
+async function refreshPortfolioAfterTrade(state) {
+  invalidatePortfolioCache(state);
+  try {
+    return await withTimeout(resolveMenuPortfolio(state, { forceRefresh: true }), 12_000, "Post-trade portfolio");
+  } catch (error) {
+    console.warn(`Post-trade portfolio refresh failed: ${error.message}`);
+    return null;
   }
 }
 
@@ -4097,7 +4115,8 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
     result
       .confirm()
       .then(async () => {
-        nativeBalanceCache.at = 0;
+        const liveState = loadState();
+        const portfolio = await refreshPortfolioAfterTrade(liveState);
         const fill = await applyConfirmedTradeFill(result).catch((error) => {
           console.warn(`Position fill tracking failed: ${error.message}`);
           return { lines: [] };
@@ -4116,7 +4135,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
           ]
             .filter(Boolean)
             .join("\n"),
-          mainMenuKeyboard(state.portfolioSnapshot),
+          mainMenuKeyboard(portfolio || liveState.portfolioSnapshot),
         ).catch(() => {});
       })
       .catch(async (error) => {
@@ -4174,7 +4193,8 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
     result
       .confirm()
       .then(async () => {
-        nativeBalanceCache.at = 0;
+        const liveState = loadState();
+        const portfolio = await refreshPortfolioAfterTrade(liveState);
         const fill = await applyConfirmedTradeFill(result).catch((error) => {
           console.warn(`Position fill tracking failed: ${error.message}`);
           return { lines: [] };
@@ -4191,7 +4211,7 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
             ...(fill.lines || []),
             `Track alerts vẫn: <b>${escapeHtml(config.baseSymbol)}</b>`,
           ].join("\n"),
-          mainMenuKeyboard(state.portfolioSnapshot),
+          mainMenuKeyboard(portfolio || liveState.portfolioSnapshot),
         ).catch(() => {});
       })
       .catch(async (error) => {
@@ -4276,7 +4296,8 @@ async function sendTextTrade(chatId, state, side, amount) {
     result
       .confirm()
       .then(async () => {
-        nativeBalanceCache.at = 0;
+        const liveState = loadState();
+        const portfolio = await refreshPortfolioAfterTrade(liveState);
         const fill = await applyConfirmedTradeFill(result).catch((error) => {
           console.warn(`Position fill tracking failed: ${error.message}`);
           return { lines: [] };
@@ -4296,7 +4317,7 @@ async function sendTextTrade(chatId, state, side, amount) {
             .join("\n"),
           parse_mode: "HTML",
           disable_web_page_preview: "true",
-          reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+          reply_markup: mainMenuKeyboard(portfolio || liveState.portfolioSnapshot),
         }).catch(() => {});
       })
       .catch(async (error) => {
