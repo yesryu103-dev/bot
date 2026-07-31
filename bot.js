@@ -1448,7 +1448,8 @@ function formatSwapError(error) {
 }
 
 function isQuoteWethToken(tokenAddress) {
-  return normalizeAddress(tokenAddress) === normalizeAddress(config.quoteTokenAddress);
+  const address = normalizeAddress(tokenAddress);
+  return address === normalizeAddress(config.quoteTokenAddress) || isNativeQuoteAddress(address);
 }
 
 function displayQuoteSymbol(symbol = config.quoteSymbol) {
@@ -2047,21 +2048,41 @@ function chooseBestTradePairForToken(pairs, tokenAddress) {
   return null;
 }
 
+function isNativeQuoteAddress(address) {
+  const value = normalizeAddress(address);
+  return !value || value === "0x0000000000000000000000000000000000000000";
+}
+
+function resolveWrappedQuote(address, symbol) {
+  const sym = String(symbol || "").toUpperCase();
+  if (isNativeQuoteAddress(address) || sym === "ETH" || sym === "BNB") {
+    return {
+      address: normalizeAddress(config.quoteTokenAddress || activeChain.wrappedAddress),
+      symbol: config.quoteSymbol || activeChain.wrappedSymbol || "WETH",
+    };
+  }
+  return {
+    address: normalizeAddress(address),
+    symbol: symbol || config.quoteSymbol || "QUOTE",
+  };
+}
+
 function trackedPairFromDexPair(pair, tokenAddress = pair?.baseToken?.address) {
   const token = normalizeAddress(tokenAddress);
   const base = normalizeAddress(pair.baseToken?.address);
   const quote = normalizeAddress(pair.quoteToken?.address);
-  const trackedIsQuote = quote === token && base !== token;
+  const trackedIsQuote = quote === token && base !== token && !isNativeQuoteAddress(quote);
   const baseToken = trackedIsQuote ? pair.quoteToken : pair.baseToken;
   const quoteToken = trackedIsQuote ? pair.baseToken : pair.quoteToken;
+  const wrappedQuote = resolveWrappedQuote(quoteToken?.address, quoteToken?.symbol);
 
   return {
     pairAddress: normalizeAddress(pair.pairAddress),
     pairUrl: pair.url || `https://dexscreener.com/${config.chainId}/${pair.pairAddress}`,
     baseTokenAddress: normalizeAddress(baseToken?.address),
     baseSymbol: baseToken?.symbol || "TOKEN",
-    quoteTokenAddress: normalizeAddress(quoteToken?.address),
-    quoteSymbol: quoteToken?.symbol || "QUOTE",
+    quoteTokenAddress: wrappedQuote.address,
+    quoteSymbol: wrappedQuote.symbol,
     watchPairAddresses: [],
   };
 }
@@ -2193,14 +2214,20 @@ function watchedPairSet(settings = config) {
 }
 
 function applyTrackedPair(trackedPair) {
-  if (!trackedPair?.pairAddress || !trackedPair?.baseTokenAddress || !trackedPair?.quoteTokenAddress) return;
+  if (!trackedPair?.pairAddress || !trackedPair?.baseTokenAddress) return;
+  const wrappedQuote = resolveWrappedQuote(trackedPair.quoteTokenAddress, trackedPair.quoteSymbol);
+  if (!wrappedQuote.address) return;
+
+  // Persist sanitized quote so state.json never stores native 0x0 from V4 ETH pools.
+  trackedPair.quoteTokenAddress = wrappedQuote.address;
+  trackedPair.quoteSymbol = wrappedQuote.symbol;
 
   config.pairAddress = normalizeAddress(trackedPair.pairAddress);
   config.dexscreenPairUrl = trackedPair.pairUrl || `https://dexscreener.com/${config.chainId}/${trackedPair.pairAddress}`;
   config.baseTokenAddress = normalizeAddress(trackedPair.baseTokenAddress);
   config.baseSymbol = trackedPair.baseSymbol || config.baseSymbol;
-  config.quoteTokenAddress = normalizeAddress(trackedPair.quoteTokenAddress);
-  config.quoteSymbol = trackedPair.quoteSymbol || config.quoteSymbol;
+  config.quoteTokenAddress = wrappedQuote.address;
+  config.quoteSymbol = wrappedQuote.symbol;
   config.tradeRoute = trackedPair.tradeRoute === "v4" || isV4PoolId(trackedPair.pairAddress) ? "v4" : "v3";
   config.v4TradePoolId = normalizeAddress(
     trackedPair.v4TradePoolId || (isV4PoolId(trackedPair.pairAddress) ? trackedPair.pairAddress : ""),
@@ -3635,9 +3662,6 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   }
 
   const trackedPair = trackedPairFromDexPair(selected.pair, followAddress);
-  // V4 ETH pools often quote as 0x000… — keep WETH for wallet/gas labels & sell context.
-  trackedPair.quoteTokenAddress = config.quoteTokenAddress;
-  trackedPair.quoteSymbol = config.quoteSymbol || "WETH";
 
   if (selected.kind === "v4") {
     const poolId = normalizeAddress(selected.pair.pairAddress);

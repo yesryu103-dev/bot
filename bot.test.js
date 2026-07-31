@@ -766,4 +766,9 @@ test("paste-token trade pair prefers deepest V4 ETH over thinner V3", () => {
     selected.pair.pairAddress,
     "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a",
   );
+
+  const tracked = bot.trackedPairFromDexPair(selected.pair, token);
+  assert.equal(tracked.baseSymbol, "FRONG");
+  assert.equal(tracked.quoteTokenAddress, bot.config.quoteTokenAddress);
+  assert.notEqual(tracked.quoteTokenAddress, "0x0000000000000000000000000000000000000000");
 });
