@@ -516,27 +516,57 @@ function watchedV4PoolSet() {
 
 function resolveV4PoolKey(poolId, baseTokenAddress) {
   const id = normalizeAddress(poolId);
-  const cacheKey = `${id}:${normalizeAddress(baseTokenAddress)}`;
+  const token = normalizeAddress(baseTokenAddress);
+  const cacheKey = `${id}:${token}`;
   if (v4PoolKeyCache.has(cacheKey)) return v4PoolKeyCache.get(cacheKey);
+
+  const tracked = findTrackedForV4Pool(id);
+  if (tracked?.v4TradeKey?.currency0 != null && tracked?.v4TradeKey?.currency1 != null) {
+    v4PoolKeyCache.set(cacheKey, tracked.v4TradeKey);
+    return tracked.v4TradeKey;
+  }
+
   const bestroute = require("./bestroute");
+  const classified = bestroute.classifyV4EthPool(id, token, { detectHooked: false });
+  if (classified?.key) {
+    v4PoolKeyCache.set(cacheKey, classified.key);
+    return classified.key;
+  }
   const key =
-    bestroute.recoverV4PoolKey(id, baseTokenAddress, bestroute.NATIVE_ETH) ||
-    bestroute.recoverV4PoolKey(id, bestroute.NATIVE_ETH, baseTokenAddress);
+    bestroute.recoverV4PoolKey(id, token, bestroute.NATIVE_ETH) ||
+    bestroute.recoverV4PoolKey(id, bestroute.NATIVE_ETH, token);
   if (key) v4PoolKeyCache.set(cacheKey, key);
   return key;
 }
 
+function alertSeenKey(txHash, scope = "") {
+  const hash = String(txHash || "").toLowerCase();
+  if (!hash) return "";
+  const scoped = normalizeAddress(scope);
+  return scoped ? `${hash}:${scoped}` : hash;
+}
+
+function hasAlertSeen(state, txHash, scope = "") {
+  const seen = state?.seen || [];
+  const hash = String(txHash || "").toLowerCase();
+  if (!hash) return true;
+  if (seen.includes(hash)) return true; // legacy bare tx hash
+  const key = alertSeenKey(hash, scope);
+  return Boolean(key && seen.includes(key));
+}
+
 function handleLiveV4SwapEvent({ poolId, sender, amount0, amount1, txHash, blockNumber }, state) {
   const hash = String(txHash || "").toLowerCase();
+  const pool = normalizeAddress(poolId);
   if (!hash) return;
-  if ((state.seen || []).includes(hash)) return;
+  if (hasAlertSeen(state, hash, pool)) return;
 
-  const tracked = findTrackedForV4Pool(poolId);
+  const tracked = findTrackedForV4Pool(pool);
   if (!tracked) return;
 
-  const key = resolveV4PoolKey(poolId, tracked.baseTokenAddress);
+  const key = resolveV4PoolKey(pool, tracked.baseTokenAddress);
   if (!key) {
-    console.warn(`V4 alert skipped — cannot recover pool key for ${compactAddress(poolId)}`);
+    console.warn(`V4 alert skipped — cannot recover pool key for ${compactAddress(pool)}`);
     return;
   }
 
@@ -554,26 +584,27 @@ function handleLiveV4SwapEvent({ poolId, sender, amount0, amount1, txHash, block
     // Below min — leave tx unset so a larger hop in the same tx can still alert.
     return;
   }
-  if (!claimSwapAlert(state, hash)) return;
+  if (!claimSwapAlert(state, hash, pool)) return;
 
   if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
   const bn = Number(blockNumber || 0);
-  const cursorKey = `v4:${normalizeAddress(poolId)}`;
+  const cursorKey = `v4:${pool}`;
   if (bn > 0) state.swapBlocks[cursorKey] = Math.max(Number(state.swapBlocks[cursorKey] || 0), bn);
   saveState(state);
 
-  emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
+  emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pool));
 }
 
-async function initRpcSwapCursors(state) {
+async function initRpcSwapCursors(state, { onlyMissing = true } = {}) {
   if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
   const provider = getRpcProvider();
   const latest = Number(await provider.getBlockNumber());
   for (const pair of watchedPairSet()) {
-    state.swapBlocks[pair] = latest;
+    if (!onlyMissing || !Number(state.swapBlocks[pair])) state.swapBlocks[pair] = latest;
   }
   for (const poolId of watchedV4PoolSet()) {
-    state.swapBlocks[`v4:${poolId}`] = latest;
+    const cursorKey = `v4:${poolId}`;
+    if (!onlyMissing || !Number(state.swapBlocks[cursorKey])) state.swapBlocks[cursorKey] = latest;
   }
   saveState(state);
   return latest;
@@ -624,7 +655,11 @@ async function pollRpcSwaps(state, options = {}) {
       }
       const key = resolveV4PoolKey(poolId, tracked.baseTokenAddress);
       if (!key) {
-        state.swapBlocks[cursorKey] = latest;
+        // Do NOT advance cursor — otherwise this pool is permanently skipped.
+        if (now - (pollRpcSwaps._lastKeyWarnAt || 0) > 60_000) {
+          console.warn(`RPC V4 skip (no pool key yet) ${compactAddress(poolId)}`);
+          pollRpcSwaps._lastKeyWarnAt = now;
+        }
         continue;
       }
 
@@ -653,7 +688,8 @@ async function pollRpcSwaps(state, options = {}) {
 
       for (const log of logs) {
         const txHash = String(log.transactionHash || "").toLowerCase();
-        if (!txHash || seen.has(txHash)) continue;
+        const seenKey = alertSeenKey(txHash, poolId);
+        if (!txHash || seen.has(txHash) || seen.has(seenKey)) continue;
         let parsed;
         try {
           parsed = v4Iface.parseLog(log);
@@ -671,12 +707,18 @@ async function pollRpcSwaps(state, options = {}) {
           sender: parsed.args.sender,
         });
         if (!trade) continue;
-        alerted.push(txHash);
-        seen.add(txHash);
+        alerted.push(seenKey);
+        seen.add(seenKey);
         emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
       }
       state.swapBlocks[cursorKey] = latest;
     }
+  }
+
+  if (options.v4Only) {
+    if (alerted.length) addSeen(state, alerted);
+    saveState(state);
+    return alerted.length;
   }
 
   for (const pair of watchedPairSet()) {
@@ -754,7 +796,8 @@ async function pollRpcSwaps(state, options = {}) {
 
     for (const log of logs) {
       const txHash = String(log.transactionHash || "").toLowerCase();
-      if (!txHash || seen.has(txHash)) continue;
+      const seenKey = alertSeenKey(txHash, pair);
+      if (!txHash || seen.has(txHash) || seen.has(seenKey)) continue;
       let parsed;
       try {
         parsed = iface.parseLog(log);
@@ -763,7 +806,7 @@ async function pollRpcSwaps(state, options = {}) {
       }
       const tsMs = light ? now : blockTs.get(Number(log.blockNumber)) || now;
       if (now - tsMs > Number(config.maxAlertAgeMs || 90_000)) {
-        seen.add(txHash);
+        seen.add(seenKey);
         continue;
       }
       const trade = tradeFromV3SwapLog({
@@ -779,8 +822,8 @@ async function pollRpcSwaps(state, options = {}) {
         recipient: parsed.args.recipient,
       });
       if (!trade) continue;
-      alerted.push(txHash);
-      seen.add(txHash);
+      alerted.push(seenKey);
+      seen.add(seenKey);
       // Non-blocking: enrich + Telegram queue so RPC poll stays fast.
       emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pair));
     }
@@ -928,6 +971,8 @@ function isSaneTradeAlert(trade) {
   // Must look like a real ETH size for our min filter.
   const minQuote = Number(config.minQuoteAmount) || 1;
   if (quote < minQuote * 0.95) return false;
+  // V4 Dex spot on pool ids can lag hard — never drop a real ETH-sized V4 whale on ratio alone.
+  if (String(trade?.dexVer || "").toLowerCase() === "v4") return true;
   if (Number.isFinite(spot) && spot > 0 && Number.isFinite(exec) && exec > 0) {
     const ratio = exec / spot;
     // Real pool swaps stay near spot; multi-hop mislabels often print 10x–100x.
@@ -936,22 +981,22 @@ function isSaneTradeAlert(trade) {
   return true;
 }
 
-function claimSwapAlert(state, txHash) {
+function claimSwapAlert(state, txHash, scope = "") {
   const hash = String(txHash || "").toLowerCase();
   if (!hash) return false;
-  const seen = new Set(state.seen || []);
-  if (seen.has(hash)) return false;
-  addSeen(state, [hash]);
+  if (hasAlertSeen(state, hash, scope)) return false;
+  addSeen(state, [alertSeenKey(hash, scope)]);
   saveState(state);
   return true;
 }
 
 function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockNumber }, state) {
   const hash = String(txHash || "").toLowerCase();
+  const pool = normalizeAddress(pair);
   if (!hash) return;
-  if ((state.seen || []).includes(hash)) return;
+  if (hasAlertSeen(state, hash, pool)) return;
 
-  const cached = poolMetaCache.get(normalizeAddress(pair));
+  const cached = poolMetaCache.get(pool);
   const run = (meta) => {
     const tracked = findTrackedForPool(meta);
     if (!tracked) return;
@@ -980,15 +1025,14 @@ function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockN
       // (e.g. FRONG V3 dust hop + V4 1+ ETH) and must still alert.
       return;
     }
-    if (!claimSwapAlert(state, hash)) return;
+    if (!claimSwapAlert(state, hash, pool)) return;
 
     if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
     const bn = Number(blockNumber || 0);
-    const key = normalizeAddress(pair);
-    if (bn > 0) state.swapBlocks[key] = Math.max(Number(state.swapBlocks[key] || 0), bn);
+    if (bn > 0) state.swapBlocks[pool] = Math.max(Number(state.swapBlocks[pool] || 0), bn);
     saveState(state);
 
-    emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pair));
+    emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pool));
   };
 
   if (cached) {
@@ -1128,30 +1172,36 @@ function startWsSwapListener(state) {
   }
 
   // Uni V4 deepest-pool alerts (PoolManager Swap filtered by poolId).
+  // Use explicit topic filters — ethers PreparedTopicFilter can silently mis-subscribe on some WSS.
   wsRuntime.listenedV4Pools = new Set();
   const v4Manager = config.v4PoolManagerAddress;
   const v4Ids = [...watchedV4PoolSet()];
   if (config.enableV4 && isEvmAddress(v4Manager) && v4Ids.length) {
-    const v4Abi = [
+    const v4Iface = new ethers.Interface([
       "event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)",
-    ];
-    const manager = new ethers.Contract(v4Manager, v4Abi, provider);
+    ]);
+    const v4Topic = v4Iface.getEvent("Swap").topicHash;
     for (const poolId of v4Ids) {
-      const filter = manager.filters.Swap(poolId);
-      manager.on(filter, (id, sender, amount0, amount1, _sqrt, _liq, _tick, _fee, event) => {
+      const filter = { address: v4Manager, topics: [v4Topic, poolId] };
+      provider.on(filter, (log) => {
         if (wsRuntime.generation !== myGeneration) return;
         const st = wsRuntime.stateRef || state;
-        const txHash = event?.log?.transactionHash || event?.transactionHash || "";
-        const blockNumber = event?.log?.blockNumber || event?.blockNumber || 0;
+        let parsed;
+        try {
+          parsed = v4Iface.parseLog(log);
+        } catch (error) {
+          console.warn(`WS V4 parse failed: ${error.message}`);
+          return;
+        }
         try {
           handleLiveV4SwapEvent(
             {
-              poolId: normalizeAddress(id) || poolId,
-              sender,
-              amount0,
-              amount1,
-              txHash,
-              blockNumber,
+              poolId: normalizeAddress(parsed.args.id) || poolId,
+              sender: parsed.args.sender,
+              amount0: parsed.args.amount0,
+              amount1: parsed.args.amount1,
+              txHash: log.transactionHash || "",
+              blockNumber: log.blockNumber || 0,
             },
             st,
           );
@@ -1162,7 +1212,10 @@ function startWsSwapListener(state) {
       wsRuntime.listenedV4Pools.add(poolId);
       const tracked = findTrackedForV4Pool(poolId);
       if (tracked?.baseTokenAddress) resolveV4PoolKey(poolId, tracked.baseTokenAddress);
+      console.log(`WS V4 listening PoolManager id=${compactAddress(poolId)}`);
     }
+  } else if (v4Ids.length) {
+    console.warn(`V4 tracks present (${v4Ids.length}) but PoolManager listen not started (enableV4/address).`);
   }
 
   const rawSocket = provider.websocket;
@@ -4125,6 +4178,16 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       selected.pair.url || `https://dexscreener.com/${config.chainId}/${poolId}`;
     // Do not also watch thin V3 — same tx often has a dust V3 hop that used to poison seen[].
     trackedPair.watchPairAddresses = [];
+    try {
+      const bestroute = require("./bestroute");
+      const classified = bestroute.classifyV4EthPool(poolId, followAddress, { detectHooked: false });
+      if (classified?.key) {
+        trackedPair.v4TradeKey = classified.key;
+        v4PoolKeyCache.set(`${poolId}:${normalizeAddress(followAddress)}`, classified.key);
+      }
+    } catch (error) {
+      console.warn(`Could not cache V4 pool key on track: ${error.message}`);
+    }
     await activateTrackedPair(trackedPair, state, chatId, {
       tradeRoute: "v4",
       liquidityUsd: selected.liquidityUsd,
@@ -5235,21 +5298,40 @@ async function main() {
     const wsOk = isWsAlertHealthy();
     wsRuntime.stateRef = state;
     const now = Date.now();
+    const v4WatchCount = watchedV4PoolSet().size;
 
-    // Full HTTP getLogs when WSS is down; light catch-up every 2 min while WSS is healthy (fill gaps).
+    // Always poll V4 tracks over HTTP (WS eth_subscribe is flaky on public Robinhood nodes).
+    // Full V3+V4 poll when WSS is down; light V3 catch-up less often when WSS is up.
     const needFullHttp = !wsOk;
-    const needLightCatchup = wsOk && now - lastHttpCatchupAt > 120_000;
-    if (needFullHttp || needLightCatchup) {
+    const needV4Http = v4WatchCount > 0;
+    const needLightCatchup = wsOk && now - lastHttpCatchupAt > 45_000;
+    if (needFullHttp || needV4Http || needLightCatchup) {
       try {
-        await withTimeout(
-          pollRpcSwaps(state, {
-            lookbackBlocks: needFullHttp ? config.rpcSwapLookbackBlocks : 30,
-            light: !needFullHttp,
-          }),
-          needFullHttp ? 25_000 : 12_000,
-          needFullHttp ? "HTTP RPC swap poll" : "HTTP light catch-up",
-        );
-        lastHttpCatchupAt = now;
+        if (!pollRpcSwaps._inFlight) {
+          const v4Only = needV4Http && wsOk && !needFullHttp && !needLightCatchup;
+          pollRpcSwaps._inFlight = withTimeout(
+            pollRpcSwaps(state, {
+              lookbackBlocks: needFullHttp ? config.rpcSwapLookbackBlocks : 60,
+              light: !needFullHttp,
+              v4Only,
+            }),
+            needFullHttp ? 25_000 : 15_000,
+            needFullHttp ? "HTTP RPC swap poll" : v4Only ? "HTTP V4 poll" : "HTTP light catch-up",
+          )
+            .then(() => {
+              lastHttpCatchupAt = Date.now();
+            })
+            .catch((error) => {
+              if (now - lastRpcWarnAt > 60_000) {
+                console.warn(`HTTP RPC poll failed (${config.rpcUrl}): ${error.message || error}`);
+                lastRpcWarnAt = now;
+              }
+            })
+            .finally(() => {
+              pollRpcSwaps._inFlight = null;
+            });
+        }
+        await pollRpcSwaps._inFlight;
       } catch (error) {
         if (now - lastRpcWarnAt > 60_000) {
           console.warn(`HTTP RPC poll failed (${config.rpcUrl}): ${error.message || error}`);
@@ -5320,6 +5402,7 @@ module.exports = {
   tradeTokenFromDexPair,
   isExpiredCallbackError,
   isFreshTrade,
+  isSaneTradeAlert,
   isMessageNotModifiedError,
   isPollingConflictError,
   isRetryableFetchError,

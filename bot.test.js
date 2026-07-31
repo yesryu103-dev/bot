@@ -921,6 +921,31 @@ test("classifyV4EthPool marks known clean FRONG pool and unknown ids unsafe", ()
   assert.equal(unsafe.clean, false);
 });
 
+test("V4 alerts are not dropped by exec/spot ratio sanity check", () => {
+  assert.equal(
+    bot.isSaneTradeAlert({
+      dexVer: "v4",
+      quoteAmount: 1.5,
+      baseAmount: 700000,
+      priceUsd: 0.05,
+      spotPriceUsd: 0.004,
+      execPriceUsd: 0.05,
+    }),
+    true,
+  );
+  assert.equal(
+    bot.isSaneTradeAlert({
+      dexVer: "v3",
+      quoteAmount: 1.5,
+      baseAmount: 700000,
+      priceUsd: 0.05,
+      spotPriceUsd: 0.004,
+      execPriceUsd: 0.05,
+    }),
+    false,
+  );
+});
+
 test("V4 track is excluded from V3 watch set (deepest pool only)", () => {
   const prev = bot.config.trackedPairs;
   const poolId = "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a";
