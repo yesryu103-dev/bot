@@ -375,6 +375,13 @@ test("gas shortage is not mislabeled as slippage", () => {
   assert.equal(/slippage/i.test(legacy), false);
 
   assert.match(bot.formatSwapError(new Error("Too little received")), /Slippage/i);
+
+  // Uniswap "AS" = amountSpecified zero — must not suggest slippage knobs.
+  const asErr = bot.formatSwapError(
+    new Error('V4 quote failed: execution reverted: "AS" (action="call", data="0x08c379a0")'),
+  );
+  assert.match(asErr, /Amount swap = 0|dust/i);
+  assert.equal(/SLIPPAGE_BPS|V2_FOT_BUFFER/i.test(asErr), false);
 });
 
 test("tracking multiple tokens keeps max 3 and unions watched pools", () => {
@@ -484,6 +491,29 @@ test("authorized chat IDs support comma-separated values", () => {
 test("EVM token address input is recognized", () => {
   assert.equal(bot.isEvmAddress("0x5266eeaff092d6136ab63d18b975a60a0cc0c8f7"), true);
   assert.equal(bot.isEvmAddress("hello"), false);
+});
+
+test("Dexscreener URL / pair address forces that pool", () => {
+  const pair = "0xB7eeDF33D02C743507c38E1eE20eF421e60661C6";
+  const fromUrl = bot.parseTrackInput(
+    `https://dexscreener.com/robinhood/${pair}`,
+  );
+  assert.equal(fromUrl.forced, true);
+  assert.equal(fromUrl.address, pair.toLowerCase());
+
+  const fromBare = bot.parseTrackInput(pair);
+  assert.equal(fromBare.forced, false);
+  assert.equal(fromBare.address, pair.toLowerCase());
+
+  const token = "0xc2362AfF2A2a4CC1f48cF3Dab2C4e2605eb94BA3";
+  const weth = bot.config.quoteTokenAddress;
+  assert.equal(
+    bot.tradeTokenFromDexPair({
+      baseToken: { address: token, symbol: "GME" },
+      quoteToken: { address: weth, symbol: "WETH" },
+    }),
+    token.toLowerCase(),
+  );
 });
 
 test("best pair selection prefers WETH quote and highest liquidity", () => {

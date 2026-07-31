@@ -394,6 +394,11 @@ function encodeUsdgHubSwap({
 }
 
 async function quoteV3ExactInput(provider, quoterAddress, path, amountIn) {
+  if (BigInt(amountIn || 0) <= 0n) {
+    throw new Error(
+      "V3 quote amountIn=0 (thường do V4 hub quote ra 0 / sell dust). Tăng % bán hoặc paste lại token.",
+    );
+  }
   const quoter = new ethers.Contract(
     quoterAddress,
     [
