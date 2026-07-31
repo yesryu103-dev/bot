@@ -1115,6 +1115,40 @@ function isEvmAddress(value) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(value || "").trim());
 }
 
+/** Parse token/pair address or Dexscreener robinhood URL. */
+function parseTrackInput(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+
+  const urlMatch = raw.match(
+    /(?:https?:\/\/)?(?:www\.)?dexscreener\.com\/robinhood\/(0x[a-fA-F0-9]{40}|0x[a-fA-F0-9]{64})\b/i,
+  );
+  if (urlMatch) {
+    return { kind: "pair", address: normalizeAddress(urlMatch[1]), forced: true };
+  }
+
+  if (isEvmAddress(raw)) return { kind: "address", address: normalizeAddress(raw), forced: false };
+  if (/^0x[a-fA-F0-9]{64}$/i.test(raw)) {
+    return { kind: "pair", address: normalizeAddress(raw), forced: true };
+  }
+  return null;
+}
+
+/** Prefer non-WETH/ETH side as the tradable meme token for a Dex pair. */
+function tradeTokenFromDexPair(pair) {
+  const weth = normalizeAddress(config.quoteTokenAddress);
+  const zero = "0x0000000000000000000000000000000000000000";
+  const base = normalizeAddress(pair?.baseToken?.address);
+  const quote = normalizeAddress(pair?.quoteToken?.address);
+  const baseSym = String(pair?.baseToken?.symbol || "").toUpperCase();
+  const quoteSym = String(pair?.quoteToken?.symbol || "").toUpperCase();
+  const isWethish = (addr, sym) =>
+    addr === weth || addr === zero || sym === "WETH" || sym === "ETH";
+  if (isWethish(quote, quoteSym) && base) return base;
+  if (isWethish(base, baseSym) && quote) return quote;
+  return base || quote || "";
+}
+
 function shouldTradeImmediately() {
   return true;
 }
@@ -1322,10 +1356,10 @@ function formatSwapError(error) {
   }
   // Uniswap V3 quoter/pool: require(amountSpecified != 0, "AS") — NOT slippage.
   if (/\bAS\b/.test(raw) || /execution reverted:\s*"AS"/i.test(raw)) {
-    return "Amount swap = 0 (dust / quote hub ra 0). Bán % lớn hơn, kiểm tra balance, hoặc paste lại token. Không cần tăng slippage.";
+    return "Amount swap = 0 (dust / quote ra 0). Bán % lớn hơn, kiểm tra balance, hoặc paste lại token. Không cần tăng slippage.";
   }
   // Match Uniswap codes carefully — bare "AS" used to match the letters inside "gas".
-  if (/\bAS\b|Too little received|TOO_LITTLE|Price slippage|slippage/i.test(raw)) {
+  if (/INSUFFICIENT_OUTPUT_AMOUNT|Too little received|TOO_LITTLE|Price slippage|slippage/i.test(raw)) {
     return `Slippage/giá chạy quá nhanh. Tăng SLIPPAGE_BPS (vd 500–1000) rồi thử lại.`;
   }
   if (/no data present|require\(false\)|execution reverted|Swap reverted on-chain/i.test(raw)) {
@@ -1969,6 +2003,19 @@ function isV3Pair(pair) {
   // Require explicit v3 — empty labels / v2 / v4 are not SwapRouter-tradeable.
   if (labels.includes("v4") || labels.includes("v2")) return false;
   return labels.includes("v3");
+}
+
+function isV4Pair(pair) {
+  const labels = (pair?.labels || []).map((item) => String(item).toLowerCase());
+  return labels.includes("v4");
+}
+
+function isTradeableDexPair(pair) {
+  return isV3Pair(pair) || isV4Pair(pair);
+}
+
+function isV4PoolId(value) {
+  return /^0x[a-fA-F0-9]{64}$/.test(String(value || "").trim());
 }
 
 function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") {
@@ -3028,64 +3075,29 @@ async function withTimeout(promise, timeoutMs, label = "operation") {
   }
 }
 
-async function activateTrackedPair(trackedPair, meta, pairs, tokenAddress, state, chatId, options = {}) {
+async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
   const forced = Boolean(options.forced);
-  trackedPair.version = meta.version || trackedPair.version || "v3";
-  if (meta.version === "v4") {
-    trackedPair.v4Meta = meta;
-    trackedPair.v4TradeKey = meta.v4TradeKey;
-    trackedPair.v4TradePoolId = meta.v4TradePoolId;
-    trackedPair.v4AlertPoolId = meta.v4AlertPoolId || normalizeAddress(trackedPair.pairAddress);
-    trackedPair.v4AlertQuote = meta.v4AlertQuote || "";
-    trackedPair.v4RouteMode = meta.v4RouteMode || "eth";
-    trackedPair.v4BridgeToken = meta.v4BridgeToken || "";
-    // Trade settles in native ETH via UniversalRouter; display quote as WETH/ETH.
-    trackedPair.quoteTokenAddress = normalizeAddress(config.quoteTokenAddress);
-    trackedPair.quoteSymbol = "WETH";
-    trackedPair.pairAddress = trackedPair.v4AlertPoolId;
-  } else {
-    // Pin v2/v3 — clear stale v4 route so Buy uses this exact pool.
-    trackedPair.v4Meta = null;
-    trackedPair.v4TradeKey = null;
-    trackedPair.v4TradePoolId = "";
-    trackedPair.v4AlertPoolId = "";
-    trackedPair.v4AlertQuote = "";
-    trackedPair.v4RouteMode = "";
-    trackedPair.v4BridgeToken = "";
-  }
+  const dexVer = options.dexVer || (forced ? "Uni V3 · forced pool" : "Uni V3");
 
-  const watchCandidates = forced
-    ? [trackedPair.pairAddress]
-    : chooseWatchPairAddresses(pairs, tokenAddress, trackedPair.pairAddress);
-  const validWatch = [];
-  for (const address of watchCandidates) {
-    if (normalizeAddress(address) === trackedPair.pairAddress || isV4PoolId(address)) {
-      validWatch.push(normalizeAddress(address));
-      continue;
-    }
-    try {
-      await getPoolMeta(address);
-      validWatch.push(normalizeAddress(address));
-    } catch {
-      // skip invalid extra pools
-    }
+  trackedPair.v4Meta = null;
+  trackedPair.v4TradeKey = null;
+  trackedPair.v4TradePoolId = "";
+  trackedPair.v4AlertPoolId = "";
+  trackedPair.v4AlertQuote = "";
+  trackedPair.v4RouteMode = "";
+  trackedPair.v4BridgeToken = "";
+
+  if (!Array.isArray(trackedPair.watchPairAddresses) || !trackedPair.watchPairAddresses.length) {
+    trackedPair.watchPairAddresses = [trackedPair.pairAddress];
   }
-  if (meta.version === "v4" && trackedPair.v4AlertPoolId) {
-    if (!validWatch.includes(trackedPair.v4AlertPoolId)) validWatch.unshift(trackedPair.v4AlertPoolId);
-  }
-  trackedPair.watchPairAddresses = validWatch.length ? validWatch : [trackedPair.pairAddress];
-  if (Number.isFinite(meta.fee) && meta.fee > 0 && meta.version === "v3") config.uniswapV3Fee = meta.fee;
 
   upsertTrackedPair(state, trackedPair);
 
   try {
-    const groups = groupTransfers(await fetchTokenTransfers());
-    addSeen(
-      state,
-      groups.map((group) => group.hash),
-    );
+    const meta = await getPoolMeta(trackedPair.pairAddress);
+    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
   } catch (error) {
-    console.warn(`Could not warm seen transactions for ${trackedPair.baseSymbol}: ${error.message}`);
+    console.warn(`Could not read pool fee: ${error.message}`);
   }
 
   try {
@@ -3100,17 +3112,16 @@ async function activateTrackedPair(trackedPair, meta, pairs, tokenAddress, state
   const trackedNames = (state.trackedPairs || [trackedPair])
     .map((entry) => entry.baseSymbol || "TOKEN")
     .join(", ");
-  const ver = (trackedPair.version || meta.version || "v3").toUpperCase();
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
-      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active · Uni ${escapeHtml(ver)}${forced ? " · forced pool" : ""})`,
+      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active · ${escapeHtml(dexVer)})`,
       `Đang track <b>${state.trackedPairs?.length || 1}/${config.maxTrackedTokens}</b>: ${escapeHtml(trackedNames)}`,
       `Chỉ theo dõi buy/sell realtime (≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}).`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
-      forced ? `Buy/Sell dùng đúng pool này.` : "",
-      !forced && trackedPair.watchPairAddresses?.length > 1
-        ? `Watching <b>${trackedPair.watchPairAddresses.length}</b> WETH pools`
+      forced ? "Buy/Sell dùng đúng pool này." : "",
+      !forced && trackedPair.watchPairAddresses?.length
+        ? `Watching <b>${trackedPair.watchPairAddresses.length}</b> WETH v3 pool(s)`
         : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
     ]
@@ -3124,18 +3135,37 @@ async function activateTrackedPair(trackedPair, meta, pairs, tokenAddress, state
 
 async function followPairAddress(pairAddress, state, chatId) {
   const pair = await fetchDexPairByAddress(pairAddress);
-  if (!pair || normalizeAddress(pair.chainId) !== "robinhood" || !isTradeableDexPair(pair)) {
+  if (!pair || normalizeAddress(pair.chainId) !== "robinhood") {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: [
-        `Không load được pool Dexscreener:`,
+        "Không load được pool Dexscreener:",
         `<code>${escapeHtml(pairAddress)}</code>`,
-        `Paste link Dexscreener (v2/v3/v4) hoặc contract token.`,
+        "Paste link Dexscreener v3 hoặc contract token.",
       ].join("\n"),
       parse_mode: "HTML",
       disable_web_page_preview: "true",
       reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
     });
+    return;
+  }
+
+  if (!isV3Pair(pair)) {
+    const tokenAddress = tradeTokenFromDexPair(pair);
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: [
+        "Pool này không phải <b>Uniswap V3</b> (bot trade qua V3 SwapRouter).",
+        `<code>${escapeHtml(pairAddress)}</code>`,
+        isEvmAddress(tokenAddress)
+          ? `Đang fallback track token <code>${escapeHtml(compactAddress(tokenAddress))}</code> (auto chọn V3 WETH pool tốt nhất).`
+          : "Paste contract token hoặc link pool V3.",
+      ].join("\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    });
+    if (isEvmAddress(tokenAddress)) await followTokenAddress(tokenAddress, state, chatId);
     return;
   }
 
@@ -3151,51 +3181,26 @@ async function followPairAddress(pairAddress, state, chatId) {
     return;
   }
 
-  let meta;
-  if (isV4Pair(pair)) {
-    const pairs = await fetchTokenPairs(tokenAddress).catch(() => [pair]);
-    const list = Array.isArray(pairs) && pairs.length ? pairs : [pair];
-    // Keep this exact pool as alert; resolve trade route from full token pair list.
-    const picked = await chooseValidPoolForToken(
-      [{ ...pair, labels: pair.labels || ["v4"] }, ...list.filter((p) => normalizeAddress(p.pairAddress) !== normalizeAddress(pair.pairAddress))],
-      tokenAddress,
-    );
-    if (!picked?.meta) {
-      await telegramRequest("sendMessage", {
-        chat_id: chatId,
-        text: `Không resolve được route trade cho pool v4:\n<code>${escapeHtml(pairAddress)}</code>`,
-        parse_mode: "HTML",
-        disable_web_page_preview: "true",
-        reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
-      });
-      return;
-    }
-    meta = {
-      ...picked.meta,
-      v4AlertPoolId: normalizeAddress(pair.pairAddress),
-    };
-  } else {
-    try {
-      meta = await getPoolMeta(pair.pairAddress);
-    } catch (error) {
-      await telegramRequest("sendMessage", {
-        chat_id: chatId,
-        text: [
-          `Pool không phải Uniswap v2/v3 hợp lệ:`,
-          `<code>${escapeHtml(pairAddress)}</code>`,
-          escapeHtml(error.message || String(error)),
-        ].join("\n"),
-        parse_mode: "HTML",
-        disable_web_page_preview: "true",
-        reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
-      });
-      return;
-    }
+  try {
+    await getPoolMeta(pair.pairAddress);
+  } catch (error) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: [
+        "Pool V3 không đọc được on-chain:",
+        `<code>${escapeHtml(pairAddress)}</code>`,
+        escapeHtml(error.message || String(error)),
+      ].join("\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: "true",
+      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+    });
+    return;
   }
 
   const trackedPair = trackedPairFromDexPair(pair, tokenAddress);
-  const pairsForWatch = await fetchTokenPairs(tokenAddress).catch(() => [pair]);
-  await activateTrackedPair(trackedPair, meta, pairsForWatch, tokenAddress, state, chatId, { forced: true });
+  trackedPair.watchPairAddresses = [trackedPair.pairAddress];
+  await activateTrackedPair(trackedPair, state, chatId, { forced: true, dexVer: "Uni V3 · forced pool" });
 }
 
 async function followTokenAddress(tokenAddress, state, chatId) {
@@ -3211,12 +3216,14 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     return;
   }
 
-  // Pasting a Uniswap pair/pool address must follow its token — never bind portfolio to the pool.
-  // Pool contracts hold base+quote reserves, so naive "has token balances ⇒ wallet" is wrong.
   let followAddress = raw;
   try {
     const asPair = await fetchDexPairByAddress(raw);
     if (asPair?.pairAddress && (asPair.baseToken?.address || asPair.quoteToken?.address)) {
+      if (isV3Pair(asPair)) {
+        await followPairAddress(raw, state, chatId);
+        return;
+      }
       const base = normalizeAddress(asPair.baseToken?.address);
       const quote = normalizeAddress(asPair.quoteToken?.address);
       const weth = normalizeAddress(config.quoteTokenAddress);
@@ -3246,7 +3253,6 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   const pair = chooseBestPairForToken(pairs, followAddress);
   if (!pair) {
     try {
-      // Do not treat Uniswap pool contracts as portfolio wallets.
       let looksLikePool = false;
       try {
         const meta = await getPoolMeta(followAddress);
@@ -3258,9 +3264,9 @@ async function followTokenAddress(tokenAddress, state, chatId) {
         await telegramRequest("sendMessage", {
           chat_id: chatId,
           text: [
-            `Đây là địa chỉ <b>pool/pair</b>, không phải ví:`,
+            "Đây là địa chỉ <b>pool/pair</b>, không phải ví:",
             `<code>${escapeHtml(followAddress)}</code>`,
-            `Paste contract <b>token</b> để track, hoặc dùng <code>/wallet 0x...</code> để gắn ví portfolio.`,
+            "Paste contract <b>token</b> để track, hoặc dùng <code>/wallet 0x...</code> để gắn ví portfolio.",
           ].join("\n"),
           parse_mode: "HTML",
           disable_web_page_preview: "true",
@@ -3284,7 +3290,11 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
     await telegramRequest("sendMessage", {
       chat_id: chatId,
-      text: `Không tìm thấy pool Robinhood cho contract:\n<code>${escapeHtml(followAddress)}</code>`,
+      text: [
+        "Không tìm thấy pool Robinhood cho contract:",
+        `<code>${escapeHtml(followAddress)}</code>`,
+        "Hoặc paste <b>link Dexscreener V3</b> để force đúng pool.",
+      ].join("\n"),
       parse_mode: "HTML",
       disable_web_page_preview: "true",
       reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
@@ -3294,7 +3304,6 @@ async function followTokenAddress(tokenAddress, state, chatId) {
 
   const trackedPair = trackedPairFromDexPair(pair, followAddress);
   trackedPair.watchPairAddresses = chooseWatchPairAddresses(pairs, followAddress, trackedPair.pairAddress);
-  // Always bind primary pair to a watchable v3 pool (never leave a v4 pool id as pairAddress).
   if (trackedPair.watchPairAddresses?.length) {
     const primaryWatch = normalizeAddress(trackedPair.watchPairAddresses[0]);
     if (primaryWatch && primaryWatch !== normalizeAddress(trackedPair.pairAddress)) {
@@ -3310,52 +3319,24 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       (entry) => normalizeAddress(entry.pairAddress) === normalizeAddress(trackedPair.pairAddress),
     ) || pair;
   const dexVer = isV3Pair(finalDexPair) ? "Uni V3" : "Uni V4 (alerts may use v3 watch pools)";
-  // Add to tracked list (max N) — keep other tokens' alerts and seen history intact.
-  upsertTrackedPair(state, trackedPair);
+  await activateTrackedPair(trackedPair, state, chatId, { forced: false, dexVer });
+}
+
+async function followTrackInput(input, state, chatId) {
+  const parsed = typeof input === "string" ? parseTrackInput(input) : input;
+  if (!parsed?.address) throw new Error("Invalid track input.");
 
   if (parsed.forced || parsed.kind === "pair") {
     await followPairAddress(parsed.address, state, chatId);
     return;
   }
 
-  // Bare 0x address: prefer Dex pair if this is a pool address, else treat as token.
   const asPair = await fetchDexPairByAddress(parsed.address).catch(() => null);
-  if (asPair && normalizeAddress(asPair.chainId) === "robinhood" && isTradeableDexPair(asPair)) {
+  if (asPair && normalizeAddress(asPair.chainId) === "robinhood" && isV3Pair(asPair)) {
     await followPairAddress(parsed.address, state, chatId);
     return;
   }
-
-  try {
-    const meta = await getPoolMeta(trackedPair.pairAddress);
-    if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
-  } catch (error) {
-    console.warn(`Could not read pool fee: ${error.message}`);
-  }
-
-  saveState(state);
-  refreshWsSwapListener(state);
-
-  const trackedNames = (state.trackedPairs || [trackedPair])
-    .map((entry) => entry.baseSymbol || "TOKEN")
-    .join(", ");
-  await telegramRequest("sendMessage", {
-    chat_id: chatId,
-    text: [
-      `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active · ${escapeHtml(dexVer)})`,
-      `Đang track <b>${state.trackedPairs?.length || 1}/${config.maxTrackedTokens}</b>: ${escapeHtml(trackedNames)}`,
-      `Chỉ theo dõi buy/sell realtime (≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol)}).`,
-      `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
-      trackedPair.watchPairAddresses?.length
-        ? `Watching <b>${trackedPair.watchPairAddresses.length}</b> WETH v3 pool(s)`
-        : "",
-      `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
-    ]
-      .filter(Boolean)
-      .join("\n"),
-    parse_mode: "HTML",
-    disable_web_page_preview: "true",
-    reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
-  });
+  await followTokenAddress(parsed.address, state, chatId);
 }
 
 
