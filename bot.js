@@ -2486,7 +2486,37 @@ async function buildPortfolio(walletAddress, options = {}) {
     .map(parseWalletBalanceEntry)
     .filter((item) => item.address && item.type.includes("ERC-20") && item.amount > 0)
     .map((item) => item.address);
-  const pairs = await fetchDexTokens(tokenAddresses);
+  let pairs = await fetchDexTokens(tokenAddresses);
+
+  // Dex /tokens batch often omits the real V3 WETH pool when many bags are scanned
+  // (GME alone: batch returns 1x V4 hub; /token-pairs returns V3 GME/WETH).
+  // Merge dedicated pair lists for tracked tokens + every bag still missing a tradeable pair.
+  const trackedTokens = trackedPairsList()
+    .map((entry) => normalizeAddress(entry?.baseTokenAddress))
+    .filter(isEvmAddress);
+  const needLookup = [
+    ...new Set([
+      ...trackedTokens,
+      ...tokenAddresses.filter((address) => !chooseBestPairForToken(pairs, address)),
+    ]),
+  ];
+  for (let index = 0; index < needLookup.length; index += 5) {
+    const chunk = needLookup.slice(index, index + 5);
+    const results = await Promise.all(
+      chunk.map(async (address) => {
+        try {
+          return await fetchTokenPairs(address);
+        } catch (error) {
+          console.warn(`Portfolio pair lookup failed for ${address}: ${error.message}`);
+          return [];
+        }
+      }),
+    );
+    for (const extra of results) {
+      if (Array.isArray(extra) && extra.length) pairs = pairs.concat(extra);
+    }
+  }
+
   const portfolio = buildPortfolioFromBalances(balances, pairs, options);
   return { wallet, ...portfolio };
 }
