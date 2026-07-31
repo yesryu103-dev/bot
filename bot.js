@@ -115,6 +115,7 @@ const config = {
   chainName: activeChain.name,
   dexLabel: activeChain.dexLabel,
   enableV4: Boolean(activeChain.enableV4),
+  v4PoolManagerAddress: normalizeAddress(process.env.V4_POOL_MANAGER || activeChain.poolManager || ""),
   feeTiers: Array.isArray(activeChain.feeTiers) ? activeChain.feeTiers : [10000, 3000, 500, 100],
   nativeSymbol: activeChain.nativeSymbol,
   wrappedSymbol: activeChain.wrappedSymbol,
@@ -137,7 +138,7 @@ const config = {
   stateFile: process.env.STATE_FILE || (activeChain.id === "bsc" ? "state.bsc.json" : "state.json"),
   maxItems: Number(process.env.MAX_ITEMS || 200),
   minUsd: Number(process.env.MIN_USD || 0),
-  minQuoteAmount: 1,
+  minQuoteAmount: Number(process.env.MIN_QUOTE_AMOUNT || 1),
   // Only alert swaps younger than this (realtime). Stale txs after sleep/redeploy are ignored.
   maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 90_000),
   rpcSwapLookbackBlocks: Number(process.env.RPC_SWAP_LOOKBACK_BLOCKS || 100),
@@ -447,12 +448,139 @@ function tradeFromV3SwapLog({ amount0, amount1, token0, token1, quoteToken, base
   };
 }
 
+/** Uni V4 PoolManager Swap → same alert shape as V3 (quote = native ETH/BNB leg). */
+function tradeFromV4SwapLog({ amount0, amount1, key, baseToken, txHash, blockNumber, timestampMs, sender }) {
+  if (!key) return null;
+  const { ethers } = require("ethers");
+  const base = normalizeAddress(baseToken);
+  const c0 = normalizeAddress(key.currency0);
+  const c1 = normalizeAddress(key.currency1);
+  const zero = "0x0000000000000000000000000000000000000000";
+  const quoteIs0 = c0 === zero || c0 === normalizeAddress(config.quoteTokenAddress);
+  const quoteIs1 = c1 === zero || c1 === normalizeAddress(config.quoteTokenAddress);
+  const baseIs0 = c0 === base;
+  const baseIs1 = c1 === base;
+  if (!(quoteIs0 || quoteIs1) || !(baseIs0 || baseIs1)) return null;
+
+  const quoteDelta = quoteIs0 ? BigInt(amount0) : BigInt(amount1);
+  const baseDelta = baseIs0 ? BigInt(amount0) : BigInt(amount1);
+  if (quoteDelta === 0n) return null;
+
+  const side = quoteDelta > 0n ? "BUY" : "SELL";
+  const quoteRaw = quoteDelta < 0n ? -quoteDelta : quoteDelta;
+  const baseRaw = baseDelta < 0n ? -baseDelta : baseDelta;
+  const quoteAmount = Number(ethers.formatUnits(quoteRaw, 18));
+  const baseAmount = Number(ethers.formatUnits(baseRaw, 18));
+  const minQuote = Number(config.minQuoteAmount);
+  if (Number.isFinite(minQuote) && minQuote > 0 && quoteAmount < minQuote * 0.95) return null;
+
+  return {
+    txHash: String(txHash || "").toLowerCase(),
+    blockNumber: Number(blockNumber || 0),
+    timestamp: new Date(timestampMs || Date.now()).toISOString(),
+    side,
+    trader: normalizeAddress(sender) || "",
+    baseRaw,
+    quoteRaw,
+    baseDecimals: 18,
+    quoteDecimals: 18,
+    baseAmount,
+    quoteAmount,
+    quoteUsdValue: Number.NaN,
+    priceUsd: Number.NaN,
+    dexVer: "v4",
+  };
+}
+
+const v4PoolKeyCache = new Map();
+
+function findTrackedForV4Pool(poolId) {
+  const id = normalizeAddress(poolId);
+  if (!isV4PoolId(id)) return null;
+  for (const entry of trackedPairsList()) {
+    const entryId = normalizeAddress(
+      entry?.v4TradePoolId || (isV4PoolId(entry?.pairAddress) ? entry.pairAddress : ""),
+    );
+    if (entryId === id) return entry;
+  }
+  return null;
+}
+
+function watchedV4PoolSet() {
+  const set = new Set();
+  if (!config.enableV4 || !config.v4PoolManagerAddress) return set;
+  for (const entry of trackedPairsList()) {
+    const id = normalizeAddress(
+      entry?.v4TradePoolId || (isV4PoolId(entry?.pairAddress) ? entry.pairAddress : ""),
+    );
+    if (isV4PoolId(id)) set.add(id);
+  }
+  if (config.tradeRoute === "v4" && isV4PoolId(config.v4TradePoolId)) {
+    set.add(normalizeAddress(config.v4TradePoolId));
+  }
+  return set;
+}
+
+function resolveV4PoolKey(poolId, baseTokenAddress) {
+  const id = normalizeAddress(poolId);
+  const cacheKey = `${id}:${normalizeAddress(baseTokenAddress)}`;
+  if (v4PoolKeyCache.has(cacheKey)) return v4PoolKeyCache.get(cacheKey);
+  const bestroute = require("./bestroute");
+  const key =
+    bestroute.recoverV4PoolKey(id, baseTokenAddress, bestroute.NATIVE_ETH) ||
+    bestroute.recoverV4PoolKey(id, bestroute.NATIVE_ETH, baseTokenAddress);
+  if (key) v4PoolKeyCache.set(cacheKey, key);
+  return key;
+}
+
+function handleLiveV4SwapEvent({ poolId, sender, amount0, amount1, txHash, blockNumber }, state) {
+  const hash = String(txHash || "").toLowerCase();
+  if (!hash) return;
+  if ((state.seen || []).includes(hash)) return;
+
+  const tracked = findTrackedForV4Pool(poolId);
+  if (!tracked) return;
+
+  const key = resolveV4PoolKey(poolId, tracked.baseTokenAddress);
+  if (!key) {
+    console.warn(`V4 alert skipped — cannot recover pool key for ${compactAddress(poolId)}`);
+    return;
+  }
+
+  const trade = tradeFromV4SwapLog({
+    amount0,
+    amount1,
+    key,
+    baseToken: tracked.baseTokenAddress,
+    txHash: hash,
+    blockNumber: Number(blockNumber || 0),
+    timestampMs: Date.now(),
+    sender,
+  });
+  if (!trade) {
+    claimSwapAlert(state, hash);
+    return;
+  }
+  if (!claimSwapAlert(state, hash)) return;
+
+  if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
+  const bn = Number(blockNumber || 0);
+  const cursorKey = `v4:${normalizeAddress(poolId)}`;
+  if (bn > 0) state.swapBlocks[cursorKey] = Math.max(Number(state.swapBlocks[cursorKey] || 0), bn);
+  saveState(state);
+
+  emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
+}
+
 async function initRpcSwapCursors(state) {
   if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
   const provider = getRpcProvider();
   const latest = Number(await provider.getBlockNumber());
   for (const pair of watchedPairSet()) {
     state.swapBlocks[pair] = latest;
+  }
+  for (const poolId of watchedV4PoolSet()) {
+    state.swapBlocks[`v4:${poolId}`] = latest;
   }
   saveState(state);
   return latest;
@@ -588,6 +716,90 @@ async function pollRpcSwaps(state, options = {}) {
     state.swapBlocks[pair] = latest;
   }
 
+  // Uni V4 PoolManager swaps for deepest V4 tracks (e.g. FRONG).
+  const v4Manager = config.v4PoolManagerAddress;
+  const v4Ids = [...watchedV4PoolSet()];
+  if (config.enableV4 && isEvmAddress(v4Manager) && v4Ids.length) {
+    const v4Iface = new ethers.Interface([
+      "event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)",
+    ]);
+    const v4Topic = v4Iface.getEvent("Swap").topicHash;
+    const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
+
+    for (const poolId of v4Ids) {
+      const cursorKey = `v4:${poolId}`;
+      let fromBlock = Number(state.swapBlocks[cursorKey] || 0);
+      if (!fromBlock || fromBlock < latest - lookback) fromBlock = latest - lookback;
+      if (fromBlock >= latest) {
+        state.swapBlocks[cursorKey] = latest;
+        continue;
+      }
+
+      const tracked = findTrackedForV4Pool(poolId);
+      if (!tracked) {
+        state.swapBlocks[cursorKey] = latest;
+        continue;
+      }
+      const key = resolveV4PoolKey(poolId, tracked.baseTokenAddress);
+      if (!key) {
+        state.swapBlocks[cursorKey] = latest;
+        continue;
+      }
+
+      let logs = [];
+      let scannedTo = fromBlock;
+      try {
+        for (let start = fromBlock + 1; start <= latest; start += maxRange) {
+          const end = Math.min(latest, start + maxRange - 1);
+          const chunk = await provider.getLogs({
+            address: v4Manager,
+            fromBlock: start,
+            toBlock: end,
+            topics: [v4Topic, poolId],
+          });
+          if (chunk.length) logs = logs.concat(chunk);
+          scannedTo = end;
+        }
+      } catch (error) {
+        if (scannedTo > fromBlock) state.swapBlocks[cursorKey] = scannedTo;
+        if (now - (pollRpcSwaps._lastLogsWarnAt || 0) > 60_000) {
+          console.warn(`RPC V4 getLogs failed for ${compactAddress(poolId)}: ${error.message}`);
+          pollRpcSwaps._lastLogsWarnAt = now;
+        }
+        continue;
+      }
+
+      for (const log of logs) {
+        const txHash = String(log.transactionHash || "").toLowerCase();
+        if (!txHash || seen.has(txHash)) continue;
+        let parsed;
+        try {
+          parsed = v4Iface.parseLog(log);
+        } catch {
+          continue;
+        }
+        const trade = tradeFromV4SwapLog({
+          amount0: parsed.args.amount0,
+          amount1: parsed.args.amount1,
+          key,
+          baseToken: tracked.baseTokenAddress,
+          txHash,
+          blockNumber: Number(log.blockNumber || 0),
+          timestampMs: now,
+          sender: parsed.args.sender,
+        });
+        if (!trade) {
+          seen.add(txHash);
+          continue;
+        }
+        alerted.push(txHash);
+        seen.add(txHash);
+        emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
+      }
+      state.swapBlocks[cursorKey] = latest;
+    }
+  }
+
   if (alerted.length) addSeen(state, alerted);
   saveState(state);
   return alerted.length;
@@ -611,6 +823,7 @@ const wsRuntime = {
   reconnectAttempts: 0,
   heartbeatFails: 0,
   listenedPairs: new Set(),
+  listenedV4Pools: new Set(),
   stateRef: null,
   reconnectTimer: null,
   heartbeatTimer: null,
@@ -837,6 +1050,7 @@ function destroyWsProvider() {
   wsRuntime.provider = null;
   wsRuntime.healthy = false;
   wsRuntime.listenedPairs.clear();
+  if (wsRuntime.listenedV4Pools) wsRuntime.listenedV4Pools.clear();
   try {
     old?.destroy?.();
   } catch {
@@ -925,6 +1139,44 @@ function startWsSwapListener(state) {
     getPoolMeta(pair).catch(() => {});
   }
 
+  // Uni V4 deepest-pool alerts (PoolManager Swap filtered by poolId).
+  wsRuntime.listenedV4Pools = new Set();
+  const v4Manager = config.v4PoolManagerAddress;
+  const v4Ids = [...watchedV4PoolSet()];
+  if (config.enableV4 && isEvmAddress(v4Manager) && v4Ids.length) {
+    const v4Abi = [
+      "event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)",
+    ];
+    const manager = new ethers.Contract(v4Manager, v4Abi, provider);
+    for (const poolId of v4Ids) {
+      const filter = manager.filters.Swap(poolId);
+      manager.on(filter, (id, sender, amount0, amount1, _sqrt, _liq, _tick, _fee, event) => {
+        if (wsRuntime.generation !== myGeneration) return;
+        const st = wsRuntime.stateRef || state;
+        const txHash = event?.log?.transactionHash || event?.transactionHash || "";
+        const blockNumber = event?.log?.blockNumber || event?.blockNumber || 0;
+        try {
+          handleLiveV4SwapEvent(
+            {
+              poolId: normalizeAddress(id) || poolId,
+              sender,
+              amount0,
+              amount1,
+              txHash,
+              blockNumber,
+            },
+            st,
+          );
+        } catch (error) {
+          console.error(`WS V4 Swap handler error: ${error.message}`);
+        }
+      });
+      wsRuntime.listenedV4Pools.add(poolId);
+      const tracked = findTrackedForV4Pool(poolId);
+      if (tracked?.baseTokenAddress) resolveV4PoolKey(poolId, tracked.baseTokenAddress);
+    }
+  }
+
   const rawSocket = provider.websocket;
   if (rawSocket?.on) {
     rawSocket.on("close", () => {
@@ -961,7 +1213,11 @@ function startWsSwapListener(state) {
   wsRuntime.healthy = true;
   wsRuntime.httpFallback = false;
   wsRuntime.reconnectAttempts = 0;
-  console.log(`✅ WS Swap listener active on ${wsRuntime.listenedPairs.size} pool(s).`);
+  console.log(
+    `✅ WS Swap listener active on ${wsRuntime.listenedPairs.size} V3 pool(s)` +
+      (wsRuntime.listenedV4Pools?.size ? ` + ${wsRuntime.listenedV4Pools.size} V4 poolId(s)` : "") +
+      ".",
+  );
   return true;
 }
 
@@ -972,10 +1228,15 @@ function refreshWsSwapListener(state) {
     startWsSwapListener(state);
     return;
   }
-  const wanted = [...watchedPairSet()];
-  const same =
-    wanted.length === wsRuntime.listenedPairs.size && wanted.every((pair) => wsRuntime.listenedPairs.has(pair));
-  if (!same) {
+  const wantedV3 = [...watchedPairSet()];
+  const wantedV4 = [...watchedV4PoolSet()];
+  const sameV3 =
+    wantedV3.length === wsRuntime.listenedPairs.size &&
+    wantedV3.every((pair) => wsRuntime.listenedPairs.has(pair));
+  const listenedV4 = wsRuntime.listenedV4Pools || new Set();
+  const sameV4 =
+    wantedV4.length === listenedV4.size && wantedV4.every((id) => listenedV4.has(id));
+  if (!sameV3 || !sameV4) {
     console.log("Tracked pools changed — refreshing WS subscriptions.");
     startWsSwapListener(state);
   }
@@ -3929,7 +4190,7 @@ function tradeMessage(trade) {
     priceLines.push(`Spot (chart): <b>${escapeHtml(formatUsd(spotPrice))}</b>`);
   }
   return [
-    `<b>${sideLabel} ${escapeHtml(baseSymbol)}</b> on Robinhood Uniswap v3`,
+    `<b>${sideLabel} ${escapeHtml(baseSymbol)}</b> on Robinhood Uniswap ${escapeHtml(trade.dexVer === "v4" ? "v4" : "v3")}`,
     `Amount: <b>${escapeHtml(formatUnits(trade.baseRaw, trade.baseDecimals, 4))} ${escapeHtml(baseSymbol)}</b>`,
     `Quote: <b>${escapeHtml(formatUnits(trade.quoteRaw, trade.quoteDecimals, 6))} ${escapeHtml(quoteSymbol)}</b> (${escapeHtml(formatUsd(trade.quoteUsdValue))})`,
     ...priceLines,
@@ -4907,6 +5168,7 @@ module.exports = {
   staticMainPanelText,
   trackedPairFromDexPair,
   tradeFromV3SwapLog,
+  tradeFromV4SwapLog,
   tradeMessage,
   tradeTimestampMs,
   preferredV3PoolForToken,

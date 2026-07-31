@@ -19,6 +19,8 @@ const CHAINS = {
     defaultFee: 10000,
     feeTiers: [10000, 3000, 500, 100],
     enableV4: true,
+    // Robinhood Uni V4 singleton (Blockscout name: PoolManager).
+    poolManager: "0x8366a39CC670B4001A1121B8F6A443A643e40951",
     // Sample pair for docs / empty boot (REPE/WETH).
     defaultPair: "0xb541c2936982dd5c4090783d8f395d3e613c8016",
     defaultBase: "0x5266eeaff092d6136ab63d18b975a60a0cc0c8f7",
@@ -41,6 +43,7 @@ const CHAINS = {
     defaultFee: 2500,
     feeTiers: [2500, 10000, 500, 100, 3000],
     enableV4: false,
+    poolManager: "",
     defaultPair: "",
     defaultBase: "",
     defaultBaseSymbol: "TOKEN",

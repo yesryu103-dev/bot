@@ -247,6 +247,48 @@ test("v3 swap log decoder flags 2 ETH buy", () => {
   assert.equal(trade.quoteAmount, 2);
 });
 
+test("v4 swap log decoder flags 1.5 ETH buy on native/token pool", () => {
+  const token = "0x6245e67affa44a23077f0ea7f981a8dc743a0c47";
+  const trade = bot.tradeFromV4SwapLog({
+    amount0: 15n * 10n ** 17n, // pool received 1.5 ETH
+    amount1: -(50_000n * 10n ** 18n),
+    key: {
+      currency0: "0x0000000000000000000000000000000000000000",
+      currency1: token,
+      fee: 2500,
+      tickSpacing: 60,
+      hooks: "0x0000000000000000000000000000000000000000",
+    },
+    baseToken: token,
+    txHash: "0xdef",
+    blockNumber: 2,
+    timestampMs: Date.now(),
+    sender: "0x2222222222222222222222222222222222222222",
+  });
+  assert.ok(trade);
+  assert.equal(trade.side, "BUY");
+  assert.equal(trade.quoteAmount, 1.5);
+  assert.equal(trade.dexVer, "v4");
+
+  const small = bot.tradeFromV4SwapLog({
+    amount0: 10n ** 17n, // 0.1 ETH — below 1 ETH min
+    amount1: -(1000n * 10n ** 18n),
+    key: {
+      currency0: "0x0000000000000000000000000000000000000000",
+      currency1: token,
+      fee: 2500,
+      tickSpacing: 60,
+      hooks: "0x0000000000000000000000000000000000000000",
+    },
+    baseToken: token,
+    txHash: "0xsmall",
+    blockNumber: 3,
+    timestampMs: Date.now(),
+    sender: "0x2222222222222222222222222222222222222222",
+  });
+  assert.equal(small, null);
+});
+
 test("main menu looks like a trading dashboard", () => {
   const keyboard = bot.mainMenuKeyboard();
   const labels = keyboard.inline_keyboard.flat().map((button) => button.text);
