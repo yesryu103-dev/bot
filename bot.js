@@ -1343,10 +1343,42 @@ async function fetchTokenPairs(tokenAddress) {
   return fetchJson(`https://api.dexscreener.com/token-pairs/v1/${config.chainId}/${tokenAddress}`);
 }
 
+async function fetchErc20BalanceRaw(tokenAddress, walletAddress) {
+  const { ethers } = require("ethers");
+  const token = new ethers.Contract(
+    tokenAddress,
+    ["function balanceOf(address) view returns (uint256)"],
+    getRpcProvider(),
+  );
+  const bal = await withTimeout(token.balanceOf(walletAddress), 5000, "balanceOf");
+  return bal.toString();
+}
+
+async function reconcileTokenBalancesWithRpc(walletAddress, balances) {
+  const wallet = normalizeAddress(walletAddress);
+  if (!isEvmAddress(wallet) || !Array.isArray(balances) || !balances.length) return balances || [];
+
+  // Blockscout token-balances often lag after sells (hours). Prefer live RPC balanceOf.
+  return Promise.all(
+    balances.map(async (entry) => {
+      const parsed = parseWalletBalanceEntry(entry);
+      if (!parsed.address || !String(parsed.type || "").includes("ERC-20")) return entry;
+      try {
+        const live = await fetchErc20BalanceRaw(parsed.address, wallet);
+        return { ...entry, value: live };
+      } catch (error) {
+        console.warn(`RPC balanceOf failed for ${parsed.address}: ${error.message}`);
+        return entry;
+      }
+    }),
+  );
+}
+
 async function fetchWalletTokenBalances(walletAddress) {
   const url = `${config.blockscoutBaseUrl}/api/v2/addresses/${walletAddress}/token-balances`;
   const payload = await fetchJson(url);
-  return Array.isArray(payload) ? payload : payload.items || [];
+  const balances = Array.isArray(payload) ? payload : payload.items || [];
+  return reconcileTokenBalancesWithRpc(walletAddress, balances);
 }
 
 async function fetchDexTokens(tokenAddresses) {
@@ -2830,12 +2862,22 @@ function parseWalletBalanceEntry(entry) {
   };
 }
 
+/** Portfolio mark: deepest Uni V3 WETH or Uni V4 ETH (same idea as trade route). */
+function chooseBestPortfolioPairForToken(pairs, tokenAddress) {
+  const picked = chooseBestTradePairForToken(pairs, tokenAddress);
+  return picked?.pair || null;
+}
+
+function isPortfolioPairRef(value) {
+  return isEvmAddress(value) || isV4PoolId(value);
+}
+
 function bestPairMapForTokens(pairs, tokenAddresses) {
   const wanted = new Set((tokenAddresses || []).map(normalizeAddress));
   const bestByToken = new Map();
 
   for (const address of wanted) {
-    const pair = chooseBestPairForToken(pairs, address);
+    const pair = chooseBestPortfolioPairForToken(pairs, address);
     if (pair) bestByToken.set(address, pair);
   }
 
@@ -2875,7 +2917,8 @@ function isBagSellableItem(item) {
   if (item.address === normalizeAddress(config.quoteTokenAddress)) return false;
   if (!(Number(item.amount) > 0)) return false;
   if (!Number.isFinite(Number(item.priceUsd)) || Number(item.priceUsd) <= 0) return false;
-  if (!isEvmAddress(item.pairAddress)) return false;
+  // V3 pair address (20 bytes) or V4 pool id (32 bytes) — both chart/tradeable on Dex.
+  if (!isPortfolioPairRef(item.pairAddress)) return false;
   // Reject junk/scam Dex quotes (tiny LP or absurd USD).
   const minLiq = Number(config.minPortfolioLiquidityUsd);
   if (Number.isFinite(minLiq) && minLiq > 0) {
@@ -2896,9 +2939,10 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
   const minValueUsd = Number(options.minValueUsd ?? config.minPortfolioValueUsd);
   const maxTokens = Number(options.maxTokens ?? config.portfolioMaxTokens);
   const filterOptions = { minLiquidityUsd, minValueUsd };
+  // Drop dust leftovers (e.g. 1 wei after a full sell) so Bags stay clean.
   const parsed = (balances || [])
     .map(parseWalletBalanceEntry)
-    .filter((item) => item.address && item.type.includes("ERC-20") && item.amount > 0);
+    .filter((item) => item.address && item.type.includes("ERC-20") && item.raw > 1000n && item.amount > 0);
 
   const bestByToken = bestPairMapForTokens(pairs, parsed.map((item) => item.address));
   const tradeable = [];
@@ -2921,7 +2965,7 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
       priceUsd,
       liquidityUsd,
       valueUsd,
-      pairAddress: normalizeAddress(pair?.pairAddress || ""),
+      pairAddress: normalizeAddress(pair?.pairAddress || "") || String(pair?.pairAddress || ""),
       pairUrl: pair?.url || (pair?.pairAddress ? `https://dexscreener.com/${config.chainId}/${pair.pairAddress}` : ""),
     };
 
@@ -2929,7 +2973,6 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
 
     if (isTradeablePortfolioItem(enriched, filterOptions)) {
       tradeable.push(enriched);
-      if (Number.isFinite(valueUsd) && valueUsd > 0) totalUsd += valueUsd;
     } else {
       skipped += 1;
     }
@@ -2939,6 +2982,10 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
   bagCandidates.sort((a, b) => Number(b.valueUsd || 0) - Number(a.valueUsd || 0));
   const items = tradeable.slice(0, maxTokens).map(serializePortfolioItem);
   const bagItems = bagCandidates.slice(0, 6).map(serializePortfolioItem);
+  // Total USD matches Bags the user sees (not Hidden junk).
+  for (const item of bagItems) {
+    if (Number.isFinite(Number(item.valueUsd)) && Number(item.valueUsd) > 0) totalUsd += Number(item.valueUsd);
+  }
 
   return {
     items,
@@ -2967,7 +3014,7 @@ async function buildPortfolio(walletAddress, options = {}) {
   const trackedTokens = trackedPairsList()
     .map((entry) => normalizeAddress(entry?.baseTokenAddress))
     .filter(isEvmAddress);
-  const missing = tokenAddresses.filter((address) => !chooseBestPairForToken(pairs, address));
+  const missing = tokenAddresses.filter((address) => !chooseBestPortfolioPairForToken(pairs, address));
   const needLookup = [...new Set([...trackedTokens, ...missing])].slice(0, 10);
   for (let index = 0; index < needLookup.length; index += 5) {
     const chunk = needLookup.slice(index, index + 5);
@@ -2987,7 +3034,7 @@ async function buildPortfolio(walletAddress, options = {}) {
   }
 
   const portfolio = buildPortfolioFromBalances(balances, pairs, options);
-  return { wallet, ...portfolio };
+  return { wallet, liveBalances: balances, ...portfolio };
 }
 
 function portfolioSectionText(portfolio, state = null) {
@@ -3071,8 +3118,32 @@ function cachePortfolioSnapshot(state, portfolio) {
     skipped: snapshot.skipped,
     updatedAt: snapshot.updatedAt,
   };
+  syncPositionsWithLiveBags(state, bagItems, portfolio.liveBalances);
   saveState(state);
   return snapshot;
+}
+
+/** Drop cost-basis when on-chain bag is gone (sold / dust) so Entry doesn't orphan. */
+function syncPositionsWithLiveBags(state, bagItems, liveBalances) {
+  const positions = ensurePositions(state);
+  const liveAddrs = new Set();
+  for (const entry of liveBalances || []) {
+    const parsed = parseWalletBalanceEntry(entry);
+    if (parsed.address && parsed.raw > 1000n && parsed.amount > 0) liveAddrs.add(parsed.address);
+  }
+  for (const item of bagItems || []) {
+    const addr = normalizeAddress(item?.address);
+    if (isEvmAddress(addr)) liveAddrs.add(addr);
+  }
+  let changed = false;
+  for (const token of Object.keys(positions)) {
+    const addr = normalizeAddress(token);
+    if (!liveAddrs.has(addr)) {
+      delete positions[token];
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 async function resolveMenuPortfolio(state = {}, { forceRefresh = false } = {}) {
@@ -3080,17 +3151,22 @@ async function resolveMenuPortfolio(state = {}, { forceRefresh = false } = {}) {
   if (!wallet) return null;
 
   const cached = state.portfolioSnapshot;
+  const cacheMs = Number(process.env.PORTFOLIO_CACHE_MS || 45_000);
+  const cacheAge = cached?.updatedAt ? Date.now() - Date.parse(cached.updatedAt) : Number.POSITIVE_INFINITY;
+  const cacheFresh =
+    Number.isFinite(cacheAge) && cacheAge >= 0 && cacheAge < (Number.isFinite(cacheMs) ? cacheMs : 45_000);
   if (
     !forceRefresh &&
     cached?.wallet === wallet &&
     Array.isArray(cached.items) &&
-    !cached.error
+    !cached.error &&
+    cacheFresh
   ) {
     return cached;
   }
 
   try {
-    const portfolio = await withTimeout(buildPortfolio(wallet), 12_000, "Portfolio");
+    const portfolio = await withTimeout(buildPortfolio(wallet), 20_000, "Portfolio");
     return cachePortfolioSnapshot(state, portfolio);
   } catch (error) {
     if (cached?.wallet === wallet && Array.isArray(cached.items)) {
@@ -3118,7 +3194,7 @@ function invalidatePortfolioCache(state) {
 async function refreshPortfolioAfterTrade(state) {
   invalidatePortfolioCache(state);
   try {
-    return await withTimeout(resolveMenuPortfolio(state, { forceRefresh: true }), 12_000, "Post-trade portfolio");
+    return await withTimeout(resolveMenuPortfolio(state, { forceRefresh: true }), 20_000, "Post-trade portfolio");
   } catch (error) {
     console.warn(`Post-trade portfolio refresh failed: ${error.message}`);
     return null;
@@ -5129,6 +5205,7 @@ module.exports = {
   buildPortfolioFromBalances,
   chooseBestPairForToken,
   chooseBestTradePairForToken,
+  chooseBestPortfolioPairForToken,
   chooseWatchPairAddresses,
   classifyFromTransaction,
   config,

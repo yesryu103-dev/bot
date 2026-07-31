@@ -688,6 +688,53 @@ test("portfolio keeps liquid tokens and hides junk", () => {
   assert.equal(portfolio.items[0].raw, undefined);
 });
 
+test("portfolio bags price V4 ETH pools and skip dust raw balances", () => {
+  const frong = "0x6245e67affa44a23077f0ea7f981a8dc743a0c47";
+  const poolId = `0x${"ab".repeat(32)}`;
+  const balances = [
+    {
+      value: "34155700000000000000000",
+      token: { address_hash: frong, symbol: "FRONG", decimals: "18", type: "ERC-20" },
+    },
+    {
+      value: "1",
+      token: {
+        address_hash: "0x9999999999999999999999999999999999999999",
+        symbol: "DUST",
+        decimals: "18",
+        type: "ERC-20",
+      },
+    },
+  ];
+  const pairs = [
+    {
+      chainId: "robinhood",
+      pairAddress: poolId,
+      url: `https://dexscreener.com/robinhood/${poolId}`,
+      labels: ["v4"],
+      baseToken: { address: frong, symbol: "FRONG" },
+      quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" },
+      priceUsd: "0.003851",
+      liquidity: { usd: 250000 },
+    },
+  ];
+
+  const portfolio = bot.buildPortfolioFromBalances(balances, pairs, {
+    minLiquidityUsd: 50,
+    minValueUsd: 3,
+    maxTokens: 10,
+  });
+
+  assert.equal(portfolio.bagItems.length, 1);
+  assert.equal(portfolio.bagItems[0].symbol, "FRONG");
+  assert.ok(portfolio.bagItems[0].valueUsd > 100);
+  assert.ok(portfolio.totalUsd > 100);
+  assert.equal(
+    portfolio.bagItems.some((item) => item.symbol === "DUST"),
+    false,
+  );
+});
+
 test("portfolio keyboard exposes Update Price", () => {
   const keyboard = bot.portfolioKeyboard();
   assert.equal(keyboard.inline_keyboard[0][0].callback_data, "portfolio:refresh");
