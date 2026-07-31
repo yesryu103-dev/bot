@@ -1,5 +1,5 @@
 /**
- * Best-price routing for Robinhood: compare Uni V3 WETH pool vs Uni V4 native-ETH pool.
+ * Uni V4 ETH helpers for Robinhood (fallback when Uni V3 WETH quote is unavailable).
  * Never routes through USDG / stock-GME hubs (those multi-hop paths lose retail size).
  */
 const { ethers } = require("ethers");

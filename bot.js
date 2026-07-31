@@ -1517,83 +1517,29 @@ async function pickBestTradeRoute({
     return out;
   }
 
-  async function quoteV3Amount(partIn) {
-    if (!v3Quote || partIn <= 0n) return 0n;
-    if (partIn === amountIn) return v3Quote.amountOut;
-    try {
-      const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, partIn, preferredFee);
-      return quoted?.amountOut > 0n ? quoted.amountOut : 0n;
-    } catch {
-      return 0n;
-    }
+  // Prefer straight Uni V3 WETH whenever it quotes — thick V3 pools are what users force-track.
+  // V4 is fallback only (V3 quote missing/failed), not a "best price" contest with inflated Dex marks.
+  if (v3Quote) {
+    console.log(`Route Uni V3 out=${ethers.formatEther(v3Quote.amountOut)}`);
+    return v3Quote;
   }
 
-  const candidates = [];
-  // Try pure pools + splits (like Uniswap UI) — pick max ETH/token out.
-  const ratios = buyWithNativeEth || sellToNativeEth ? [0, 25, 50, 75, 100] : [100];
-  for (const pctV3 of ratios) {
-    const part3 = (amountIn * BigInt(pctV3)) / 100n;
-    const part4 = amountIn - part3;
-    if (part3 > 0n && !v3Quote) continue;
-    if (part4 > 0n && !v4Meta) continue;
-    const out3 = await quoteV3Amount(part3);
-    const out4 = await quoteV4Amount(part4);
-    const total = out3 + out4;
-    if (total <= 0n) continue;
-    if (pctV3 === 100) {
-      candidates.push({ ...v3Quote, amountOut: total });
-    } else if (pctV3 === 0) {
-      candidates.push({
+  if (v4Meta) {
+    const out4 = await quoteV4Amount(amountIn);
+    if (out4 > 0n) {
+      const best = {
         kind: "v4",
         label: "Uni V4 ETH",
-        amountOut: total,
+        amountOut: out4,
         poolId: v4Meta.poolId,
         key: v4Meta.key,
-      });
-    } else {
-      // Split: execute the larger leg only for now (atomic split needs more UR wiring).
-      // Prefer the single pool that alone quotes closest to this split total.
-      const pure3 = v3Quote?.amountOut || 0n;
-      const pure4 = await quoteV4Amount(amountIn);
-      if (pure4 >= pure3 && pure4 > 0n) {
-        candidates.push({
-          kind: "v4",
-          label: `Uni V4 ETH (~${100 - pctV3}% split-aware)`,
-          amountOut: pure4 > total ? pure4 : total,
-          poolId: v4Meta.poolId,
-          key: v4Meta.key,
-        });
-      } else if (pure3 > 0n) {
-        candidates.push({
-          kind: "v3",
-          label: `Uni V3 WETH (~${pctV3}% split-aware)`,
-          amountOut: pure3 > total ? pure3 : total,
-          fee: v3Quote.fee,
-        });
-      }
+      };
+      console.log(`Route Uni V4 ETH (V3 unavailable) out=${ethers.formatEther(out4)}`);
+      return best;
     }
   }
 
-  candidates.sort((a, b) => (a.amountOut < b.amountOut ? 1 : a.amountOut > b.amountOut ? -1 : 0));
-  // Dedupe by kind keeping highest out
-  const seen = new Set();
-  const uniq = [];
-  for (const c of candidates) {
-    const k = c.kind;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    uniq.push(c);
-  }
-  uniq.sort((a, b) => (a.amountOut < b.amountOut ? 1 : a.amountOut > b.amountOut ? -1 : 0));
-  if (!uniq.length) throw new Error("No V3/V4 quote available. Try again in a few seconds.");
-  const best = uniq[0];
-  const alt = uniq[1];
-  console.log(
-    alt
-      ? `Best route ${best.label} out=${ethers.formatEther(best.amountOut)} > ${alt.label} out=${ethers.formatEther(alt.amountOut)}`
-      : `Best route ${best.label} out=${ethers.formatEther(best.amountOut)}`,
-  );
-  return best;
+  throw new Error("No V3/V4 quote available. Try again in a few seconds.");
 }
 
 async function executeSwap(side, amountText, overrides = {}) {
@@ -4426,7 +4372,7 @@ async function main() {
   console.log("Starting telegram-bot...");
   console.log(
     `Chain: ${config.chainName} (${config.chainId}) · ${config.dexLabel} V3` +
-      (config.enableV4 ? " + Uni V4 ETH" : "") +
+      (config.enableV4 ? " (V4 ETH fallback)" : "") +
       ` · quote ${config.quoteSymbol}`,
   );
   startHealthServer();
