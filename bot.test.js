@@ -494,11 +494,20 @@ test("best pair selection prefers WETH quote and highest liquidity", () => {
       quoteToken: { address: weth, symbol: "WETH" },
       liquidity: { usd: 100 },
     },
+    {
+      chainId: "robinhood",
+      pairAddress: "0xdddddddddddddddddddddddddddddddddddddddd",
+      labels: ["v3"],
+      baseToken: { address: token, symbol: "AAA" },
+      quoteToken: { address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", symbol: "USDG" },
+      liquidity: { usd: 500000 },
+    },
   ];
 
   const pair = bot.chooseBestPairForToken(pairs, token);
 
   assert.equal(pair.pairAddress, "0xcccccccccccccccccccccccccccccccccccccccc");
+  assert.equal(bot.chooseBestPairForToken(pairs.slice(0, 1), token), null);
 });
 
 test("trade smaller than minimum quote amount is ignored", () => {
@@ -536,7 +545,7 @@ test("near-threshold 1 ETH buy is still alerted", () => {
   assert.ok(trade.quoteAmount >= 0.95);
 });
 
-test("watch pair list keeps primary and extra WETH pools", () => {
+test("watch pair list keeps only primary V3 pool", () => {
   const token = "0x020bfc650a365f8bb26819deaabf3e21291018b4";
   const watched = bot.chooseWatchPairAddresses(
     [
@@ -568,9 +577,7 @@ test("watch pair list keeps primary and extra WETH pools", () => {
     token,
     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   );
-  assert.ok(watched.includes("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-  assert.ok(watched.includes("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-  assert.equal(watched.some((item) => item.startsWith("0xccc")), false);
+  assert.deepEqual(watched, ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
 });
 
 test("portfolio keeps liquid tokens and hides junk", () => {
@@ -656,4 +663,41 @@ test("portfolio wallet prefers state over config", () => {
     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   );
   bot.config.walletAddress = original;
+});
+
+test("buy fill records entry and DCA average", () => {
+  const token = "0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3";
+  const state = { positions: {} };
+  const first = bot.recordBuyFill(state, {
+    tokenAddress: token,
+    symbol: "GME",
+    tokenAmount: 1000,
+    ethSpent: 0.1,
+    ethUsd: 2000,
+  });
+  // 0.1 ETH * $2000 = $200 → entry $0.20
+  assert.equal(first.isDca, false);
+  assert.ok(Math.abs(first.fillEntryUsd - 0.2) < 1e-9);
+  assert.ok(Math.abs(first.position.avgEntryUsd - 0.2) < 1e-9);
+
+  const second = bot.recordBuyFill(state, {
+    tokenAddress: token,
+    symbol: "GME",
+    tokenAmount: 1000,
+    ethSpent: 0.05,
+    ethUsd: 2000,
+  });
+  // +$100 for 1000 → total $300 / 2000 = $0.15 avg
+  assert.equal(second.isDca, true);
+  assert.ok(Math.abs(second.fillEntryUsd - 0.1) < 1e-9);
+  assert.ok(Math.abs(second.position.avgEntryUsd - 0.15) < 1e-9);
+  assert.equal(second.position.amount, 2000);
+
+  const sold = bot.recordSellFill(state, { tokenAddress: token, tokenAmount: 1000 });
+  assert.equal(sold.closed, false);
+  assert.ok(Math.abs(sold.position.amount - 1000) < 1e-9);
+  assert.ok(Math.abs(sold.position.avgEntryUsd - 0.15) < 1e-9);
+
+  assert.equal(bot.formatPnlPct(0.15, 0.18), "+20.0%");
+  assert.ok(bot.positionEntryLines(second.position, { fillEntryUsd: 0.1, isDca: true }).length >= 2);
 });

@@ -336,11 +336,6 @@ function getRpcProvider() {
   return getHttpRpcProvider();
 }
 
-/** @deprecated alias — buy/sell uses the same preferred provider. */
-function getTradeProvider() {
-  return getRpcProvider();
-}
-
 function isRpcTransportError(error) {
   const message = String(error?.message || error || "");
   return /websocket|web socket|socket|ECONNRESET|ETIMEDOUT|ECONNREFUSED|fetch failed|network|provider destroyed|connection|closed before|bad response/i.test(
@@ -1084,6 +1079,7 @@ async function fetchDexTokens(tokenAddresses) {
 
 
 function loadState() {
+  if (saveStatePending) return saveStatePending;
   if (!fs.existsSync(config.stateFile)) return { seen: [] };
 
   try {
@@ -1557,6 +1553,7 @@ async function executeSwap(side, amountText, overrides = {}) {
   const quoteSymbol = overrides.quoteSymbol || config.quoteSymbol;
   let swapFee = Number(overrides.fee || config.uniswapV3Fee);
   let decimalsIn = Number.isFinite(Number(overrides.decimals)) ? Number(overrides.decimals) : 18;
+  let baseDecimals = Number.isFinite(Number(overrides.decimals)) ? Number(overrides.decimals) : Number.NaN;
   const decimalsOut = 18;
 
   const { ethers } = require("ethers");
@@ -1570,8 +1567,11 @@ async function executeSwap(side, amountText, overrides = {}) {
   const buyWithNativeEth = side === "BUY" && isQuoteWethToken(tokenIn);
   const sellToNativeEth = side === "SELL" && isQuoteWethToken(tokenOut);
 
-  if (!buyWithNativeEth && side === "SELL" && !Number.isFinite(Number(overrides.decimals))) {
-    decimalsIn = await readTokenDecimals(tokenIn, provider, 18);
+  if (!Number.isFinite(baseDecimals)) {
+    baseDecimals = await readTokenDecimals(baseTokenAddress, provider, 18);
+  }
+  if (!buyWithNativeEth && side === "SELL") {
+    decimalsIn = baseDecimals;
   }
 
   const erc20Abi = [
@@ -1585,7 +1585,47 @@ async function executeSwap(side, amountText, overrides = {}) {
     "function multicall(bytes[] data) payable returns (bytes[] results)",
   ];
   const inputToken = new ethers.Contract(tokenIn, erc20Abi, wallet);
+  const baseTokenContract = new ethers.Contract(baseTokenAddress, erc20Abi, wallet);
   const pairAddress = normalizeAddress(overrides.pairAddress || config.pairAddress || "");
+  const preBaseBalance = await rpcCall("balanceOf(base)", () => baseTokenContract.balanceOf(wallet.address));
+
+  const buildTradeResult = (tx, routeLabelFinal) => {
+    const outDecimals = side === "BUY" ? baseDecimals : decimalsOut;
+    return {
+      hash: tx.hash,
+      wallet: wallet.address,
+      side,
+      baseTokenAddress,
+      baseSymbol,
+      baseDecimals,
+      preBaseBalance: preBaseBalance.toString(),
+      soldTokenAmount: side === "SELL" ? ethers.formatUnits(amountIn, baseDecimals) : "",
+      expectedTokenAmount:
+        side === "BUY" ? ethers.formatUnits(best.amountOut, baseDecimals) : "",
+      tokenInSymbol,
+      tokenOutSymbol: sellToNativeEth ? "ETH" : tokenOutSymbol,
+      minOut: ethers.formatUnits(minOut, outDecimals),
+      paidNative: buyWithNativeEth ? ethers.formatEther(payValue) : "",
+      receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
+      routeLabel: routeLabelFinal,
+      confirm: async () => {
+        try {
+          const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `confirm ${tx.hash}`);
+          if (!receipt || Number(receipt.status) !== 1) {
+            throw new Error(`Swap reverted on-chain. Tx: ${tx.hash}`);
+          }
+          return receipt;
+        } catch (error) {
+          const hash = extractTxHash(tx.hash, error);
+          throw new Error(
+            hash
+              ? `Swap reverted on-chain. Tx: ${hash}. ${formatSwapError(error)}`
+              : formatSwapError(error),
+          );
+        }
+      },
+    };
+  };
 
   let amountIn;
   let knownBalance = null;
@@ -1683,30 +1723,7 @@ async function executeSwap(side, amountText, overrides = {}) {
         wallet.sendTransaction({ to: UNIVERSAL_ROUTER_V4, data, value: payValue, ...gasOverrides }),
       );
       assertTradeTx(tx, "v4");
-      return {
-        hash: tx.hash,
-        wallet: wallet.address,
-        tokenInSymbol,
-        tokenOutSymbol: sellToNativeEth ? "ETH" : tokenOutSymbol,
-        minOut: ethers.formatUnits(minOut, decimalsOut),
-        paidNative: buyWithNativeEth ? ethers.formatEther(payValue) : "",
-        receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
-        routeLabel,
-        confirm: async () => {
-          try {
-            const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `confirm ${tx.hash}`);
-            if (!receipt || Number(receipt.status) !== 1) {
-              throw new Error(`Swap reverted on-chain. Tx: ${tx.hash}`);
-            }
-            return receipt;
-          } catch (error) {
-            const hash = extractTxHash(tx.hash, error);
-            throw new Error(
-              hash ? `Swap reverted on-chain. Tx: ${hash}. ${formatSwapError(error)}` : formatSwapError(error),
-            );
-          }
-        },
-      };
+      return buildTradeResult(tx, routeLabel);
     }
   }
 
@@ -1833,33 +1850,7 @@ async function executeSwap(side, amountText, overrides = {}) {
     throw new Error(formatSwapError(error));
   }
 
-  return {
-    hash: tx.hash,
-    wallet: wallet.address,
-    tokenInSymbol,
-    tokenOutSymbol: sellToNativeEth ? "ETH" : tokenOutSymbol,
-    minOut: ethers.formatUnits(minOut, decimalsOut),
-    paidNative: buyWithNativeEth ? ethers.formatEther(payValue) : "",
-    receivedNative: sellToNativeEth ? ethers.formatUnits(minOut, decimalsOut) : "",
-    routeLabel,
-    // Confirm separately so Telegram can show the tx hash immediately (OKX-like feel).
-    confirm: async () => {
-      try {
-        const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `confirm ${tx.hash}`);
-        if (!receipt || Number(receipt.status) !== 1) {
-          throw new Error(`Swap reverted on-chain. Tx: ${tx.hash}`);
-        }
-        return receipt;
-      } catch (error) {
-        const hash = extractTxHash(tx.hash, error);
-        throw new Error(
-          hash
-            ? `Swap reverted on-chain. Tx: ${hash}. ${formatSwapError(error)}`
-            : formatSwapError(error),
-        );
-      }
-    },
-  };
+  return buildTradeResult(tx, routeLabel);
 }
 
 function parseBuyAmountText(text) {
@@ -1901,40 +1892,6 @@ function parseQuickTradeCallback(data) {
   if (parseSellPercent(amount) !== null) return { side, amount: amount.toUpperCase() };
   if (/^[0-9]*\.?[0-9]+$/.test(amount)) return { side, amount };
   return null;
-}
-
-async function ensureRouterApprovals(state = null) {
-  if (!config.tradeEnabled || !config.walletPrivateKey || !config.rpcUrl) return;
-
-  await withRpcFallback("Router pre-approve", async (provider) => {
-    const { ethers } = require("ethers");
-    const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
-    const erc20Abi = [
-      "function allowance(address owner,address spender) view returns (uint256)",
-      "function approve(address spender,uint256 amount) returns (bool)",
-    ];
-    const snapshot = state || loadState();
-    const bagTokens = (snapshot?.portfolioSnapshot?.bagItems || [])
-      .map((item) => normalizeAddress(item?.address))
-      .filter(isEvmAddress);
-    const tokens = [...new Set([config.baseTokenAddress, ...bagTokens].map(normalizeAddress).filter(isEvmAddress))];
-
-    for (const token of tokens) {
-      try {
-        const tokenContract = new ethers.Contract(token, erc20Abi, wallet);
-        const allowance = await tokenContract.allowance(wallet.address, config.swapRouterAddress);
-        if (allowance >= ethers.MaxUint256 / 2n) continue;
-        console.log(`Pre-approving router for ${compactAddress(token)} via ${isWsProviderReady() ? "WSS" : "HTTP"}...`);
-        const tx = await tokenContract.approve(config.swapRouterAddress, ethers.MaxUint256);
-        const receipt = await tx.wait(1);
-        if (!receipt || receipt.status !== 1) {
-          console.warn(`Pre-approve failed for ${token}`);
-        }
-      } catch (error) {
-        console.warn(`Pre-approve skipped for ${token}: ${error.message}`);
-      }
-    }
-  });
 }
 
 function parseSellPercent(amountText) {
@@ -1980,11 +1937,9 @@ function chooseBestPairForToken(pairs, tokenAddress) {
     );
   };
 
-  // Prefer v3 pools vs wrapped native (WETH/WBNB).
+  // Only Uni V3 vs wrapped native (WETH/WBNB) — never fall back to V3/USDG hubs.
   const tradeable = validPairs.filter((pair) => isV3Pair(pair) && isWethPair(pair) && Number(pair.liquidity?.usd || 0) > 0);
-  const ranked = (tradeable.length ? tradeable : validPairs.filter((pair) => isV3Pair(pair))).sort(
-    (a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0),
-  );
+  const ranked = tradeable.sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
 
   return ranked[0] || null;
 }
@@ -2031,13 +1986,12 @@ function isV4PoolId(value) {
 function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") {
   const token = normalizeAddress(tokenAddress);
   const primary = normalizeAddress(primaryPairAddress);
-  const watched = [];
+  // One pool per token keeps WSS/getLogs light. Prefer forced/primary V3, else deepest V3 WETH.
   if (primary) {
     const primaryPair = (Array.isArray(pairs) ? pairs : []).find(
       (pair) => normalizeAddress(pair.pairAddress) === primary,
     );
-    // Never watch a v4 pool with the v3 Swap listener / getPoolMeta ABI.
-    if (!primaryPair || isV3Pair(primaryPair)) watched.push(primary);
+    if (!primaryPair || isV3Pair(primaryPair)) return [primary];
   }
 
   const ranked = (Array.isArray(pairs) ? pairs : [])
@@ -2059,15 +2013,12 @@ function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") 
         baseSym === "BNB" ||
         quote === config.quoteTokenAddress ||
         base === config.quoteTokenAddress;
-      return isWeth && isV3Pair(pair) && Number(pair.liquidity?.usd || 0) >= 1000;
+      return isWeth && isV3Pair(pair) && Number(pair.liquidity?.usd || 0) > 0;
     })
     .sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
 
-  for (const pair of ranked.slice(0, 4)) {
-    const address = normalizeAddress(pair.pairAddress);
-    if (address && !watched.includes(address)) watched.push(address);
-  }
-  return watched;
+  const best = normalizeAddress(ranked[0]?.pairAddress || "");
+  return best ? [best] : [];
 }
 
 function trackedPairsList() {
@@ -2269,6 +2220,182 @@ function formatPriceUsd(value) {
   return `$${value.toPrecision(4)}`;
 }
 
+function ensurePositions(state) {
+  if (!state.positions || typeof state.positions !== "object" || Array.isArray(state.positions)) {
+    state.positions = {};
+  }
+  return state.positions;
+}
+
+function getPosition(state, tokenAddress) {
+  const token = normalizeAddress(tokenAddress);
+  if (!isEvmAddress(token)) return null;
+  const pos = state?.positions?.[token];
+  if (!pos || !(Number(pos.amount) > 0)) return null;
+  return pos;
+}
+
+/** Weighted-average cost basis after a buy (DCA). */
+function recordBuyFill(state, { tokenAddress, symbol, tokenAmount, ethSpent, ethUsd }) {
+  const token = normalizeAddress(tokenAddress);
+  const amount = Number(tokenAmount);
+  const eth = Number(ethSpent);
+  const usdPerEth = Number(ethUsd);
+  if (!isEvmAddress(token) || !(amount > 0) || !(eth > 0)) return null;
+
+  const costUsd = Number.isFinite(usdPerEth) && usdPerEth > 0 ? eth * usdPerEth : NaN;
+  const fillEntryUsd = Number.isFinite(costUsd) ? costUsd / amount : NaN;
+  const fillEntryEth = eth / amount;
+
+  const positions = ensurePositions(state);
+  const prev = positions[token] || { amount: 0, costEth: 0, costUsd: 0, symbol: symbol || "TOKEN" };
+  const prevAmt = Number(prev.amount) || 0;
+  const prevCostEth = Number(prev.costEth) || 0;
+  const prevCostUsd = Number.isFinite(Number(prev.costUsd)) ? Number(prev.costUsd) : 0;
+  const addUsd = Number.isFinite(costUsd) ? costUsd : 0;
+
+  const nextAmt = prevAmt + amount;
+  const nextCostEth = prevCostEth + eth;
+  const nextCostUsd = prevCostUsd + addUsd;
+  const position = {
+    symbol: symbol || prev.symbol || "TOKEN",
+    amount: nextAmt,
+    costEth: nextCostEth,
+    costUsd: nextCostUsd,
+    avgEntryEth: nextAmt > 0 ? nextCostEth / nextAmt : Number.NaN,
+    avgEntryUsd: nextAmt > 0 && nextCostUsd > 0 ? nextCostUsd / nextAmt : Number.NaN,
+    updatedAt: new Date().toISOString(),
+  };
+  positions[token] = position;
+  return {
+    position,
+    fillEntryUsd,
+    fillEntryEth,
+    fillCostUsd: costUsd,
+    isDca: prevAmt > 0,
+  };
+}
+
+/** Reduce cost basis proportionally on sell (keeps avg entry). */
+function recordSellFill(state, { tokenAddress, tokenAmount }) {
+  const token = normalizeAddress(tokenAddress);
+  const sold = Number(tokenAmount);
+  const positions = ensurePositions(state);
+  const prev = positions[token];
+  if (!prev || !(Number(prev.amount) > 0) || !(sold > 0)) return null;
+
+  const prevAmt = Number(prev.amount);
+  const ratio = Math.min(1, sold / prevAmt);
+  const nextAmt = Math.max(0, prevAmt - sold);
+  if (!(nextAmt > 0) || nextAmt / prevAmt < 1e-12) {
+    delete positions[token];
+    return { position: null, closed: true };
+  }
+
+  const nextCostEth = Number(prev.costEth || 0) * (1 - ratio);
+  const nextCostUsd = Number(prev.costUsd || 0) * (1 - ratio);
+  const position = {
+    symbol: prev.symbol || "TOKEN",
+    amount: nextAmt,
+    costEth: nextCostEth,
+    costUsd: nextCostUsd,
+    avgEntryEth: nextAmt > 0 ? nextCostEth / nextAmt : Number.NaN,
+    avgEntryUsd: nextAmt > 0 && nextCostUsd > 0 ? nextCostUsd / nextAmt : Number.NaN,
+    updatedAt: new Date().toISOString(),
+  };
+  positions[token] = position;
+  return { position, closed: false };
+}
+
+function formatPnlPct(entryUsd, spotUsd) {
+  const entry = Number(entryUsd);
+  const spot = Number(spotUsd);
+  if (!(entry > 0) || !(spot > 0)) return "";
+  const pct = ((spot - entry) / entry) * 100;
+  const sign = pct >= 0 ? "+" : "";
+  return `${sign}${pct.toFixed(1)}%`;
+}
+
+function positionEntryLines(position, { fillEntryUsd, spotUsd, isDca } = {}) {
+  const lines = [];
+  const avg = Number(position?.avgEntryUsd);
+  if (isDca && Number.isFinite(Number(fillEntryUsd)) && Number(fillEntryUsd) > 0) {
+    lines.push(`Entry (lệnh này): <b>${escapeHtml(formatPriceUsd(fillEntryUsd))}</b>`);
+  }
+  if (Number.isFinite(avg) && avg > 0) {
+    const pnl = formatPnlPct(avg, spotUsd);
+    const label = isDca ? "Avg entry" : "Entry";
+    lines.push(
+      `${label}: <b>${escapeHtml(formatPriceUsd(avg))}</b>` +
+        (pnl ? ` · PnL <b>${escapeHtml(pnl)}</b>` : ""),
+    );
+  }
+  return lines;
+}
+
+async function resolveBuyTokenReceived(result) {
+  const expected = Number(result?.expectedTokenAmount);
+  if (!result?.baseTokenAddress || result.preBaseBalance == null || !result.wallet) {
+    return Number.isFinite(expected) && expected > 0 ? expected : Number.NaN;
+  }
+  try {
+    const { ethers } = require("ethers");
+    const provider = getRpcProvider();
+    const token = new ethers.Contract(
+      result.baseTokenAddress,
+      ["function balanceOf(address owner) view returns (uint256)"],
+      provider,
+    );
+    const after = await token.balanceOf(result.wallet);
+    const delta = after - BigInt(result.preBaseBalance);
+    if (delta > 0n) return unitsToNumber(delta, Number(result.baseDecimals) || 18);
+  } catch (error) {
+    console.warn(`Buy fill balance delta failed: ${error.message}`);
+  }
+  return Number.isFinite(expected) && expected > 0 ? expected : Number.NaN;
+}
+
+async function applyConfirmedTradeFill(result) {
+  if (!result?.side || !result?.baseTokenAddress) return { lines: [] };
+  const state = loadState();
+
+  if (result.side === "SELL") {
+    const sold = Number(result.soldTokenAmount);
+    const outcome = recordSellFill(state, {
+      tokenAddress: result.baseTokenAddress,
+      tokenAmount: sold,
+    });
+    saveState(state, { flush: true });
+    return {
+      state,
+      lines: positionEntryLines(outcome?.position, {}),
+      closed: Boolean(outcome?.closed),
+    };
+  }
+
+  if (result.side !== "BUY") return { lines: [] };
+
+  const [tokenAmount, ethUsd] = await Promise.all([resolveBuyTokenReceived(result), fetchEthPriceUsd()]);
+  const ethSpent = Number(result.paidNative);
+  const outcome = recordBuyFill(state, {
+    tokenAddress: result.baseTokenAddress,
+    symbol: result.baseSymbol,
+    tokenAmount,
+    ethSpent,
+    ethUsd,
+  });
+  saveState(state, { flush: true });
+  return {
+    state,
+    lines: positionEntryLines(outcome?.position, {
+      fillEntryUsd: outcome?.fillEntryUsd,
+      spotUsd: Number.NaN,
+      isDca: Boolean(outcome?.isDca),
+    }),
+    fill: outcome,
+  };
+}
+
 function getPortfolioWallet(state = {}) {
   const configured = normalizeAddress(state.portfolioWallet || config.walletAddress || "");
   if (configured) return configured;
@@ -2434,18 +2561,13 @@ async function buildPortfolio(walletAddress, options = {}) {
     .map((item) => item.address);
   let pairs = await fetchDexTokens(tokenAddresses);
 
-  // Dex /tokens batch often omits the real V3 WETH pool when many bags are scanned
-  // (GME alone: batch returns 1x V4 hub; /token-pairs returns V3 GME/WETH).
-  // Merge dedicated pair lists for tracked tokens + every bag still missing a tradeable pair.
+  // Dex /tokens batch often omits the real V3 WETH pool when many bags are scanned.
+  // Lookup tracked tokens always; cap other missing lookups to keep Update Price light.
   const trackedTokens = trackedPairsList()
     .map((entry) => normalizeAddress(entry?.baseTokenAddress))
     .filter(isEvmAddress);
-  const needLookup = [
-    ...new Set([
-      ...trackedTokens,
-      ...tokenAddresses.filter((address) => !chooseBestPairForToken(pairs, address)),
-    ]),
-  ];
+  const missing = tokenAddresses.filter((address) => !chooseBestPairForToken(pairs, address));
+  const needLookup = [...new Set([...trackedTokens, ...missing])].slice(0, 10);
   for (let index = 0; index < needLookup.length; index += 5) {
     const chunk = needLookup.slice(index, index + 5);
     const results = await Promise.all(
@@ -2467,7 +2589,7 @@ async function buildPortfolio(walletAddress, options = {}) {
   return { wallet, ...portfolio };
 }
 
-function portfolioSectionText(portfolio) {
+function portfolioSectionText(portfolio, state = null) {
   if (!portfolio?.wallet) {
     return [
       `<b>📦 Portfolio</b>`,
@@ -2497,8 +2619,15 @@ function portfolioSectionText(portfolio) {
   } else {
     for (const item of displayItems) {
       const chart = item.pairUrl ? ` <a href="${escapeHtml(item.pairUrl)}">chart</a>` : "";
+      const pos = getPosition(state, item.address);
+      const avg = Number(pos?.avgEntryUsd);
+      const pnl = formatPnlPct(avg, item.priceUsd);
+      const entryBit =
+        Number.isFinite(avg) && avg > 0
+          ? ` · Entry <b>${escapeHtml(formatPriceUsd(avg))}</b>${pnl ? ` <b>${escapeHtml(pnl)}</b>` : ""}`
+          : "";
       lines.push(
-        `↳ <b>${escapeHtml(item.symbol)}</b> ${escapeHtml(formatTokenAmount(item.amount))} · ${escapeHtml(formatPriceUsd(item.priceUsd))} · <b>${escapeHtml(formatUsd(item.valueUsd))}</b>${chart}`,
+        `↳ <b>${escapeHtml(item.symbol)}</b> ${escapeHtml(formatTokenAmount(item.amount))} · ${escapeHtml(formatPriceUsd(item.priceUsd))} · <b>${escapeHtml(formatUsd(item.valueUsd))}</b>${entryBit}${chart}`,
       );
     }
   }
@@ -2755,15 +2884,26 @@ function findBagItem(state, tokenAddress) {
   return lists.find((item) => normalizeAddress(item.address) === token) || null;
 }
 
-function bagSellPanelText(item, extras = {}) {
+function bagSellPanelText(item, extras = {}, state = null) {
   if (!item?.address) {
     return [`<b>Sell bag</b>`, "Token không còn trong portfolio. Bấm Update Price rồi thử lại."].join("\n");
   }
   const chart = item.pairUrl ? `<a href="${escapeHtml(item.pairUrl)}">Dexscreener</a>` : "";
+  const pos = getPosition(state, item.address);
+  const avg = Number(pos?.avgEntryUsd);
+  const pnl = formatPnlPct(avg, item.priceUsd);
+  const entryLines =
+    Number.isFinite(avg) && avg > 0
+      ? [
+          `Avg entry: <b>${escapeHtml(formatPriceUsd(avg))}</b>` +
+            (pnl ? ` · PnL <b>${escapeHtml(pnl)}</b>` : ""),
+        ]
+      : [];
   return [
     `<b>Sell ${escapeHtml(item.symbol || "TOKEN")}</b>`,
     `Balance: <b>${escapeHtml(formatTokenAmount(item.amount))}</b> · Value: <b>${escapeHtml(formatUsd(item.valueUsd))}</b>`,
     `Price: <b>${escapeHtml(formatPriceUsd(item.priceUsd))}</b>`,
+    ...entryLines,
     chart ? `Pair: ${chart}` : "",
     extras.note || "",
     "",
@@ -2914,7 +3054,7 @@ async function mainPanelText(options = {}) {
     `↳ <code>${escapeHtml(walletText)}</code>`,
     `↳ <b>Balance:</b> <code>${escapeHtml(balanceText)}</code>`,
     "",
-    portfolioSectionText(portfolio),
+    portfolioSectionText(portfolio, options.state),
   ].join("\n");
 }
 
@@ -3614,6 +3754,14 @@ async function resolveSellContext(tokenAddress, state = {}) {
     } catch {
       // keep fee
     }
+    let decimals = Number(fromBag.decimals);
+    if (!Number.isFinite(decimals) || decimals < 0) {
+      try {
+        decimals = await readTokenDecimals(token, getRpcProvider(), 18);
+      } catch {
+        decimals = 18;
+      }
+    }
     return {
       baseTokenAddress: token,
       baseSymbol: fromBag.symbol || "TOKEN",
@@ -3624,7 +3772,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
       fee,
       priceNative: Number.NaN,
       priceUsd: Number(fromBag.priceUsd),
-      decimals: Number(fromBag.decimals) || 18,
+      decimals,
     };
   }
 
@@ -3661,6 +3809,12 @@ async function resolveSellContext(tokenAddress, state = {}) {
     if (Number.isFinite(meta.fee) && meta.fee > 0) fee = meta.fee;
   } catch {
     // keep current fee
+  }
+
+  try {
+    decimals = await readTokenDecimals(token, getRpcProvider(), 18);
+  } catch {
+    decimals = 18;
   }
 
   return {
@@ -3762,6 +3916,10 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
       .confirm()
       .then(async () => {
         nativeBalanceCache.at = 0;
+        const fill = await applyConfirmedTradeFill(result).catch((error) => {
+          console.warn(`Position fill tracking failed: ${error.message}`);
+          return { lines: [] };
+        });
         await editTradeMessage(
           callbackQuery,
           [
@@ -3772,6 +3930,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
             `Route: <b>${escapeHtml(result.routeLabel || "Uni V3")}</b>`,
             `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
             result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
+            ...(fill.lines || []),
           ]
             .filter(Boolean)
             .join("\n"),
@@ -3834,6 +3993,10 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
       .confirm()
       .then(async () => {
         nativeBalanceCache.at = 0;
+        const fill = await applyConfirmedTradeFill(result).catch((error) => {
+          console.warn(`Position fill tracking failed: ${error.message}`);
+          return { lines: [] };
+        });
         await editTradeMessage(
           callbackQuery,
           [
@@ -3843,6 +4006,7 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
             `Route: <b>${escapeHtml(result.routeLabel || "Uni V3")}</b>`,
             `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
             result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
+            ...(fill.lines || []),
             `Track alerts vẫn: <b>${escapeHtml(config.baseSymbol)}</b>`,
           ].join("\n"),
           mainMenuKeyboard(state.portfolioSnapshot),
@@ -3931,6 +4095,10 @@ async function sendTextTrade(chatId, state, side, amount) {
       .confirm()
       .then(async () => {
         nativeBalanceCache.at = 0;
+        const fill = await applyConfirmedTradeFill(result).catch((error) => {
+          console.warn(`Position fill tracking failed: ${error.message}`);
+          return { lines: [] };
+        });
         await telegramRequest("sendMessage", {
           chat_id: chatId,
           text: [
@@ -3940,6 +4108,7 @@ async function sendTextTrade(chatId, state, side, amount) {
             `Route: <b>${escapeHtml(result.routeLabel || "Uni V3")}</b>`,
             `Min out: <b>${escapeHtml(result.minOut)} ${escapeHtml(result.tokenOutSymbol)}</b>`,
             result.receivedNative ? `Received: <b>≥${escapeHtml(result.receivedNative)} ETH</b>` : "",
+            ...(fill.lines || []),
           ]
             .filter(Boolean)
             .join("\n"),
@@ -4083,7 +4252,7 @@ async function handleCallbackQueryInner(callbackQuery, state) {
       await editTradeMessage(callbackQuery, bagSellPanelText(null), mainMenuKeyboard(state.portfolioSnapshot));
       return;
     }
-    await editTradeMessage(callbackQuery, bagSellPanelText(item), bagSellKeyboard(item));
+    await editTradeMessage(callbackQuery, bagSellPanelText(item, {}, state), bagSellKeyboard(item));
     return;
   }
 
@@ -4340,32 +4509,15 @@ async function handleNewGroups(groups, state) {
 }
 
 async function bootState(state) {
+  // Alerts are WSS/HTTP getLogs — skip heavy Blockscout transfer crawl on boot.
   try {
-    try {
-      await initRpcSwapCursors(state);
-    } catch (error) {
-      console.warn(`RPC swap cursor init failed: ${error.message}`);
-    }
-
-    const groups = groupTransfers(await fetchTokenTransfers());
-    if (config.backfillOnStart) {
-      await handleNewGroups(groups, state);
-      return;
-    }
-
-    // Realtime only: mark everything currently on-chain as seen, never backfill old txs.
-    addSeen(
-      state,
-      groups.map((group) => group.hash),
-    );
-    saveState(state);
-    console.log(`Booted. Marked ${groups.length} existing transactions as seen (no backfill alerts).`);
+    await initRpcSwapCursors(state);
   } catch (error) {
-    if (!state.seen) state.seen = [];
-    saveState(state);
-    console.warn(`Blockscout unavailable during boot: ${error.message}`);
-    console.warn("Telegram commands still work. RPC swap polling will still run.");
+    console.warn(`RPC swap cursor init failed: ${error.message}`);
   }
+  if (!state.seen) state.seen = [];
+  saveState(state);
+  console.log("Booted. RPC swap cursors ready (Blockscout boot crawl skipped).");
 }
 
 async function main() {
@@ -4414,13 +4566,6 @@ async function main() {
   } else {
     markHttpFallback("RPC_WS_URL not set");
     console.log("RPC_WS_URL not set — alerts use HTTP getLogs poll.");
-  }
-
-  if (config.tradeEnabled && config.walletPrivateKey && config.rpcUrl) {
-    // After WSS connect so approve/swap prefer the same socket.
-    ensureRouterApprovals(state).catch((error) => {
-      console.warn(`Router pre-approve skipped: ${error.message}`);
-    });
   }
 
   console.log("Entering poll loop.");
@@ -4560,6 +4705,11 @@ module.exports = {
   tradeFromV3SwapLog,
   tradeMessage,
   tradeTimestampMs,
+  recordBuyFill,
+  recordSellFill,
+  getPosition,
+  formatPnlPct,
+  positionEntryLines,
   bagSellKeyboard,
 };
 
