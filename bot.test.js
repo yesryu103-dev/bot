@@ -441,10 +441,14 @@ test("EVM token address input is recognized", () => {
 test("Dexscreener URL / pair address forces that pool", () => {
   const pair = "0xB7eeDF33D02C743507c38E1eE20eF421e60661C6";
   const fromUrl = bot.parseTrackInput(
-    `https://dexscreener.com/robinhood/${pair}`,
+    `https://dexscreener.com/${bot.config.chainId}/${pair}`,
   );
   assert.equal(fromUrl.forced, true);
   assert.equal(fromUrl.address, pair.toLowerCase());
+
+  const fromBsc = bot.parseTrackInput(`https://dexscreener.com/bsc/${pair}`);
+  assert.equal(fromBsc.forced, true);
+  assert.equal(fromBsc.address, pair.toLowerCase());
 
   const fromBare = bot.parseTrackInput(pair);
   assert.equal(fromBare.forced, false);
@@ -455,10 +459,19 @@ test("Dexscreener URL / pair address forces that pool", () => {
   assert.equal(
     bot.tradeTokenFromDexPair({
       baseToken: { address: token, symbol: "GME" },
-      quoteToken: { address: weth, symbol: "WETH" },
+      quoteToken: { address: weth, symbol: bot.config.quoteSymbol },
     }),
     token.toLowerCase(),
   );
+});
+
+test("chain presets resolve robinhood and bsc pancake", () => {
+  const { resolveChain } = require("./chains");
+  assert.equal(resolveChain("robinhood").id, "robinhood");
+  assert.equal(resolveChain("bsc").dexId, "pancakeswap");
+  assert.equal(resolveChain("pancake").id, "bsc");
+  assert.equal(resolveChain("bsc").enableV4, false);
+  assert.match(resolveChain("bsc").swapRouter, /^0x1b81/i);
 });
 
 test("best pair selection prefers WETH quote and highest liquidity", () => {

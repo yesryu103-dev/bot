@@ -18,6 +18,9 @@ function loadDotenv(filePath = path.join(process.cwd(), ".env")) {
 
 loadDotenv();
 
+const { resolveChain } = require("./chains");
+const activeChain = resolveChain(process.env.CHAIN);
+
 const ROBINHOOD_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
 
 function truthy(value) {
@@ -33,37 +36,38 @@ function httpUrlFromWs(wsUrl) {
 function resolveHttpRpcUrl(rpcUrl, rpcWsUrl) {
   const explicit = String(rpcUrl || "").trim();
   const fromWs = httpUrlFromWs(rpcWsUrl);
-  const isPublicRobinhood =
-    !explicit || explicit === ROBINHOOD_PUBLIC_RPC || /rpc\.mainnet\.chain\.robinhood\.com/i.test(explicit);
-  // Public Robinhood HTTP often times out on eth_getLogs; reuse Alchemy/QuickNode HTTP sibling of WSS.
-  if (isPublicRobinhood && fromWs) return fromWs;
-  return explicit || fromWs || ROBINHOOD_PUBLIC_RPC;
+  if (activeChain.id === "robinhood") {
+    const isPublicRobinhood =
+      !explicit || explicit === ROBINHOOD_PUBLIC_RPC || /rpc\.mainnet\.chain\.robinhood\.com/i.test(explicit);
+    // Public Robinhood HTTP often times out on eth_getLogs; reuse Alchemy/QuickNode HTTP sibling of WSS.
+    if (isPublicRobinhood && fromWs) return fromWs;
+    return explicit || fromWs || ROBINHOOD_PUBLIC_RPC;
+  }
+  return explicit || fromWs || activeChain.rpcUrl;
 }
 
 function normalizeAddress(value) {
   return String(value || "").toLowerCase();
 }
 
-/** Official Robinhood Uniswap v3 SwapRouter (exactInputSingle). */
-const SWAP_ROUTER_V3 = "0xcaf681a66d020601342297493863e78c959e5cb2";
-/** UniversalRouter — only for direct Uni V4 ETH single-hop (never USDG multi-hop). */
+/** UniversalRouter — only for Robinhood Uni V4 ETH single-hop (never USDG multi-hop). */
 const UNIVERSAL_ROUTER_V4 = "0x8876789976decbfcbbbe364623c63652db8c0904";
 
 function resolveSwapRouterAddress() {
-  const raw = normalizeAddress(process.env.SWAP_ROUTER_ADDRESS || SWAP_ROUTER_V3);
-  if (!raw || raw === UNIVERSAL_ROUTER_V4) {
-    if (raw === UNIVERSAL_ROUTER_V4) {
-      console.warn(`SWAP_ROUTER_ADDRESS is UniversalRouter; forcing SwapRouter v3 ${SWAP_ROUTER_V3}`);
-    }
-    return SWAP_ROUTER_V3;
+  const fallback = normalizeAddress(activeChain.swapRouter);
+  const raw = normalizeAddress(process.env.SWAP_ROUTER_ADDRESS || fallback);
+  if (activeChain.id === "robinhood" && raw === UNIVERSAL_ROUTER_V4) {
+    console.warn(`SWAP_ROUTER_ADDRESS is UniversalRouter; forcing SwapRouter v3 ${fallback}`);
+    return fallback;
   }
-  return raw;
+  return raw || fallback;
 }
 
 function assertTradeTx(tx, mode = "v3") {
   const to = normalizeAddress(tx?.to);
   const selector = String(tx?.data || "").slice(0, 10).toLowerCase();
   if (mode === "v4") {
+    if (!activeChain.enableV4) throw new Error("Trade abort: V4 disabled on this chain.");
     if (to !== UNIVERSAL_ROUTER_V4) {
       throw new Error(`Trade abort: v4 tx.to=${to || "?"} ≠ UniversalRouter ${UNIVERSAL_ROUTER_V4}`);
     }
@@ -75,9 +79,9 @@ function assertTradeTx(tx, mode = "v3") {
     }
     return;
   }
-  const expected = normalizeAddress(config.swapRouterAddress || SWAP_ROUTER_V3);
+  const expected = normalizeAddress(config.swapRouterAddress || activeChain.swapRouter);
   if (!to || to !== expected) {
-    throw new Error(`Trade abort: tx.to=${to || "?"} is not SwapRouter v3 ${expected}.`);
+    throw new Error(`Trade abort: tx.to=${to || "?"} is not SwapRouter ${expected}.`);
   }
   if (selector === "0x3593564c") {
     throw new Error("Trade abort: v3 path must not use UniversalRouter execute.");
@@ -85,17 +89,30 @@ function assertTradeTx(tx, mode = "v3") {
 }
 
 const config = {
-  blockscoutBaseUrl: (process.env.BLOCKSCOUT_BASE_URL || "https://robinhoodchain.blockscout.com").replace(/\/$/, ""),
+  chainId: activeChain.id,
+  chainName: activeChain.name,
+  dexLabel: activeChain.dexLabel,
+  enableV4: Boolean(activeChain.enableV4),
+  feeTiers: Array.isArray(activeChain.feeTiers) ? activeChain.feeTiers : [10000, 3000, 500, 100],
+  nativeSymbol: activeChain.nativeSymbol,
+  wrappedSymbol: activeChain.wrappedSymbol,
+  blockscoutBaseUrl: (
+    process.env.BLOCKSCOUT_BASE_URL ||
+    process.env.EXPLORER_BASE_URL ||
+    activeChain.explorerBaseUrl
+  ).replace(/\/$/, ""),
   dexscreenPairUrl:
     process.env.DEXSCREENER_PAIR_URL ||
-    "https://dexscreener.com/robinhood/0xb541c2936982dd5c4090783d8f395d3e613c8016",
-  pairAddress: normalizeAddress(process.env.PAIR_ADDRESS || "0xb541c2936982dd5c4090783d8f395d3e613c8016"),
-  baseTokenAddress: normalizeAddress(process.env.BASE_TOKEN_ADDRESS || "0x5266eeaff092d6136ab63d18b975a60a0cc0c8f7"),
-  quoteTokenAddress: normalizeAddress(process.env.QUOTE_TOKEN_ADDRESS || "0x0bd7d308f8e1639fab988df18a8011f41eacad73"),
-  baseSymbol: process.env.BASE_SYMBOL || "REPE",
-  quoteSymbol: process.env.QUOTE_SYMBOL || "WETH",
+    (activeChain.defaultPair
+      ? `https://dexscreener.com/${activeChain.id}/${activeChain.defaultPair}`
+      : `https://dexscreener.com/${activeChain.id}`),
+  pairAddress: normalizeAddress(process.env.PAIR_ADDRESS || activeChain.defaultPair || ""),
+  baseTokenAddress: normalizeAddress(process.env.BASE_TOKEN_ADDRESS || activeChain.defaultBase || ""),
+  quoteTokenAddress: normalizeAddress(process.env.QUOTE_TOKEN_ADDRESS || activeChain.wrappedAddress),
+  baseSymbol: process.env.BASE_SYMBOL || activeChain.defaultBaseSymbol || "TOKEN",
+  quoteSymbol: process.env.QUOTE_SYMBOL || activeChain.wrappedSymbol,
   pollSeconds: Number(process.env.POLL_SECONDS || 3),
-  stateFile: process.env.STATE_FILE || "state.json",
+  stateFile: process.env.STATE_FILE || (activeChain.id === "bsc" ? "state.bsc.json" : "state.json"),
   maxItems: Number(process.env.MAX_ITEMS || 200),
   minUsd: Number(process.env.MIN_USD || 0),
   minQuoteAmount: 1,
@@ -115,22 +132,19 @@ const config = {
   // Hardcoded brand — ignore stale BOT_TITLE env if set to old names.
   botTitle: "Treasure_tradingbot",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
-  // Prefer Alchemy/QuickNode HTTP derived from WSS when public Robinhood RPC is flaky.
   rpcUrl: resolveHttpRpcUrl(process.env.RPC_URL, process.env.RPC_WS_URL),
   // When set: all chain RPC (track + trade + reads) prefers WSS; HTTP only on WSS failure.
-  rpcWsUrl: process.env.RPC_WS_URL || "",
+  rpcWsUrl: process.env.RPC_WS_URL || activeChain.rpcWsUrl || "",
   walletPrivateKey: process.env.WALLET_PRIVATE_KEY || "",
   walletAddress: process.env.WALLET_ADDRESS || "",
-  // Hard-pin Uniswap v3 SwapRouter — never UniversalRouter multi-hop (0x887678…).
   swapRouterAddress: resolveSwapRouterAddress(),
-  quoterAddress: process.env.QUOTER_ADDRESS || "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
-  // Default 3000 (0.3%) — common Robinhood v3 WETH pools; live pool meta still overrides.
-  uniswapV3Fee: Number(process.env.UNISWAP_V3_FEE || 3000),
+  quoterAddress: process.env.QUOTER_ADDRESS || activeChain.quoter,
+  uniswapV3Fee: Number(process.env.UNISWAP_V3_FEE || activeChain.defaultFee),
   slippageBps: Number(process.env.SLIPPAGE_BPS || 200),
   // Gas: buffer estimate + bump tip so txs land faster / avoid underpriced drops.
   gasLimitBufferBps: Number(process.env.GAS_LIMIT_BUFFER_BPS || 3000),
   gasFeeBumpBps: Number(process.env.GAS_FEE_BUMP_BPS || 2000),
-  gasPriorityGwei: Number(process.env.GAS_PRIORITY_GWEI || 0.001),
+  gasPriorityGwei: Number(process.env.GAS_PRIORITY_GWEI || (activeChain.id === "bsc" ? 1 : 0.001)),
   buyAmountsQuote: parseAmountOptions(process.env.BUY_AMOUNTS_QUOTE || "0.01,0.05,0.1,0.2,0.25"),
   sellPercents: parseAmountOptions(process.env.SELL_PERCENTS || "25,50,70")
     .map((value) => Number(value))
@@ -180,7 +194,7 @@ async function fetchJson(url, options = {}, retries = 3) {
         ...fetchOptions,
         signal: controller.signal,
         headers: {
-          "user-agent": "robinhood-uniswap-telegram-bot/1.0",
+          "user-agent": "treasure-tradingbot/1.0",
           ...(fetchOptions.headers || {}),
         },
       });
@@ -742,7 +756,7 @@ function markHttpFallback(reason) {
   wsRuntime.httpFallback = true;
   const now = Date.now();
   if (now - wsRuntime.lastFallbackLogAt > 30_000) {
-    const rpc = config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com";
+    const rpc = config.rpcUrl || activeChain.rpcUrl;
     console.warn(`⚠️  WSS sự cố (${reason}) — toàn bộ RPC fallback HTTP: ${rpc}`);
     wsRuntime.lastFallbackLogAt = now;
   }
@@ -806,7 +820,7 @@ function scheduleWsReconnect(reason, generation) {
   const wait = WS_RECONNECT_BACKOFFS_MS[wsRuntime.reconnectAttempts];
   wsRuntime.reconnectAttempts += 1;
   console.warn(
-    `WS down (${reason}). All RPC → HTTP backup (${config.rpcUrl || "https://rpc.mainnet.chain.robinhood.com"}). Reconnect ${wsRuntime.reconnectAttempts}/${WS_RECONNECT_BACKOFFS_MS.length} in ${wait}ms…`,
+    `WS down (${reason}). All RPC → HTTP backup (${config.rpcUrl || activeChain.rpcUrl}). Reconnect ${wsRuntime.reconnectAttempts}/${WS_RECONNECT_BACKOFFS_MS.length} in ${wait}ms…`,
   );
   wsRuntime.reconnectTimer = setTimeout(() => {
     wsRuntime.reconnectTimer = null;
@@ -925,7 +939,7 @@ async function fetchDexPair() {
 async function fetchDexPairByAddress(pairAddress) {
   const pair = normalizeAddress(pairAddress);
   if (!isEvmAddress(pair)) return null;
-  const url = `https://api.dexscreener.com/latest/dex/pairs/robinhood/${pair}`;
+  const url = `https://api.dexscreener.com/latest/dex/pairs/${config.chainId}/${pair}`;
   const payload = await fetchJson(url);
   return payload.pair || payload.pairs?.[0] || null;
 }
@@ -1012,7 +1026,7 @@ async function enrichTradePrices(trade) {
 }
 
 async function fetchTokenPairs(tokenAddress) {
-  return fetchJson(`https://api.dexscreener.com/token-pairs/v1/robinhood/${tokenAddress}`);
+  return fetchJson(`https://api.dexscreener.com/token-pairs/v1/${config.chainId}/${tokenAddress}`);
 }
 
 async function fetchWalletTokenBalances(walletAddress) {
@@ -1028,7 +1042,7 @@ async function fetchDexTokens(tokenAddresses) {
   const pairs = [];
   for (let index = 0; index < addresses.length; index += 30) {
     const chunk = addresses.slice(index, index + 30);
-    const payload = await fetchJson(`https://api.dexscreener.com/tokens/v1/robinhood/${chunk.join(",")}`);
+    const payload = await fetchJson(`https://api.dexscreener.com/tokens/v1/${config.chainId}/${chunk.join(",")}`);
     if (Array.isArray(payload)) pairs.push(...payload);
   }
   return pairs;
@@ -1093,7 +1107,7 @@ function startHealthServer() {
     const pathName = String(req.url || "/").split("?")[0];
     if (pathName === "/healthz" || pathName === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, service: "robinhood-telegram-bot" }));
+      res.end(JSON.stringify({ ok: true, service: "telegram-bot" }));
       return;
     }
 
@@ -1115,13 +1129,16 @@ function isEvmAddress(value) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(value || "").trim());
 }
 
-/** Parse token/pair address or Dexscreener robinhood URL. */
+/** Parse token/pair address or Dexscreener URL for the active chain. */
 function parseTrackInput(text) {
   const raw = String(text || "").trim();
   if (!raw) return null;
 
   const urlMatch = raw.match(
-    /(?:https?:\/\/)?(?:www\.)?dexscreener\.com\/robinhood\/(0x[a-fA-F0-9]{40}|0x[a-fA-F0-9]{64})\b/i,
+    new RegExp(
+      `(?:https?:\\/\\/)?(?:www\\.)?dexscreener\\.com\\/(?:${config.chainId}|robinhood|bsc)\\/(0x[a-fA-F0-9]{40}|0x[a-fA-F0-9]{64})\\b`,
+      "i",
+    ),
   );
   if (urlMatch) {
     return { kind: "pair", address: normalizeAddress(urlMatch[1]), forced: true };
@@ -1143,7 +1160,12 @@ function tradeTokenFromDexPair(pair) {
   const baseSym = String(pair?.baseToken?.symbol || "").toUpperCase();
   const quoteSym = String(pair?.quoteToken?.symbol || "").toUpperCase();
   const isWethish = (addr, sym) =>
-    addr === weth || addr === zero || sym === "WETH" || sym === "ETH";
+    addr === weth ||
+    addr === zero ||
+    sym === "WETH" ||
+    sym === "ETH" ||
+    sym === "WBNB" ||
+    sym === "BNB";
   if (isWethish(quote, quoteSym) && base) return base;
   if (isWethish(base, baseSym) && quote) return quote;
   return base || quote || "";
@@ -1166,7 +1188,7 @@ async function quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn
     ],
     provider,
   );
-  const feeCandidates = [preferredFee, config.uniswapV3Fee, 3000, 10000, 500, 100].filter(
+  const feeCandidates = [preferredFee, config.uniswapV3Fee, ...(config.feeTiers || [])].filter(
     (value, index, list) => Number.isFinite(value) && value > 0 && list.indexOf(value) === index,
   );
   let lastError = "";
@@ -1377,7 +1399,9 @@ function isQuoteWethToken(tokenAddress) {
 
 function displayQuoteSymbol(symbol = config.quoteSymbol) {
   const upper = String(symbol || "").toUpperCase();
-  return upper === "WETH" ? "ETH" : symbol || "ETH";
+  if (upper === "WETH") return "ETH";
+  if (upper === "WBNB") return "BNB";
+  return symbol || config.nativeSymbol || "ETH";
 }
 
 async function readTokenDecimals(tokenAddress, provider, fallback = 18) {
@@ -1410,14 +1434,19 @@ async function pickBestTradeRoute({
   try {
     const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, preferredFee);
     if (quoted?.amountOut > 0n) {
-      v3Quote = { kind: "v3", label: "Uni V3 WETH", amountOut: quoted.amountOut, fee: quoted.fee };
+      v3Quote = {
+        kind: "v3",
+        label: `${config.dexLabel || "Uni"} V3 ${config.wrappedSymbol || config.quoteSymbol || "WETH"}`,
+        amountOut: quoted.amountOut,
+        fee: quoted.fee,
+      };
     }
   } catch (error) {
     console.warn(`V3 quote failed: ${error.message}`);
   }
 
   let v4Meta = null;
-  if (buyWithNativeEth || sellToNativeEth) {
+  if (config.enableV4 && (buyWithNativeEth || sellToNativeEth)) {
     try {
       const pairs = await fetchTokenPairs(baseTokenAddress);
       const v4pool = bestroute.pickV4EthPool(pairs, baseTokenAddress);
@@ -1948,7 +1977,7 @@ function balancePercent(balance, percent) {
 function chooseBestPairForToken(pairs, tokenAddress) {
   const token = normalizeAddress(tokenAddress);
   const validPairs = (Array.isArray(pairs) ? pairs : [])
-    .filter((pair) => normalizeAddress(pair.chainId) === "robinhood")
+    .filter((pair) => normalizeAddress(pair.chainId) === config.chainId)
     .filter((pair) => {
       const base = normalizeAddress(pair.baseToken?.address);
       const quote = normalizeAddress(pair.quoteToken?.address);
@@ -1960,17 +1989,18 @@ function chooseBestPairForToken(pairs, tokenAddress) {
     const quote = normalizeAddress(pair.quoteToken?.address);
     const quoteSym = String(pair.quoteToken?.symbol || "").toUpperCase();
     const baseSym = String(pair.baseToken?.symbol || "").toUpperCase();
-    // Native ETH (0x000…) on Dexscreener is usually Uniswap v4 — do NOT treat as bot-tradeable WETH.
+    // Native 0x000… on Dexscreener is usually v4 — do NOT treat as wrapped-quote pool.
     return (
       quoteSym === "WETH" ||
       baseSym === "WETH" ||
+      quoteSym === "WBNB" ||
+      baseSym === "WBNB" ||
       quote === config.quoteTokenAddress ||
       base === config.quoteTokenAddress
     );
   };
 
-  // HARD filter: bot SwapRouter only supports Uniswap v3 WETH pools.
-  // Never return v4 GME/GME or v4 GME/ETH as the primary tracked pair.
+  // Prefer v3 pools vs wrapped native (WETH/WBNB).
   const tradeable = validPairs.filter((pair) => isV3Pair(pair) && isWethPair(pair) && Number(pair.liquidity?.usd || 0) > 0);
   const ranked = (tradeable.length ? tradeable : validPairs.filter((pair) => isV3Pair(pair))).sort(
     (a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0),
@@ -1989,7 +2019,7 @@ function trackedPairFromDexPair(pair, tokenAddress = pair?.baseToken?.address) {
 
   return {
     pairAddress: normalizeAddress(pair.pairAddress),
-    pairUrl: pair.url || `https://dexscreener.com/robinhood/${pair.pairAddress}`,
+    pairUrl: pair.url || `https://dexscreener.com/${config.chainId}/${pair.pairAddress}`,
     baseTokenAddress: normalizeAddress(baseToken?.address),
     baseSymbol: baseToken?.symbol || "TOKEN",
     quoteTokenAddress: normalizeAddress(quoteToken?.address),
@@ -2031,7 +2061,7 @@ function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") 
   }
 
   const ranked = (Array.isArray(pairs) ? pairs : [])
-    .filter((pair) => normalizeAddress(pair.chainId) === "robinhood")
+    .filter((pair) => normalizeAddress(pair.chainId) === config.chainId)
     .filter((pair) => {
       const base = normalizeAddress(pair.baseToken?.address);
       const quote = normalizeAddress(pair.quoteToken?.address);
@@ -2041,8 +2071,12 @@ function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "") 
       const isWeth =
         quoteSym === "WETH" ||
         quoteSym === "ETH" ||
+        quoteSym === "WBNB" ||
+        quoteSym === "BNB" ||
         baseSym === "WETH" ||
         baseSym === "ETH" ||
+        baseSym === "WBNB" ||
+        baseSym === "BNB" ||
         quote === config.quoteTokenAddress ||
         base === config.quoteTokenAddress;
       return isWeth && isV3Pair(pair) && Number(pair.liquidity?.usd || 0) >= 1000;
@@ -2095,7 +2129,7 @@ function tagTradeWithTracked(trade, entry, poolAddress = "") {
   // Prefer the pool that actually emitted the Swap (not only the primary tracked pair).
   trade.pairAddress = normalizeAddress(poolAddress || entry.pairAddress);
   if (trade.pairAddress && trade.pairAddress !== normalizeAddress(entry.pairAddress)) {
-    trade.pairUrl = `https://dexscreener.com/robinhood/${trade.pairAddress}`;
+    trade.pairUrl = `https://dexscreener.com/${config.chainId}/${trade.pairAddress}`;
   }
   return trade;
 }
@@ -2124,7 +2158,7 @@ function applyTrackedPair(trackedPair) {
   if (!trackedPair?.pairAddress || !trackedPair?.baseTokenAddress || !trackedPair?.quoteTokenAddress) return;
 
   config.pairAddress = normalizeAddress(trackedPair.pairAddress);
-  config.dexscreenPairUrl = trackedPair.pairUrl || `https://dexscreener.com/robinhood/${trackedPair.pairAddress}`;
+  config.dexscreenPairUrl = trackedPair.pairUrl || `https://dexscreener.com/${config.chainId}/${trackedPair.pairAddress}`;
   config.baseTokenAddress = normalizeAddress(trackedPair.baseTokenAddress);
   config.baseSymbol = trackedPair.baseSymbol || config.baseSymbol;
   config.quoteTokenAddress = normalizeAddress(trackedPair.quoteTokenAddress);
@@ -2380,7 +2414,7 @@ function buildPortfolioFromBalances(balances, pairs, options = {}) {
       liquidityUsd,
       valueUsd,
       pairAddress: normalizeAddress(pair?.pairAddress || ""),
-      pairUrl: pair?.url || (pair?.pairAddress ? `https://dexscreener.com/robinhood/${pair.pairAddress}` : ""),
+      pairUrl: pair?.url || (pair?.pairAddress ? `https://dexscreener.com/${config.chainId}/${pair.pairAddress}` : ""),
     };
 
     if (isBagSellableItem(enriched)) bagCandidates.push(enriched);
@@ -2789,7 +2823,7 @@ async function fetchEthPriceUsd() {
     const weth = normalizeAddress(config.quoteTokenAddress);
     const pairs = await fetchTokenPairs(weth);
     const list = (Array.isArray(pairs) ? pairs : []).filter(
-      (pair) => normalizeAddress(pair.chainId) === "robinhood" && Number(pair.liquidity?.usd || 0) > 0,
+      (pair) => normalizeAddress(pair.chainId) === config.chainId && Number(pair.liquidity?.usd || 0) > 0,
     );
 
     // Prefer WETH priced against a stable quote.
@@ -2850,11 +2884,15 @@ async function mainPanelText(options = {}) {
   const walletText = wallet ? compactAddress(wallet) : "Not configured";
   const balanceText = balance ? `${Number(balance).toPrecision(6)} ETH` : "n/a";
 
-  const portfolioTotal =
+  const bagUsd =
     Number.isFinite(Number(portfolio?.totalUsd)) && Number(portfolio.totalUsd) > 0
       ? Number(portfolio.totalUsd)
-      : null;
-  const totalUsdText = portfolioTotal != null ? formatUsd(portfolioTotal) : "n/a";
+      : 0;
+  const ethBal = Number(balance);
+  const ethUsdValue =
+    Number.isFinite(ethUsd) && ethUsd > 0 && Number.isFinite(ethBal) && ethBal > 0 ? ethBal * ethUsd : 0;
+  const totalUsd = bagUsd + ethUsdValue;
+  const totalUsdText = totalUsd > 0 ? formatUsd(totalUsd) : "n/a";
 
   return [
     `🚀 <b>${escapeHtml(config.botTitle)}</b>`,
@@ -3135,7 +3173,7 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
 
 async function followPairAddress(pairAddress, state, chatId) {
   const pair = await fetchDexPairByAddress(pairAddress);
-  if (!pair || normalizeAddress(pair.chainId) !== "robinhood") {
+  if (!pair || normalizeAddress(pair.chainId) !== config.chainId) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: [
@@ -3311,7 +3349,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
         `Retarget primary pair ${trackedPair.pairAddress} → v3 watch pool ${primaryWatch} for ${trackedPair.baseSymbol}`,
       );
       trackedPair.pairAddress = primaryWatch;
-      trackedPair.pairUrl = `https://dexscreener.com/robinhood/${primaryWatch}`;
+      trackedPair.pairUrl = `https://dexscreener.com/${config.chainId}/${primaryWatch}`;
     }
   }
   const finalDexPair =
@@ -3332,7 +3370,7 @@ async function followTrackInput(input, state, chatId) {
   }
 
   const asPair = await fetchDexPairByAddress(parsed.address).catch(() => null);
-  if (asPair && normalizeAddress(asPair.chainId) === "robinhood" && isV3Pair(asPair)) {
+  if (asPair && normalizeAddress(asPair.chainId) === config.chainId && isV3Pair(asPair)) {
     await followPairAddress(parsed.address, state, chatId);
     return;
   }
@@ -3572,7 +3610,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
       quoteTokenAddress: config.quoteTokenAddress,
       quoteSymbol: config.quoteSymbol,
       pairAddress: normalizeAddress(fromBag.pairAddress),
-      pairUrl: fromBag.pairUrl || `https://dexscreener.com/robinhood/${fromBag.pairAddress}`,
+      pairUrl: fromBag.pairUrl || `https://dexscreener.com/${config.chainId}/${fromBag.pairAddress}`,
       fee,
       priceNative: Number.NaN,
       priceUsd: Number(fromBag.priceUsd),
@@ -3596,7 +3634,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
   const tracked = trackedPairFromDexPair(pair, token);
   pairAddress = tracked.pairAddress;
   baseSymbol = tracked.baseSymbol || baseSymbol;
-  pairUrl = tracked.pairUrl || `https://dexscreener.com/robinhood/${pairAddress}`;
+  pairUrl = tracked.pairUrl || `https://dexscreener.com/${config.chainId}/${pairAddress}`;
   priceNative = Number(pair.priceNative);
   priceUsd = Number(pair.priceUsd);
   const rawBase = normalizeAddress(pair.baseToken?.address);
@@ -4321,8 +4359,12 @@ async function bootState(state) {
 }
 
 async function main() {
-  console.log("Starting robinhood-telegram-bot...");
-  console.log(`Trade router: best of Uni V3 SwapRouter / Uni V4 ETH (no USDG hub).`);
+  console.log("Starting telegram-bot...");
+  console.log(
+    `Chain: ${config.chainName} (${config.chainId}) · ${config.dexLabel} V3` +
+      (config.enableV4 ? " + Uni V4 ETH" : "") +
+      ` · quote ${config.quoteSymbol}`,
+  );
   startHealthServer();
 
   const state = loadState();
@@ -4470,6 +4512,8 @@ module.exports = {
   chooseWatchPairAddresses,
   classifyFromTransaction,
   config,
+  activeChain,
+  resolveChain: require("./chains").resolveChain,
   formatBagButtonLabel,
   formatUnits,
   getPortfolioWallet,
