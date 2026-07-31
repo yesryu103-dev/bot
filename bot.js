@@ -54,19 +54,12 @@ function normalizeAddress(value) {
 const UNIVERSAL_ROUTER_V4 = "0x8876789976decbfcbbbe364623c63652db8c0904";
 
 /**
- * Pin known tokens to clean Uni V3 WETH pools so Buy/Sell never hit V4 Doppler hooks.
- * (Hook paths skim extra token fees — see RehypeDopplerHookInitializer.)
- * Override/extend via FORCE_V3_POOLS=token:pool,token:pool
+ * Optional manual V3 pin via FORCE_V3_POOLS=token:pool,token:pool.
+ * Hook avoidance is automatic: paste picks deepest clean V3 WETH or clean V4 ETH (hooks=0).
  */
-const FORCE_V3_WETH_POOLS = {
-  // Robinhood meme GME → Uni V3 GME/WETH
-  "0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3": "0xb7eedf33d02c743507c38e1ee20ef421e60661c6",
-};
-
 function preferredV3PoolForToken(tokenAddress) {
   const token = normalizeAddress(tokenAddress);
   if (!isEvmAddress(token)) return "";
-  if (FORCE_V3_WETH_POOLS[token]) return FORCE_V3_WETH_POOLS[token];
   const raw = String(process.env.FORCE_V3_POOLS || "");
   for (const part of raw.split(",")) {
     const [left, right] = part.split(":").map((item) => normalizeAddress(String(item || "").trim()));
@@ -1798,20 +1791,30 @@ async function pickBestTradeRoute({
       const want = normalizeAddress(preferredV4PoolId);
       let v4pool = null;
       if (want && bestroute.isV4PoolId(want)) {
-        v4pool =
-          (Array.isArray(pairs) ? pairs : []).find((pair) => normalizeAddress(pair.pairAddress) === want) || {
-            pairAddress: want,
-          };
-      }
-      if (!v4pool) v4pool = bestroute.pickV4EthPool(pairs, baseTokenAddress);
-      if (v4pool?.pairAddress && bestroute.isV4PoolId(v4pool.pairAddress)) {
-        const key =
-          bestroute.recoverV4PoolKey(v4pool.pairAddress, baseTokenAddress, bestroute.NATIVE_ETH) ||
-          bestroute.recoverV4PoolKey(v4pool.pairAddress, bestroute.NATIVE_ETH, baseTokenAddress);
-        if (key) {
-          v4Meta = { poolId: normalizeAddress(v4pool.pairAddress), key };
+        const wantClassified = bestroute.classifyV4EthPool(want, baseTokenAddress);
+        if (wantClassified.clean && wantClassified.key) {
+          v4pool =
+            (Array.isArray(pairs) ? pairs : []).find((pair) => normalizeAddress(pair.pairAddress) === want) || {
+              pairAddress: want,
+            };
         } else {
-          console.warn(`V4 pool key recovery failed for ${compactAddress(v4pool.pairAddress)}`);
+          console.warn(
+            `Tracked V4 ${compactAddress(want)} is ${wantClassified.status} (hook/unsafe) — picking clean pool instead`,
+          );
+        }
+      }
+      if (!v4pool) {
+        const clean = bestroute.pickCleanV4EthPool(pairs, baseTokenAddress);
+        v4pool = clean?.pair || null;
+      }
+      if (v4pool?.pairAddress && bestroute.isV4PoolId(v4pool.pairAddress)) {
+        const classified = bestroute.classifyV4EthPool(v4pool.pairAddress, baseTokenAddress);
+        if (classified.clean && classified.key) {
+          v4Meta = { poolId: normalizeAddress(v4pool.pairAddress), key: classified.key };
+        } else {
+          console.warn(
+            `Skip V4 pool ${compactAddress(v4pool.pairAddress)} (${classified.status}) — hook fee / unsafe`,
+          );
         }
       }
     } catch (error) {
@@ -1843,10 +1846,10 @@ async function pickBestTradeRoute({
   if (preferV4 && v4Meta) {
     const out4 = await quoteV4Amount(amountIn);
     if (out4 > 0n) {
-      console.log(`Route Uni V4 ETH (deepest) out=${ethers.formatEther(out4)}`);
+      console.log(`Route Uni V4 ETH (clean, no hooks) out=${ethers.formatEther(out4)}`);
       return {
         kind: "v4",
-        label: "Uni V4 ETH · deepest",
+        label: "Uni V4 ETH · clean",
         amountOut: out4,
         poolId: v4Meta.poolId,
         key: v4Meta.key,
@@ -2309,29 +2312,51 @@ function chooseBestPairForToken(pairs, tokenAddress) {
   return ranked[0] || null;
 }
 
-/** Deepest tradeable pool for paste-token Buy/Sell: Uni V3 WETH or Uni V4 native ETH (skip USDG). */
+/** Deepest tradeable clean pool: Uni V3 WETH or Uni V4 ETH with hooks=0 (skip Doppler/USDG). */
 function chooseBestTradePairForToken(pairs, tokenAddress) {
   const token = normalizeAddress(tokenAddress);
   const forced = preferredV3PoolForToken(token);
   if (forced) {
-    const pinned = chooseBestPairForToken(pairs, token);
-    if (pinned) return { pair: pinned, kind: "v3", liquidityUsd: Number(pinned.liquidity?.usd || 0) };
+    const pinned =
+      (Array.isArray(pairs) ? pairs : []).find((pair) => normalizeAddress(pair.pairAddress) === forced) ||
+      chooseBestPairForToken(pairs, token);
+    if (pinned) {
+      return {
+        pair: pinned.pairAddress ? pinned : { ...pinned, pairAddress: forced },
+        kind: "v3",
+        liquidityUsd: Number(pinned.liquidity?.usd || 0),
+        clean: true,
+      };
+    }
+    return {
+      pair: {
+        chainId: config.chainId,
+        pairAddress: forced,
+        labels: ["v3"],
+        liquidity: { usd: 0 },
+        baseToken: { address: token },
+        quoteToken: { address: config.quoteTokenAddress, symbol: config.quoteSymbol },
+      },
+      kind: "v3",
+      liquidityUsd: 0,
+      clean: true,
+    };
   }
 
   const v3 = chooseBestPairForToken(pairs, token);
   const bestroute = require("./bestroute");
-  const v4 = bestroute.pickV4EthPool(pairs, token);
+  const cleanV4 = bestroute.pickCleanV4EthPool(pairs, token);
   const v3Liq = Number(v3?.liquidity?.usd || 0);
-  const v4Liq = Number(v4?.liquidity?.usd || 0);
+  const v4Liq = Number(cleanV4?.liquidityUsd || 0);
 
-  if (v4 && v4Liq > v3Liq) {
-    return { pair: v4, kind: "v4", liquidityUsd: v4Liq };
+  if (cleanV4?.pair && v4Liq > v3Liq) {
+    return { pair: cleanV4.pair, kind: "v4", liquidityUsd: v4Liq, clean: true };
   }
   if (v3) {
-    return { pair: v3, kind: "v3", liquidityUsd: v3Liq };
+    return { pair: v3, kind: "v3", liquidityUsd: v3Liq, clean: true };
   }
-  if (v4) {
-    return { pair: v4, kind: "v4", liquidityUsd: v4Liq };
+  if (cleanV4?.pair) {
+    return { pair: cleanV4.pair, kind: "v4", liquidityUsd: v4Liq, clean: true };
   }
   return null;
 }
@@ -3826,7 +3851,11 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
   trackedPair.tradeRoute = tradeRoute;
   const dexVer =
     options.dexVer ||
-    (forced ? "Uni V3 · forced pool" : tradeRoute === "v4" ? "Uni V4 ETH · deepest" : "Uni V3 · deepest");
+    (forced
+      ? "Uni V3 · forced pool"
+      : tradeRoute === "v4"
+        ? "Uni V4 ETH · clean (no hooks)"
+        : "Uni V3 · clean deepest");
 
   if (tradeRoute === "v4") {
     trackedPair.v4TradePoolId = isV4PoolId(trackedPair.pairAddress)
@@ -3880,15 +3909,15 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
     : "";
   const listenLine =
     tradeRoute === "v4"
-      ? `Listen: <b>1 pool</b> Uni V4 ETH (deepest)${escapeHtml(liqNote)}`
-      : `Listen: <b>1 pool</b> Uni V3 WETH (deepest)${escapeHtml(liqNote)}`;
+      ? `Listen: <b>1 pool</b> Uni V4 ETH sạch (no hook fee)${escapeHtml(liqNote)}`
+      : `Listen: <b>1 pool</b> Uni V3 WETH sạch${escapeHtml(liqNote)}`;
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
       `<b>Tracking ${escapeHtml(trackedPair.baseSymbol)}</b> (active · ${escapeHtml(dexVer)}${escapeHtml(liqNote)})`,
       `Đang track <b>${state.trackedPairs?.length || 1}/${config.maxTrackedTokens}</b>: ${escapeHtml(trackedNames)}`,
       listenLine,
-      `Chỉ alert buy/sell ≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol || "ETH")} trên pool này.`,
+      `Tự bỏ pool V4 có Doppler/Rehype hook. Alert ≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol || "ETH")} trên pool này.`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
       forced ? "Buy/Sell dùng đúng pool này." : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
@@ -4059,9 +4088,9 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: [
-        "Không tìm thấy pool tradeable (Uni V3 WETH / Uni V4 ETH) cho:",
+        "Không tìm thấy pool <b>sạch</b> (Uni V3 WETH / Uni V4 ETH không hook) cho:",
         `<code>${escapeHtml(followAddress)}</code>`,
-        "Hoặc paste <b>link Dexscreener</b> để force đúng pool.",
+        "Pool V4 có Doppler/Rehype hook fee đã bị bỏ. Paste link Dexscreener V3 nếu muốn force.",
       ].join("\n"),
       parse_mode: "HTML",
       disable_web_page_preview: "true",
@@ -4084,7 +4113,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     await activateTrackedPair(trackedPair, state, chatId, {
       tradeRoute: "v4",
       liquidityUsd: selected.liquidityUsd,
-      dexVer: "Uni V4 ETH · deepest",
+      dexVer: "Uni V4 ETH · clean (no hooks)",
     });
     return;
   }
@@ -4095,7 +4124,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
   await activateTrackedPair(trackedPair, state, chatId, {
     tradeRoute: "v3",
     liquidityUsd: selected.liquidityUsd,
-    dexVer: "Uni V3 · deepest",
+    dexVer: "Uni V3 · clean deepest",
   });
 }
 

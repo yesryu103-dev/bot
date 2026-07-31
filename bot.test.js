@@ -690,7 +690,7 @@ test("portfolio keeps liquid tokens and hides junk", () => {
 
 test("portfolio bags price V4 ETH pools and skip dust raw balances", () => {
   const frong = "0x6245e67affa44a23077f0ea7f981a8dc743a0c47";
-  const poolId = `0x${"ab".repeat(32)}`;
+  const poolId = "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a";
   const balances = [
     {
       value: "34155700000000000000000",
@@ -791,9 +791,11 @@ test("buy fill records entry and DCA average", () => {
   assert.ok(bot.positionEntryLines(second.position, { fillEntryUsd: 0.1, isDca: true }).length >= 2);
 });
 
-test("GME is pinned to clean Uni V3 WETH pool", () => {
-  const gme = "0xc2362AfF2A2a4CC1f48cF3Dab2C4e2605eb94BA3";
+test("FORCE_V3_POOLS env still pins a token to a V3 pool", () => {
+  const gme = "0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3";
   const pool = "0xb7eedf33d02c743507c38e1ee20ef421e60661c6";
+  const prev = process.env.FORCE_V3_POOLS;
+  process.env.FORCE_V3_POOLS = `${gme}:${pool}`;
   assert.equal(bot.preferredV3PoolForToken(gme), pool);
   const picked = bot.chooseBestPairForToken(
     [
@@ -817,9 +819,11 @@ test("GME is pinned to clean Uni V3 WETH pool", () => {
     gme,
   );
   assert.equal(picked.pairAddress, pool);
+  if (prev === undefined) delete process.env.FORCE_V3_POOLS;
+  else process.env.FORCE_V3_POOLS = prev;
 });
 
-test("paste-token trade pair prefers deepest V4 ETH over thinner V3", () => {
+test("paste-token prefers deepest clean V4 ETH over thinner V3", () => {
   const token = "0x6245e67affa44a23077f0ea7f981a8dc743a0c47";
   const selected = bot.chooseBestTradePairForToken(
     [
@@ -851,6 +855,7 @@ test("paste-token trade pair prefers deepest V4 ETH over thinner V3", () => {
     token,
   );
   assert.equal(selected.kind, "v4");
+  assert.equal(selected.clean, true);
   assert.equal(
     selected.pair.pairAddress,
     "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a",
@@ -868,6 +873,52 @@ test("paste-token trade pair prefers deepest V4 ETH over thinner V3", () => {
   assert.equal(tracked.baseSymbol, "FRONG");
   assert.equal(tracked.quoteTokenAddress, bot.config.quoteTokenAddress);
   assert.notEqual(tracked.quoteTokenAddress, "0x0000000000000000000000000000000000000000");
+});
+
+test("unsafe/hooked V4 is skipped so deeper-looking hook pools lose to clean V3", () => {
+  const token = "0xc2362aff2a2a4cc1f48cf3dab2c4e2605eb94ba3";
+  const v3 = "0xb7eedf33d02c743507c38e1ee20ef421e60661c6";
+  const unsafeV4 = `0x${"ab".repeat(32)}`;
+  const selected = bot.chooseBestTradePairForToken(
+    [
+      {
+        chainId: "robinhood",
+        pairAddress: v3,
+        labels: ["v3"],
+        liquidity: { usd: 100000 },
+        baseToken: { address: token, symbol: "GME" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        pairAddress: unsafeV4,
+        labels: ["v4"],
+        liquidity: { usd: 500000 },
+        baseToken: { address: token, symbol: "GME" },
+        quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" },
+      },
+    ],
+    token,
+  );
+  assert.equal(selected.kind, "v3");
+  assert.equal(selected.pair.pairAddress.toLowerCase(), v3);
+  assert.equal(selected.clean, true);
+});
+
+test("classifyV4EthPool marks known clean FRONG pool and unknown ids unsafe", () => {
+  const bestroute = require("./bestroute");
+  const frong = "0x6245e67affa44a23077f0ea7f981a8dc743a0c47";
+  const clean = bestroute.classifyV4EthPool(
+    "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a",
+    frong,
+  );
+  assert.equal(clean.status, "clean");
+  assert.equal(clean.clean, true);
+  assert.equal(String(clean.key.hooks).toLowerCase(), bestroute.NATIVE_ETH);
+
+  const unsafe = bestroute.classifyV4EthPool(`0x${"cd".repeat(32)}`, frong);
+  assert.equal(unsafe.status, "unsafe");
+  assert.equal(unsafe.clean, false);
 });
 
 test("V4 track is excluded from V3 watch set (deepest pool only)", () => {

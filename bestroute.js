@@ -40,10 +40,10 @@ function dexPairHasUsdg(pair) {
 }
 
 /** Deepest v4 token/ETH pool (native 0x000… only — skips USDG hubs). */
-function pickV4EthPool(pairs, tokenAddress) {
+function listV4EthPools(pairs, tokenAddress) {
   const token = String(tokenAddress || "").toLowerCase();
   const zero = "0x0000000000000000000000000000000000000000";
-  const ranked = (Array.isArray(pairs) ? pairs : [])
+  return (Array.isArray(pairs) ? pairs : [])
     .filter((pair) => String(pair.chainId || "").toLowerCase() === "robinhood")
     .filter((pair) => dexPairIsV4(pair) && !dexPairHasUsdg(pair))
     .filter((pair) => {
@@ -55,7 +55,88 @@ function pickV4EthPool(pairs, tokenAddress) {
     })
     .filter((pair) => Number(pair.liquidity?.usd || 0) > 0)
     .sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
-  return ranked[0] || null;
+}
+
+function pickV4EthPool(pairs, tokenAddress) {
+  return listV4EthPools(pairs, tokenAddress)[0] || null;
+}
+
+/**
+ * Known Doppler / Rehype / multicurve hooks (Robinhood 4663 + common mainnet clones).
+ * Env V4_HOOK_HINTS=0x..,0x.. extends this list for recover/classify.
+ */
+const KNOWN_V4_HOOKS = [
+  // Robinhood Chain (4663) — whetstoneresearch/doppler Deployments.json
+  "0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544", // DopplerHookInitializer
+  "0x7bf319d8e969f7596b1bc171da9ce322f67ae0c4", // DopplerHookMigrator
+  "0x9982538f41f2ae29ddb9d3d9307010052984fdbb", // RehypeDopplerHookInitializer
+  "0x975f9d1939cf6e4a3c9d99f9d41e6411cf4da23b", // RehypeDopplerHookMigrator
+  "0xc16c826f75338a5ea626f94f8992191b4ce5aba2", // SwapRestrictorDopplerHook
+  // Cross-chain Doppler / Rehype clones often reused in memes
+  "0xbdf938149ac6a781f94faa0ed45e6a0e984c6544",
+  "0x1e40b0875dda35f41e15cfb475403859b8c860c4",
+  "0x3ec4798a9b11e8243a8db99687f7a23597b96623",
+  "0x56ea13da5f39863d3b3d54826187306af7ada544",
+  "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503",
+  "0x78c79c95eaceb2d08f7a55cc0d31012f8af510c3",
+  "0x9349e5a3e6458aa65e2fb7ed67e9ad08ae7f660d",
+  "0xbf4195ab0b03e1eb3345dd1e83bed7650b1ed123",
+  "0xea95dfdf69b90c65c827070852f7039d6af6dd7b",
+  "0xbb7784a4d481184283ed89619a3e3ed143e1adc0", // DecayMulticurveInitializerHook
+  "0xc6a562cb5cbfa29bcb1bdccf903b8b8f2e4a2dc0",
+  "0x580ca49389d83b019d07e17e99454f2f218e2dc0",
+  "0x11b55a121a38fdab8faf16f9f1a4f124e3f42d40",
+  "0x892d3c2b4abeaaf67d52a7b29783e2161b7cad40",
+  "0xfaf16d11737e6552156dd328cd26c530e1da2d40",
+  "0x6a1061fc558dde1e6fd0efd641b370d435b56d40",
+];
+
+function knownV4HookHints() {
+  const fromEnv = String(process.env.V4_HOOK_HINTS || "")
+    .split(",")
+    .map((item) => String(item || "").trim().toLowerCase())
+    .filter((item) => /^0x[a-f0-9]{40}$/.test(item));
+  return [...new Set([...KNOWN_V4_HOOKS.map((h) => h.toLowerCase()), ...fromEnv])];
+}
+
+function recoverV4PoolKeyEither(poolId, tokenAddress, hookHints = []) {
+  const token = tokenAddress;
+  return (
+    recoverV4PoolKey(poolId, token, NATIVE_ETH, hookHints) ||
+    recoverV4PoolKey(poolId, NATIVE_ETH, token, hookHints)
+  );
+}
+
+/**
+ * Classify a V4 ETH pool for hook-fee safety.
+ * clean = hooks is zero; hooked = known non-zero hook; unsafe = cannot recover.
+ */
+function classifyV4EthPool(poolId, tokenAddress) {
+  const id = String(poolId || "").toLowerCase();
+  if (!isV4PoolId(id)) return { status: "unsafe", key: null, clean: false, hooked: false };
+
+  const cleanKey = recoverV4PoolKeyEither(id, tokenAddress, []);
+  if (cleanKey && String(cleanKey.hooks).toLowerCase() === NATIVE_ETH) {
+    return { status: "clean", key: cleanKey, clean: true, hooked: false };
+  }
+
+  const hookedKey = recoverV4PoolKeyEither(id, tokenAddress, knownV4HookHints());
+  if (hookedKey && String(hookedKey.hooks).toLowerCase() !== NATIVE_ETH) {
+    return { status: "hooked", key: hookedKey, clean: false, hooked: true };
+  }
+
+  return { status: "unsafe", key: null, clean: false, hooked: false };
+}
+
+/** Deepest V4 native-ETH pool with hooks=0x0 (skips Doppler/Rehype fee skims). */
+function pickCleanV4EthPool(pairs, tokenAddress) {
+  for (const pair of listV4EthPools(pairs, tokenAddress)) {
+    const classified = classifyV4EthPool(pair.pairAddress, tokenAddress);
+    if (classified.clean) {
+      return { pair, key: classified.key, liquidityUsd: Number(pair.liquidity?.usd || 0) };
+    }
+  }
+  return null;
 }
 
 function recoverV4PoolKey(poolId, currencyA, currencyB, hookHints = []) {
@@ -184,8 +265,13 @@ async function ensurePermit2(wallet, tokenAddress, routerAddress, amountIn, perm
 module.exports = {
   NATIVE_ETH,
   DEFAULTS,
+  KNOWN_V4_HOOKS,
   isV4PoolId,
+  listV4EthPools,
   pickV4EthPool,
+  pickCleanV4EthPool,
+  classifyV4EthPool,
+  knownV4HookHints,
   recoverV4PoolKey,
   encodeExactInputSingle,
   quoteV4ExactInSpot,
