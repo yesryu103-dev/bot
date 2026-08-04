@@ -944,6 +944,19 @@ test("V4 alerts are not dropped by exec/spot ratio sanity check", () => {
     }),
     true,
   );
+  // Below minQuote still uses ratio guard (default min 0.2).
+  assert.equal(
+    bot.isSaneTradeAlert({
+      dexVer: "v3",
+      quoteAmount: 0.15,
+      baseAmount: 700000,
+      priceUsd: 0.05,
+      spotPriceUsd: 0.004,
+      execPriceUsd: 0.05,
+    }),
+    false,
+  );
+  // At/above minQuote, pool-log size is trusted (Dex spot lag must not drop whales).
   assert.equal(
     bot.isSaneTradeAlert({
       dexVer: "v3",
@@ -953,7 +966,7 @@ test("V4 alerts are not dropped by exec/spot ratio sanity check", () => {
       spotPriceUsd: 0.004,
       execPriceUsd: 0.05,
     }),
-    false,
+    true,
   );
 });
 

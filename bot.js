@@ -148,15 +148,16 @@ const config = {
   stateFile: process.env.STATE_FILE || (activeChain.id === "bsc" ? "state.bsc.json" : "state.json"),
   maxItems: Number(process.env.MAX_ITEMS || 200),
   minUsd: Number(process.env.MIN_USD || 0),
-  minQuoteAmount: Number(process.env.MIN_QUOTE_AMOUNT || 1),
+  // Default 0.2 ETH — 1.0 was filtering most retail "whale" prints on RH memes.
+  minQuoteAmount: Number(process.env.MIN_QUOTE_AMOUNT || 0.2),
   // Only alert swaps younger than this (realtime). Stale txs after sleep/redeploy are ignored.
-  maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 90_000),
+  maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 120_000),
   // Prefer time-based lookback — Robinhood ~0.1s/block so "100 blocks" was only ~10s and missed whales.
   rpcSwapLookbackMs: Number(process.env.RPC_SWAP_LOOKBACK_MS || 180_000),
   // Optional hard block cap/override. 0 = derive from rpcSwapLookbackMs + chain speed.
   rpcSwapLookbackBlocks: Number(process.env.RPC_SWAP_LOOKBACK_BLOCKS || 0),
-  // Alchemy free tier caps eth_getLogs to 10-block windows; publicnode can go higher.
-  rpcGetLogsMaxBlockRange: Number(process.env.RPC_GETLOGS_MAX_BLOCK_RANGE || 100),
+  // Alchemy free tier caps eth_getLogs to 10-block windows; publicnode/pocket ok higher.
+  rpcGetLogsMaxBlockRange: Number(process.env.RPC_GETLOGS_MAX_BLOCK_RANGE || 200),
   dryRun: truthy(process.env.DRY_RUN),
   backfillOnStart: truthy(process.env.BACKFILL_ON_START),
   fetchTxDetails: truthy(process.env.FETCH_TX_DETAILS),
@@ -351,6 +352,7 @@ async function fetchTokenTransfers() {
 
 const poolMetaCache = new Map();
 let cachedHttpRpcProvider = null;
+const cachedHttpProvidersByUrl = new Map();
 
 /** Explicit HTTP JSON-RPC (fallback when WSS is down). */
 function getHttpRpcProvider() {
@@ -365,6 +367,106 @@ function getHttpRpcProvider() {
     cachedHttpRpcProvider._walletRpcUrl = url;
   }
   return cachedHttpRpcProvider;
+}
+
+function httpProviderForUrl(url) {
+  const { ethers } = require("ethers");
+  const key = String(url || "").trim();
+  if (!key) return getHttpRpcProvider();
+  if (cachedHttpProvidersByUrl.has(key)) return cachedHttpProvidersByUrl.get(key);
+  const provider = new ethers.JsonRpcProvider(key, undefined, {
+    staticNetwork: true,
+    batchMaxCount: 3,
+  });
+  provider._walletRpcUrl = key;
+  cachedHttpProvidersByUrl.set(key, provider);
+  return provider;
+}
+
+/** HTTP endpoints for getLogs: primary RPC_URL then HTTP siblings of WSS list. */
+function httpRpcUrls() {
+  const urls = [];
+  const seen = new Set();
+  const push = (raw) => {
+    const url = String(raw || "").trim();
+    if (!url || !/^https?:\/\//i.test(url)) return;
+    const key = url.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    urls.push(url);
+  };
+  push(config.rpcUrl || ROBINHOOD_PUBLIC_RPC);
+  for (const ws of wsEndpoints()) push(httpUrlFromWs(ws));
+  push(ROBINHOOD_PUBLIC_RPC);
+  return urls;
+}
+
+function checksumOrRawAddress(address) {
+  const { ethers } = require("ethers");
+  const raw = String(address || "").trim();
+  if (!raw) return raw;
+  try {
+    if (isEvmAddress(raw)) return ethers.getAddress(raw);
+  } catch {
+    // keep raw (e.g. bytes32 pool id)
+  }
+  return raw;
+}
+
+/**
+ * Robust eth_getLogs: shrink range on failure, try checksum address, try backup HTTP RPCs.
+ * Returns { logs, scannedTo, error }.
+ */
+async function fetchSwapLogsRange({ provider, address, fromBlock, toBlock, topics, maxRange }) {
+  const startRange = Math.max(1, Number(maxRange) || 100);
+  const addrs = [...new Set([checksumOrRawAddress(address), normalizeAddress(address)].filter(Boolean))];
+  const providers = [provider];
+  for (const url of httpRpcUrls()) {
+    const alt = httpProviderForUrl(url);
+    if (alt !== provider) providers.push(alt);
+  }
+
+  const logs = [];
+  let scannedTo = fromBlock;
+  let lastError = null;
+
+  for (let start = fromBlock + 1; start <= toBlock; ) {
+    let range = startRange;
+    let chunkDone = false;
+    while (range >= 1 && !chunkDone) {
+      const end = Math.min(toBlock, start + range - 1);
+      let ok = false;
+      for (const rpc of providers) {
+        for (const addr of addrs) {
+          try {
+            const chunk = await rpc.getLogs({
+              address: addr,
+              fromBlock: start,
+              toBlock: end,
+              topics,
+            });
+            if (chunk.length) logs.push(...chunk);
+            scannedTo = end;
+            ok = true;
+            chunkDone = true;
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        if (ok) break;
+      }
+      if (ok) break;
+      if (range <= 1) break;
+      range = Math.max(1, Math.floor(range / 2));
+    }
+    if (!chunkDone) {
+      return { logs, scannedTo, error: lastError || new Error("eth_getLogs failed") };
+    }
+    start = scannedTo + 1;
+  }
+
+  return { logs, scannedTo, error: null };
 }
 
 /** Cache of recent blocks/sec so lookback tracks fast chains (RH ~10 blk/s). */
@@ -658,7 +760,6 @@ function handleLiveV4SwapEvent({ poolId, sender, amount0, amount1, txHash, block
     // Below min — leave tx unset so a larger hop in the same tx can still alert.
     return;
   }
-  if (!claimSwapAlert(state, hash, pool)) return;
 
   if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
   const bn = Number(blockNumber || 0);
@@ -666,7 +767,7 @@ function handleLiveV4SwapEvent({ poolId, sender, amount0, amount1, txHash, block
   if (bn > 0) state.swapBlocks[cursorKey] = Math.max(Number(state.swapBlocks[cursorKey] || 0), bn);
   saveState(state);
 
-  emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pool));
+  emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pool), { state, scope: pool });
 }
 
 async function initRpcSwapCursors(state, { onlyMissing = true } = {}) {
@@ -744,25 +845,25 @@ async function pollRpcSwaps(state, options = {}) {
 
       let logs = [];
       let scannedTo = fromBlock;
-      try {
-        for (let start = fromBlock + 1; start <= latest; start += maxRange) {
-          const end = Math.min(latest, start + maxRange - 1);
-          const chunk = await provider.getLogs({
-            address: v4Manager,
-            fromBlock: start,
-            toBlock: end,
-            topics: [v4Topic, poolId],
-          });
-          if (chunk.length) logs = logs.concat(chunk);
-          scannedTo = end;
-        }
-      } catch (error) {
+      const fetched = await fetchSwapLogsRange({
+        provider,
+        address: v4Manager,
+        fromBlock,
+        toBlock: latest,
+        topics: [v4Topic, poolId],
+        maxRange,
+      });
+      logs = fetched.logs;
+      scannedTo = fetched.scannedTo;
+      if (fetched.error) {
         if (scannedTo > fromBlock) state.swapBlocks[cursorKey] = scannedTo;
         if (now - (pollRpcSwaps._lastLogsWarnAt || 0) > 60_000) {
-          console.warn(`RPC V4 getLogs failed for ${compactAddress(poolId)}: ${error.message}`);
+          console.warn(
+            `RPC V4 getLogs failed for ${compactAddress(poolId)}: ${fetched.error.message}`,
+          );
           pollRpcSwaps._lastLogsWarnAt = now;
         }
-        continue;
+        if (scannedTo <= fromBlock) continue;
       }
 
       for (const log of logs) {
@@ -785,18 +886,19 @@ async function pollRpcSwaps(state, options = {}) {
           sender: parsed.args.sender,
         });
         if (!trade) continue;
-        const seenKey = alertSeenKey(txHash, poolId);
-        alerted.push(seenKey);
-        // Claim before async enrich so WS/HTTP races don't double-send.
-        addSeen(state, [seenKey]);
-        emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
+        alerted.push(alertSeenKey(txHash, poolId));
+        emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId), {
+          state,
+          scope: poolId,
+        });
       }
-      state.swapBlocks[cursorKey] = latest;
+      if (!fetched.error || scannedTo > fromBlock) {
+        state.swapBlocks[cursorKey] = fetched.error ? scannedTo : latest;
+      }
     }
   }
 
   if (options.v4Only) {
-    if (alerted.length) addSeen(state, alerted);
     saveState(state);
     return alerted.length;
   }
@@ -837,25 +939,23 @@ async function pollRpcSwaps(state, options = {}) {
 
     let logs = [];
     let scannedTo = fromBlock;
-    try {
-      for (let start = fromBlock + 1; start <= latest; start += maxRange) {
-        const end = Math.min(latest, start + maxRange - 1);
-        const chunk = await provider.getLogs({
-          address: pair,
-          fromBlock: start,
-          toBlock: end,
-          topics: [topic],
-        });
-        if (chunk.length) logs = logs.concat(chunk);
-        scannedTo = end;
-      }
-    } catch (error) {
+    const fetched = await fetchSwapLogsRange({
+      provider,
+      address: pair,
+      fromBlock,
+      toBlock: latest,
+      topics: [topic],
+      maxRange,
+    });
+    logs = fetched.logs;
+    scannedTo = fetched.scannedTo;
+    if (fetched.error) {
       if (scannedTo > fromBlock) state.swapBlocks[pair] = scannedTo;
       if (now - (pollRpcSwaps._lastLogsWarnAt || 0) > 60_000) {
-        console.warn(`RPC getLogs failed for ${pair}: ${error.message}`);
+        console.warn(`RPC getLogs failed for ${pair}: ${fetched.error.message}`);
         pollRpcSwaps._lastLogsWarnAt = now;
       }
-      continue;
+      if (scannedTo <= fromBlock) continue;
     }
 
     const blockTs = new Map();
@@ -882,7 +982,7 @@ async function pollRpcSwaps(state, options = {}) {
         continue;
       }
       const tsMs = light ? now : blockTs.get(Number(log.blockNumber)) || now;
-      if (now - tsMs > Number(config.maxAlertAgeMs || 90_000)) {
+      if (now - tsMs > Number(config.maxAlertAgeMs || 120_000)) {
         // Too old for a live alert — still mark scoped so we don't retry forever.
         addSeen(state, [alertSeenKey(txHash, pair)]);
         continue;
@@ -900,17 +1000,15 @@ async function pollRpcSwaps(state, options = {}) {
         recipient: parsed.args.recipient,
       });
       if (!trade) continue;
-      const seenKey = alertSeenKey(txHash, pair);
-      alerted.push(seenKey);
-      addSeen(state, [seenKey]);
-      // Non-blocking: enrich + Telegram queue so RPC poll stays fast.
-      emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pair));
+      alerted.push(alertSeenKey(txHash, pair));
+      emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pair), { state, scope: pair });
     }
 
-    state.swapBlocks[pair] = latest;
+    if (!fetched.error || scannedTo > fromBlock) {
+      state.swapBlocks[pair] = fetched.error ? scannedTo : latest;
+    }
   }
 
-  if (alerted.length) addSeen(state, alerted);
   saveState(state);
   return alerted.length;
 }
@@ -1017,7 +1115,7 @@ function resolveAlertEthUsd(cache) {
   return Number.NaN;
 }
 
-function emitTradeAlertAsync(trade) {
+function emitTradeAlertAsync(trade, claim = null) {
   const cache = priceCacheFor(trade?.pairAddress || config.pairAddress);
   const ethUsdCached = resolveAlertEthUsd(cache);
   const warm =
@@ -1029,9 +1127,14 @@ function emitTradeAlertAsync(trade) {
       console.warn(
         `Skip junk alert ${priced?.txHash || ""} ${priced?.side} ${priced?.baseSymbol}: exec=${priced?.priceUsd} spot=${priced?.spotPriceUsd} quote=${priced?.quoteAmount}`,
       );
-      return;
+      return false;
+    }
+    // Claim AFTER sanity so a junk drop cannot permanently silence a real whale tx.
+    if (claim?.state) {
+      if (!claimSwapAlert(claim.state, priced.txHash || trade.txHash, claim.scope || "")) return false;
     }
     enqueueTelegramAlert(tradeMessage(priced), mainMenuKeyboard());
+    return true;
   };
 
   if (warm) {
@@ -1068,17 +1171,14 @@ function isSaneTradeAlert(trade) {
   const spot = Number(trade?.spotPriceUsd);
   if (!(quote > 0) || !(base > 0)) return false;
   // Must look like a real ETH size for our min filter.
-  const minQuote = Number(config.minQuoteAmount) || 1;
+  const minQuote = Number(config.minQuoteAmount) || 0.2;
   if (quote < minQuote * 0.95) return false;
-  // V4 Dex spot on pool ids can lag hard — never drop a real ETH-sized V4 whale on ratio alone.
+  // Pool-log ETH size already passed min — trust it. Dex spot lag used to drop real V3 whales.
   if (String(trade?.dexVer || "").toLowerCase() === "v4") return true;
+  if (quote >= minQuote) return true;
   if (Number.isFinite(spot) && spot > 0 && Number.isFinite(exec) && exec > 0) {
     const ratio = exec / spot;
-    // Real pool swaps stay near spot; multi-hop mislabels often print 10x–100x.
-    // Allow slightly wider band for >= minQuote whales (flow + stale Dex cache).
-    // Keep below typical multi-hop mislabels (~12x–100x).
-    const maxRatio = quote >= minQuote ? 10 : 8;
-    if (ratio > maxRatio || ratio < 1 / maxRatio) return false;
+    if (ratio > 8 || ratio < 1 / 8) return false;
   }
   return true;
 }
@@ -1127,14 +1227,13 @@ function handleLiveSwapEvent({ pair, amount0, amount1, recipient, txHash, blockN
       // (e.g. FRONG V3 dust hop + V4 1+ ETH) and must still alert.
       return;
     }
-    if (!claimSwapAlert(state, hash, pool)) return;
 
     if (!state.swapBlocks || typeof state.swapBlocks !== "object") state.swapBlocks = {};
     const bn = Number(blockNumber || 0);
     if (bn > 0) state.swapBlocks[pool] = Math.max(Number(state.swapBlocks[pool] || 0), bn);
     saveState(state);
 
-    emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pool));
+    emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pool), { state, scope: pool });
   };
 
   if (cached) {
@@ -5439,47 +5538,34 @@ async function main() {
     const wsOk = isWsAlertHealthy();
     wsRuntime.stateRef = state;
     const now = Date.now();
+    const v3WatchCount = watchedPairSet().size;
     const v4WatchCount = watchedV4PoolSet().size;
 
-    // Always poll V4 tracks over HTTP (WS eth_subscribe is flaky on public Robinhood nodes).
-    // Full V3+V4 poll when WSS is down; light V3 catch-up often enough that lookback covers the gap.
+    // Always HTTP-poll every watched pool (WSS drops are common). Never block Telegram on it.
+    const needHttp = v3WatchCount > 0 || v4WatchCount > 0 || !wsOk;
     const needFullHttp = !wsOk;
-    const needV4Http = v4WatchCount > 0;
-    // Was 45s with ~6s block-lookback on RH → permanently missed most V3 whales when WS dropped events.
-    const needLightCatchup = wsOk && now - lastHttpCatchupAt > 12_000;
-    if (needFullHttp || needV4Http || needLightCatchup) {
-      try {
-        if (!pollRpcSwaps._inFlight) {
-          const v4Only = needV4Http && wsOk && !needFullHttp && !needLightCatchup;
-          pollRpcSwaps._inFlight = withTimeout(
-            pollRpcSwaps(state, {
-              // Time-based lookback (resolveSwapLookbackBlocks). Do NOT pass tiny block counts.
-              light: !needFullHttp,
-              v4Only,
-            }),
-            needFullHttp ? 25_000 : 15_000,
-            needFullHttp ? "HTTP RPC swap poll" : v4Only ? "HTTP V4 poll" : "HTTP light catch-up",
-          )
-            .then(() => {
-              lastHttpCatchupAt = Date.now();
-            })
-            .catch((error) => {
-              if (now - lastRpcWarnAt > 60_000) {
-                console.warn(`HTTP RPC poll failed (${config.rpcUrl}): ${error.message || error}`);
-                lastRpcWarnAt = now;
-              }
-            })
-            .finally(() => {
-              pollRpcSwaps._inFlight = null;
-            });
-        }
-        await pollRpcSwaps._inFlight;
-      } catch (error) {
-        if (now - lastRpcWarnAt > 60_000) {
-          console.warn(`HTTP RPC poll failed (${config.rpcUrl}): ${error.message || error}`);
-          lastRpcWarnAt = now;
-        }
-      }
+    const due = now - lastHttpCatchupAt > (needFullHttp ? 2_000 : 4_000);
+    if (needHttp && due && !pollRpcSwaps._inFlight) {
+      pollRpcSwaps._inFlight = withTimeout(
+        pollRpcSwaps(state, {
+          light: !needFullHttp,
+          v4Only: false,
+        }),
+        needFullHttp ? 45_000 : 35_000,
+        needFullHttp ? "HTTP RPC swap poll" : "HTTP V3+V4 catch-up",
+      )
+        .then(() => {
+          lastHttpCatchupAt = Date.now();
+        })
+        .catch((error) => {
+          if (Date.now() - lastRpcWarnAt > 60_000) {
+            console.warn(`HTTP RPC poll failed (${config.rpcUrl}): ${error.message || error}`);
+            lastRpcWarnAt = Date.now();
+          }
+        })
+        .finally(() => {
+          pollRpcSwaps._inFlight = null;
+        });
     }
 
     // Optional Blockscout API is disabled in the hot loop — HTTP RPC (RPC_URL) already covers alerts.
