@@ -134,9 +134,12 @@ const config = {
   minQuoteAmount: Number(process.env.MIN_QUOTE_AMOUNT || 1),
   // Only alert swaps younger than this (realtime). Stale txs after sleep/redeploy are ignored.
   maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 90_000),
-  rpcSwapLookbackBlocks: Number(process.env.RPC_SWAP_LOOKBACK_BLOCKS || 100),
-  // Alchemy free tier caps eth_getLogs to 10-block windows.
-  rpcGetLogsMaxBlockRange: Number(process.env.RPC_GETLOGS_MAX_BLOCK_RANGE || 10),
+  // Prefer time-based lookback — Robinhood ~0.1s/block so "100 blocks" was only ~10s and missed whales.
+  rpcSwapLookbackMs: Number(process.env.RPC_SWAP_LOOKBACK_MS || 180_000),
+  // Optional hard block cap/override. 0 = derive from rpcSwapLookbackMs + chain speed.
+  rpcSwapLookbackBlocks: Number(process.env.RPC_SWAP_LOOKBACK_BLOCKS || 0),
+  // Alchemy free tier caps eth_getLogs to 10-block windows; publicnode can go higher.
+  rpcGetLogsMaxBlockRange: Number(process.env.RPC_GETLOGS_MAX_BLOCK_RANGE || 100),
   dryRun: truthy(process.env.DRY_RUN),
   backfillOnStart: truthy(process.env.BACKFILL_ON_START),
   fetchTxDetails: truthy(process.env.FETCH_TX_DETAILS),
@@ -339,6 +342,48 @@ function getHttpRpcProvider() {
     cachedHttpRpcProvider._walletRpcUrl = url;
   }
   return cachedHttpRpcProvider;
+}
+
+/** Cache of recent blocks/sec so lookback tracks fast chains (RH ~10 blk/s). */
+const chainPaceCache = { at: 0, blocksPerSec: activeChain.id === "robinhood" ? 10 : 0.5 };
+
+async function estimateBlocksPerSecond(provider) {
+  const now = Date.now();
+  if (now - chainPaceCache.at < 60_000 && chainPaceCache.blocksPerSec > 0) {
+    return chainPaceCache.blocksPerSec;
+  }
+  try {
+    const latest = Number(await provider.getBlockNumber());
+    const sample = Math.min(200, Math.max(20, latest - 1));
+    const [head, older] = await Promise.all([provider.getBlock(latest), provider.getBlock(latest - sample)]);
+    const dt = Number(head?.timestamp || 0) - Number(older?.timestamp || 0);
+    const bps = dt > 0 ? sample / dt : chainPaceCache.blocksPerSec;
+    if (Number.isFinite(bps) && bps > 0) {
+      chainPaceCache.blocksPerSec = Math.min(50, Math.max(0.1, bps));
+      chainPaceCache.at = now;
+    }
+  } catch {
+    // keep prior estimate
+  }
+  return chainPaceCache.blocksPerSec;
+}
+
+/**
+ * How many blocks to re-scan on HTTP catch-up.
+ * Must exceed (catch-up interval + RPC blips) or silent WS drops permanently miss whales.
+ */
+async function resolveSwapLookbackBlocks(provider, options = {}) {
+  const explicit = Number(options.lookbackBlocks ?? config.rpcSwapLookbackBlocks);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
+
+  const wantMs = Math.max(
+    60_000,
+    Number(options.lookbackMs ?? config.rpcSwapLookbackMs ?? 180_000),
+    Number(config.maxAlertAgeMs || 90_000),
+  );
+  const bps = await estimateBlocksPerSecond(provider);
+  // Cap keeps getLogs chunked work bounded; floor covers slow-poll gaps.
+  return Math.min(8_000, Math.max(300, Math.ceil((wantMs / 1000) * bps * 1.25)));
 }
 
 function isWsProviderReady() {
@@ -627,12 +672,18 @@ async function pollRpcSwaps(state, options = {}) {
     "event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)",
   ]);
   const topic = iface.getEvent("Swap").topicHash;
-  const seen = new Set(state.seen || []);
   const now = Date.now();
-  const configuredLookback = Number(config.rpcSwapLookbackBlocks || 100);
-  const lookback = Math.max(20, Number(options.lookbackBlocks ?? configuredLookback));
+  const lookback = await resolveSwapLookbackBlocks(provider, options);
   const light = Boolean(options.light);
   const alerted = [];
+  // Alchemy free: keep ≤10. Public nodes can use config default (100).
+  const maxRange = Math.max(
+    1,
+    Number(
+      options.maxBlockRange ||
+        (/alchemy\.com/i.test(String(config.rpcUrl || "")) ? 10 : config.rpcGetLogsMaxBlockRange || 100),
+    ),
+  );
 
   // Process V4 deepest pools BEFORE thin V3 watches so a multi-hop tx (V3 dust + V4 whale)
   // alerts on the real size instead of getting poisoned by a below-min V3 hop.
@@ -643,7 +694,6 @@ async function pollRpcSwaps(state, options = {}) {
       "event Swap(bytes32 indexed id,address indexed sender,int128 amount0,int128 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint24 fee)",
     ]);
     const v4Topic = v4Iface.getEvent("Swap").topicHash;
-    const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
 
     for (const poolId of v4Ids) {
       const cursorKey = `v4:${poolId}`;
@@ -694,8 +744,7 @@ async function pollRpcSwaps(state, options = {}) {
 
       for (const log of logs) {
         const txHash = String(log.transactionHash || "").toLowerCase();
-        const seenKey = alertSeenKey(txHash, poolId);
-        if (!txHash || seen.has(txHash) || seen.has(seenKey)) continue;
+        if (!txHash || hasAlertSeen(state, txHash, poolId)) continue;
         let parsed;
         try {
           parsed = v4Iface.parseLog(log);
@@ -713,8 +762,10 @@ async function pollRpcSwaps(state, options = {}) {
           sender: parsed.args.sender,
         });
         if (!trade) continue;
+        const seenKey = alertSeenKey(txHash, poolId);
         alerted.push(seenKey);
-        seen.add(seenKey);
+        // Claim before async enrich so WS/HTTP races don't double-send.
+        addSeen(state, [seenKey]);
         emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, poolId));
       }
       state.swapBlocks[cursorKey] = latest;
@@ -761,8 +812,6 @@ async function pollRpcSwaps(state, options = {}) {
       config.uniswapV3Fee = meta.fee;
     }
 
-    // Alchemy free: eth_getLogs max 10-block range — chunk so backup stays reliable.
-    const maxRange = Math.max(1, Number(options.maxBlockRange || config.rpcGetLogsMaxBlockRange || 10));
     let logs = [];
     let scannedTo = fromBlock;
     try {
@@ -802,8 +851,7 @@ async function pollRpcSwaps(state, options = {}) {
 
     for (const log of logs) {
       const txHash = String(log.transactionHash || "").toLowerCase();
-      const seenKey = alertSeenKey(txHash, pair);
-      if (!txHash || seen.has(txHash) || seen.has(seenKey)) continue;
+      if (!txHash || hasAlertSeen(state, txHash, pair)) continue;
       let parsed;
       try {
         parsed = iface.parseLog(log);
@@ -812,7 +860,8 @@ async function pollRpcSwaps(state, options = {}) {
       }
       const tsMs = light ? now : blockTs.get(Number(log.blockNumber)) || now;
       if (now - tsMs > Number(config.maxAlertAgeMs || 90_000)) {
-        seen.add(seenKey);
+        // Too old for a live alert — still mark scoped so we don't retry forever.
+        addSeen(state, [alertSeenKey(txHash, pair)]);
         continue;
       }
       const trade = tradeFromV3SwapLog({
@@ -828,8 +877,9 @@ async function pollRpcSwaps(state, options = {}) {
         recipient: parsed.args.recipient,
       });
       if (!trade) continue;
+      const seenKey = alertSeenKey(txHash, pair);
       alerted.push(seenKey);
-      seen.add(seenKey);
+      addSeen(state, [seenKey]);
       // Non-blocking: enrich + Telegram queue so RPC poll stays fast.
       emitTradeAlertAsync(tagTradeWithTracked(trade, tracked, pair));
     }
@@ -982,7 +1032,10 @@ function isSaneTradeAlert(trade) {
   if (Number.isFinite(spot) && spot > 0 && Number.isFinite(exec) && exec > 0) {
     const ratio = exec / spot;
     // Real pool swaps stay near spot; multi-hop mislabels often print 10x–100x.
-    if (ratio > 8 || ratio < 1 / 8) return false;
+    // Allow slightly wider band for >= minQuote whales (flow + stale Dex cache).
+    // Keep below typical multi-hop mislabels (~12x–100x).
+    const maxRatio = quote >= minQuote ? 10 : 8;
+    if (ratio > maxRatio || ratio < 1 / maxRatio) return false;
   }
   return true;
 }
@@ -5307,17 +5360,18 @@ async function main() {
     const v4WatchCount = watchedV4PoolSet().size;
 
     // Always poll V4 tracks over HTTP (WS eth_subscribe is flaky on public Robinhood nodes).
-    // Full V3+V4 poll when WSS is down; light V3 catch-up less often when WSS is up.
+    // Full V3+V4 poll when WSS is down; light V3 catch-up often enough that lookback covers the gap.
     const needFullHttp = !wsOk;
     const needV4Http = v4WatchCount > 0;
-    const needLightCatchup = wsOk && now - lastHttpCatchupAt > 45_000;
+    // Was 45s with ~6s block-lookback on RH → permanently missed most V3 whales when WS dropped events.
+    const needLightCatchup = wsOk && now - lastHttpCatchupAt > 12_000;
     if (needFullHttp || needV4Http || needLightCatchup) {
       try {
         if (!pollRpcSwaps._inFlight) {
           const v4Only = needV4Http && wsOk && !needFullHttp && !needLightCatchup;
           pollRpcSwaps._inFlight = withTimeout(
             pollRpcSwaps(state, {
-              lookbackBlocks: needFullHttp ? config.rpcSwapLookbackBlocks : 60,
+              // Time-based lookback (resolveSwapLookbackBlocks). Do NOT pass tiny block counts.
               light: !needFullHttp,
               v4Only,
             }),
