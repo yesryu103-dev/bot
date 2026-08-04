@@ -5093,8 +5093,7 @@ async function handleCallbackQueryInner(callbackQuery, state) {
     }
     await editTradeMessage(
       callbackQuery,
-      `Đang chuyển track sang:\n<code>${escapeHtml(token)}</code>`,
-      mainMenuKeyboard(state.portfolioSnapshot),
+      `Đang chuyển track sang:\n<code>${escapeHtml(token)}</code>\n<i>Đợi xác nhận Tracking…</i>`,
     );
     enqueueFollowToken(token, state, chatId).catch((error) => {
       console.error(`bagtrack follow failed: ${error.message}`);
@@ -5178,11 +5177,17 @@ async function handleTelegramMessageInner(message, state) {
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: trackInput.forced
-        ? `Đang force track pool:\n<code>${escapeHtml(trackInput.address)}</code>`
-        : `Đang track buy/sell cho:\n<code>${escapeHtml(trackInput.address)}</code>`,
+        ? `Đang force track pool:\n<code>${escapeHtml(trackInput.address)}</code>\n<i>Đợi bot chọn/xác nhận pool…</i>`
+        : [
+            `Đang track buy/sell cho:`,
+            `<code>${escapeHtml(trackInput.address)}</code>`,
+            `<i>Đợi bot tìm pool sạch (V3 WETH / V4 ETH)…</i>`,
+            `Menu bên dưới là token <b>cũ</b> — tin Tracking tiếp theo mới là token mới.`,
+          ].join("\n"),
       parse_mode: "HTML",
       disable_web_page_preview: "true",
-      reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+      // Do not attach sniper keyboard here — it still shows the PREVIOUS active token
+      // (e.g. paste GME but keyboard still says 🎯 JUGGERNAUT) and confuses users.
     });
     enqueueFollowToken(text, state, chatId).catch((error) => {
       console.error(`enqueueFollowToken failed: ${error.message}`);
