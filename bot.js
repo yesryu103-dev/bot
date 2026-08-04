@@ -46,6 +46,23 @@ function resolveHttpRpcUrl(rpcUrl, rpcWsUrl) {
   return explicit || fromWs || activeChain.rpcUrl;
 }
 
+/** Primary + fallback WSS endpoints (comma-separated RPC_WS_URL and/or RPC_WS_URL_FALLBACK). */
+function parseRpcWsUrls(...rawParts) {
+  const out = [];
+  const seen = new Set();
+  for (const part of rawParts) {
+    for (const item of String(part || "").split(/[\s,]+/)) {
+      const url = item.trim();
+      if (!url || !/^wss?:\/\//i.test(url)) continue;
+      const key = url.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(url);
+    }
+  }
+  return out;
+}
+
 function normalizeAddress(value) {
   return String(value || "").toLowerCase();
 }
@@ -151,9 +168,14 @@ const config = {
   // Hardcoded brand — ignore stale BOT_TITLE env if set to old names.
   botTitle: "Treasure_tradingbot",
   tradeEnabled: truthy(process.env.TRADE_ENABLED),
-  rpcUrl: resolveHttpRpcUrl(process.env.RPC_URL, process.env.RPC_WS_URL),
-  // When set: all chain RPC (track + trade + reads) prefers WSS; HTTP only on WSS failure.
-  rpcWsUrl: process.env.RPC_WS_URL || activeChain.rpcWsUrl || "",
+  rpcUrl: resolveHttpRpcUrl(
+    process.env.RPC_URL,
+    parseRpcWsUrls(process.env.RPC_WS_URL, process.env.RPC_WS_URL_FALLBACK, activeChain.rpcWsUrl || "")[0] || "",
+  ),
+  // Primary first, then fallbacks. Comma-separated RPC_WS_URL and/or RPC_WS_URL_FALLBACK.
+  rpcWsUrls: parseRpcWsUrls(process.env.RPC_WS_URL, process.env.RPC_WS_URL_FALLBACK, activeChain.rpcWsUrl || ""),
+  // Active WSS endpoint (rotated on failure).
+  rpcWsUrl: "",
   walletPrivateKey: process.env.WALLET_PRIVATE_KEY || "",
   walletAddress: process.env.WALLET_ADDRESS || "",
   swapRouterAddress: resolveSwapRouterAddress(),
@@ -181,6 +203,7 @@ const config = {
   maxTrackedTokens: Math.max(1, Number(process.env.MAX_TRACKED_TOKENS || 3)),
   trackedPairs: [],
 };
+config.rpcWsUrl = config.rpcWsUrls[0] || "";
 
 function parseAmountOptions(value) {
   return String(value || "")
@@ -908,6 +931,7 @@ const wsRuntime = {
   httpFallback: false,
   generation: 0,
   reconnectAttempts: 0,
+  wsUrlIndex: 0,
   heartbeatFails: 0,
   listenedPairs: new Set(),
   listenedV4Pools: new Set(),
@@ -919,6 +943,25 @@ const wsRuntime = {
 const WS_RECONNECT_BACKOFFS_MS = [1000, 2000, 5000, 10000, 15000];
 // After hard fallback to HTTP, keep retrying WS occasionally.
 const WS_RETRY_AFTER_FALLBACK_MS = 120_000;
+
+function wsEndpoints() {
+  return Array.isArray(config.rpcWsUrls) && config.rpcWsUrls.length
+    ? config.rpcWsUrls
+    : config.rpcWsUrl
+      ? [config.rpcWsUrl]
+      : [];
+}
+
+function activeWsUrl() {
+  const urls = wsEndpoints();
+  if (!urls.length) return "";
+  const idx = Math.min(urls.length - 1, Math.max(0, Number(wsRuntime.wsUrlIndex) || 0));
+  return urls[idx];
+}
+
+function maskWsUrl(url) {
+  return String(url || "").replace(/\/v2\/[^/]+$/i, "/v2/***");
+}
 
 function enqueueTelegramAlert(text, replyMarkup = null) {
   alertTgQueue.push({ text, replyMarkup, attempts: 0 });
@@ -1150,7 +1193,7 @@ function destroyWsProvider() {
 }
 
 function scheduleWsReconnect(reason, generation) {
-  if (!config.rpcWsUrl) return;
+  if (!wsEndpoints().length) return;
   if (generation !== wsRuntime.generation) return; // stale socket
   if (wsRuntime.reconnectTimer) return;
 
@@ -1159,12 +1202,34 @@ function scheduleWsReconnect(reason, generation) {
 
   if (wsRuntime.reconnectAttempts >= WS_RECONNECT_BACKOFFS_MS.length) {
     destroyWsProvider();
-    markHttpFallback(reason);
     wsRuntime.reconnectAttempts = 0;
-    // Keep trying WS later; HTTP covers alerts in the meantime.
+    const urls = wsEndpoints();
+    const nextIndex = (Math.max(0, Number(wsRuntime.wsUrlIndex) || 0) + 1);
+    if (nextIndex < urls.length) {
+      wsRuntime.wsUrlIndex = nextIndex;
+      config.rpcWsUrl = urls[nextIndex];
+      console.warn(
+        `WSS failed (${reason}) — switching to fallback [${nextIndex + 1}/${urls.length}]: ${maskWsUrl(urls[nextIndex])}`,
+      );
+      wsRuntime.reconnectTimer = setTimeout(() => {
+        wsRuntime.reconnectTimer = null;
+        try {
+          startWsSwapListener(wsRuntime.stateRef || loadState());
+        } catch (error) {
+          markHttpFallback(error.message);
+          scheduleWsReconnect(error.message, wsRuntime.generation);
+        }
+      }, 500);
+      return;
+    }
+
+    // All WSS endpoints exhausted → HTTP, then retry from primary later.
+    wsRuntime.wsUrlIndex = 0;
+    config.rpcWsUrl = urls[0] || "";
+    markHttpFallback(reason);
     wsRuntime.reconnectTimer = setTimeout(() => {
       wsRuntime.reconnectTimer = null;
-      console.log("Retrying WSS after HTTP fallback…");
+      console.log("Retrying primary WSS after HTTP fallback…");
       try {
         startWsSwapListener(wsRuntime.stateRef || loadState());
       } catch (error) {
@@ -1178,7 +1243,7 @@ function scheduleWsReconnect(reason, generation) {
   const wait = WS_RECONNECT_BACKOFFS_MS[wsRuntime.reconnectAttempts];
   wsRuntime.reconnectAttempts += 1;
   console.warn(
-    `WS down (${reason}). All RPC → HTTP backup (${config.rpcUrl || activeChain.rpcUrl}). Reconnect ${wsRuntime.reconnectAttempts}/${WS_RECONNECT_BACKOFFS_MS.length} in ${wait}ms…`,
+    `WS down (${reason}) @ ${maskWsUrl(activeWsUrl())}. HTTP backup (${config.rpcUrl || activeChain.rpcUrl}). Reconnect ${wsRuntime.reconnectAttempts}/${WS_RECONNECT_BACKOFFS_MS.length} in ${wait}ms…`,
   );
   wsRuntime.reconnectTimer = setTimeout(() => {
     wsRuntime.reconnectTimer = null;
@@ -1192,7 +1257,10 @@ function scheduleWsReconnect(reason, generation) {
 }
 
 function startWsSwapListener(state) {
-  if (!config.rpcWsUrl) return false;
+  const urls = wsEndpoints();
+  if (!urls.length) return false;
+  const wsUrl = activeWsUrl() || urls[0];
+  config.rpcWsUrl = wsUrl;
   wsRuntime.stateRef = state;
   clearWsReconnectTimer();
 
@@ -1200,9 +1268,10 @@ function startWsSwapListener(state) {
   destroyWsProvider(); // bumps generation + closes previous socket safely
   const myGeneration = wsRuntime.generation;
 
-  const safeUrl = String(config.rpcWsUrl).replace(/\/v2\/[^/]+$/i, "/v2/***");
-  console.log(`Connecting Swap WebSocket: ${safeUrl}`);
-  const provider = new ethers.WebSocketProvider(config.rpcWsUrl);
+  console.log(
+    `Connecting Swap WebSocket [${(wsRuntime.wsUrlIndex || 0) + 1}/${urls.length}]: ${maskWsUrl(wsUrl)}`,
+  );
+  const provider = new ethers.WebSocketProvider(wsUrl);
   wsRuntime.provider = provider;
 
   const abi = [
@@ -1316,13 +1385,13 @@ function startWsSwapListener(state) {
   console.log(
     `✅ WS Swap listener active on ${wsRuntime.listenedPairs.size} V3 pool(s)` +
       (wsRuntime.listenedV4Pools?.size ? ` + ${wsRuntime.listenedV4Pools.size} V4 poolId(s)` : "") +
-      ".",
+      ` via ${maskWsUrl(activeWsUrl())}.`,
   );
   return true;
 }
 
 function refreshWsSwapListener(state) {
-  if (!config.rpcWsUrl) return;
+  if (!wsEndpoints().length) return;
   wsRuntime.stateRef = state;
   if (!wsRuntime.healthy) {
     startWsSwapListener(state);
@@ -5287,6 +5356,14 @@ async function main() {
       (config.enableV4 ? " (V4 ETH fallback)" : "") +
       ` · quote ${config.quoteSymbol}`,
   );
+  if (config.rpcWsUrls?.length) {
+    console.log(
+      `WSS endpoints: primary=${maskWsUrl(config.rpcWsUrls[0])}` +
+        (config.rpcWsUrls.length > 1
+          ? `; fallback=${config.rpcWsUrls.slice(1).map(maskWsUrl).join(", ")}`
+          : ""),
+    );
+  }
   startHealthServer();
 
   const state = loadState();
@@ -5316,7 +5393,7 @@ async function main() {
     if (once) return;
   }
 
-  if (config.rpcWsUrl) {
+  if (wsEndpoints().length) {
     try {
       startWsSwapListener(state);
     } catch (error) {
