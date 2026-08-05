@@ -1020,8 +1020,11 @@ let alertTgWorkerRunning = false;
 const ALERT_TG_BACKOFFS_MS = [1000, 3000, 8000, 20_000, 60_000];
 const TRADE_CONFIRM_TIMEOUT_MS = 120_000;
 const TRADE_HANDLER_TIMEOUT_MS = 180_000;
+// Broadcast (quote → approve → send) must finish inside the Telegram handler window; a wedged RPC
+// used to hold the lock forever, so every later Buy/Sell answered "Trade đang chạy" until restart.
+const TRADE_LOCK_TIMEOUT_MS = 150_000;
 
-let tradeBusy = false;
+const tradeLock = { busy: false, startedAt: 0, label: "", generation: 0 };
 
 const wsRuntime = {
   provider: null,
@@ -1848,15 +1851,27 @@ async function rpcCall(label, fn, retries = 3) {
   throw lastError;
 }
 
-async function withTradeLock(fn) {
-  if (tradeBusy) {
-    throw new Error("Trade đang chạy. Đợi xong rồi bấm lại (tránh double-send).");
+async function withTradeLock(fn, label = "trade", timeoutMs = TRADE_LOCK_TIMEOUT_MS) {
+  const heldMs = tradeLock.busy ? Date.now() - tradeLock.startedAt : 0;
+  if (tradeLock.busy && heldMs < timeoutMs) {
+    const leftSec = Math.ceil((timeoutMs - heldMs) / 1000);
+    throw new Error(
+      `Trade đang chạy: ${tradeLock.label} (${Math.round(heldMs / 1000)}s). Đợi tối đa ${leftSec}s rồi bấm lại (tránh double-send).`,
+    );
   }
-  tradeBusy = true;
+  if (tradeLock.busy) {
+    console.warn(`Trade lock stuck ${heldMs}ms on ${tradeLock.label}; taking it over for ${label}.`);
+  }
+
+  const generation = tradeLock.generation + 1;
+  Object.assign(tradeLock, { busy: true, startedAt: Date.now(), label, generation });
   try {
-    return await fn();
+    return await withTimeout(fn(), timeoutMs, `${label} broadcast`);
   } finally {
-    tradeBusy = false;
+    // A stolen lock belongs to the newer trade; only its owner may clear it.
+    if (tradeLock.generation === generation) {
+      Object.assign(tradeLock, { busy: false, startedAt: 0, label: "" });
+    }
   }
 }
 
@@ -1982,6 +1997,10 @@ function formatSwapError(error) {
   }
   if (/insufficient funds/i.test(raw)) {
     return "Không đủ ETH cho value + gas. Nạp thêm ETH rồi thử lại.";
+  }
+  // Broadcast cap hit: the tx may still have gone out, so never imply "not sent".
+  if (/broadcast timed out/i.test(raw)) {
+    return "RPC treo khi gửi tx (quá lâu không phản hồi). Mở ví/explorer xem tx đã lên chain chưa rồi mới bấm lại.";
   }
   if (/timed out|timeout|fetch failed|ECONNRESET|ETIMEDOUT|network/i.test(raw)) {
     return `Mạng/RPC chập chờn: ${raw.slice(0, 120)}. Thử lại sau vài giây.`;
@@ -4818,7 +4837,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
 
   let broadcastHash = "";
   try {
-    const result = await withTradeLock(() => executeSwap(side, amount));
+    const result = await withTradeLock(() => executeSwap(side, amount), `${side} ${config.baseSymbol}`);
     broadcastHash = result.hash;
     await pending;
     const txUrl = explorerTxUrl(result.hash);
@@ -4901,7 +4920,7 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
 
   let broadcastHash = "";
   try {
-    const result = await withTradeLock(() => executeSwap("SELL", amount, ctx));
+    const result = await withTradeLock(() => executeSwap("SELL", amount, ctx), `SELL ${ctx.baseSymbol}`);
     broadcastHash = result.hash;
     await pending;
     const txUrl = explorerTxUrl(result.hash);
@@ -5004,7 +5023,7 @@ async function sendTextTrade(chatId, state, side, amount) {
 
   let broadcastHash = "";
   try {
-    const result = await withTradeLock(() => executeSwap(side, amount));
+    const result = await withTradeLock(() => executeSwap(side, amount), `${side} ${config.baseSymbol}`);
     broadcastHash = result.hash;
     const txUrl = explorerTxUrl(result.hash);
     await telegramRequest("sendMessage", {
@@ -5665,5 +5684,6 @@ module.exports = {
   formatPnlPct,
   positionEntryLines,
   bagSellKeyboard,
+  withTradeLock,
 };
 

@@ -402,6 +402,26 @@ test("swap error formatter softens network and busy messages", () => {
   assert.match(bot.formatSwapError(new Error("nonce too low")), /Nonce/i);
 });
 
+test("trade lock rejects double-send but releases a wedged trade", async () => {
+  let release;
+  const wedged = bot.withTradeLock(() => new Promise((resolve) => (release = resolve)), "BUY WEDGED", 120);
+
+  await assert.rejects(
+    () => bot.withTradeLock(async () => "second", "BUY GME", 120),
+    /Trade đang chạy: BUY WEDGED/,
+  );
+  await assert.rejects(() => wedged, /BUY WEDGED broadcast timed out/);
+  release?.();
+
+  assert.equal(await bot.withTradeLock(async () => "ok", "BUY GME", 120), "ok");
+});
+
+test("broadcast timeout warns to check the chain instead of claiming not sent", () => {
+  const formatted = bot.formatSwapError(new Error("BUY GME broadcast timed out after 150000ms"));
+  assert.match(formatted, /explorer|ví/i);
+  assert.equal(/Mạng\/RPC/i.test(formatted), false);
+});
+
 test("gas shortage is not mislabeled as slippage", () => {
   const gasErr = new Error(
     "Không đủ ETH gas để SELL. Cần ~0.0001 ETH, còn 0.000818069059511026 ETH. Nạp thêm ETH rồi Sell lại.",
