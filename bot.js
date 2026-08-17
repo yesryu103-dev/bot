@@ -3278,17 +3278,33 @@ async function applyConfirmedTradeFill(result) {
   };
 }
 
-function getPortfolioWallet(state = {}) {
-  const configured = normalizeAddress(state.portfolioWallet || config.walletAddress || "");
-  if (configured) return configured;
-  if (!config.walletPrivateKey) return "";
+let cachedSignerAddress = "";
 
+function signerWalletAddress() {
+  if (cachedSignerAddress) return cachedSignerAddress;
+  if (!config.walletPrivateKey) return "";
   try {
     const { ethers } = require("ethers");
-    return normalizeAddress(new ethers.Wallet(config.walletPrivateKey).address);
+    cachedSignerAddress = normalizeAddress(new ethers.Wallet(config.walletPrivateKey).address);
+    return cachedSignerAddress;
   } catch {
     return "";
   }
+}
+
+function getPortfolioWallet(state = {}) {
+  const fromUser = state.portfolioWalletSetByUser
+    ? normalizeAddress(state.portfolioWallet || "")
+    : "";
+  if (isEvmAddress(fromUser)) return fromUser;
+
+  const fromEnv = normalizeAddress(config.walletAddress || "");
+  if (isEvmAddress(fromEnv)) return fromEnv;
+
+  const fromSnap = normalizeAddress(state.portfolioSnapshot?.wallet || "");
+  if (isEvmAddress(fromSnap)) return fromSnap;
+
+  return signerWalletAddress() || "";
 }
 
 function parseWalletBalanceEntry(entry) {
@@ -3559,7 +3575,7 @@ function cachePortfolioSnapshot(state, portfolio) {
     updatedAt: portfolio.updatedAt || new Date().toISOString(),
     error: portfolio.error || "",
   };
-  state.portfolioWallet = portfolio.wallet;
+  if (!state.portfolioWalletSetByUser) state.portfolioWallet = portfolio.wallet;
   state.portfolioSnapshot = snapshot;
   state.portfolioCache = {
     totalUsd: snapshot.totalUsd,
@@ -3795,16 +3811,8 @@ function mainMenuKeyboard(portfolio = null) {
   };
 }
 
-async function getDisplayWallet() {
-  if (config.walletAddress) return config.walletAddress;
-  if (!config.walletPrivateKey) return "";
-
-  try {
-    const { ethers } = require("ethers");
-    return new ethers.Wallet(config.walletPrivateKey).address;
-  } catch {
-    return "";
-  }
+async function getDisplayWallet(state = {}) {
+  return getPortfolioWallet(state);
 }
 
 function bagButtonRows(portfolio, maxTokens = 6) {
@@ -3967,10 +3975,12 @@ async function mainPanelText(options = {}) {
         ? resolveMenuPortfolio(options.state, { forceRefresh: Boolean(options.refreshPortfolio) })
         : Promise.resolve(null);
 
-  // Show the same address portfolio actually scans (not just the trade-key wallet).
+  // Same address as the bags below — never show the signing-key wallet while
+  // rendering a snapshot from /wallet or WALLET_ADDRESS.
   const wallet =
+    normalizeAddress(options.portfolio?.wallet || "") ||
     (options.state && getPortfolioWallet(options.state)) ||
-    (await getDisplayWallet());
+    (await getDisplayWallet(options.state));
   const [ethUsd, balance, portfolio] = await Promise.all([
     fetchEthPriceUsd(),
     getNativeBalance(wallet),
@@ -4185,6 +4195,7 @@ async function setPortfolioWallet(walletAddress, state, chatId) {
   }
 
   state.portfolioWallet = wallet;
+  state.portfolioWalletSetByUser = true;
   saveState(state);
   await telegramRequest("sendMessage", {
     chat_id: chatId,
@@ -4499,6 +4510,20 @@ async function followTokenAddress(tokenAddress, state, chatId, trackOpts = {}) {
         return item.address && item.amount > 0;
       });
       if (hasTokens) {
+        if (getPortfolioWallet(state)) {
+          await telegramRequest("sendMessage", {
+            chat_id: chatId,
+            text: [
+              "Đây giống địa chỉ <b>ví</b>, không phải token:",
+              `<code>${escapeHtml(followAddress)}</code>`,
+              "Portfolio đang gắn ví khác. Gửi <code>/wallet 0x...</code> nếu muốn đổi.",
+            ].join("\n"),
+            parse_mode: "HTML",
+            disable_web_page_preview: "true",
+            reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
+          });
+          return;
+        }
         await setPortfolioWallet(followAddress, state, chatId);
         return;
       }

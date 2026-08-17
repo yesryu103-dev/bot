@@ -779,8 +779,29 @@ test("portfolio wallet prefers state over config", () => {
   bot.config.walletAddress = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   assert.equal(bot.getPortfolioWallet({}), "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   assert.equal(
-    bot.getPortfolioWallet({ portfolioWallet: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+    bot.getPortfolioWallet({
+      portfolioWallet: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      portfolioWalletSetByUser: true,
+    }),
     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  );
+  bot.config.walletAddress = original;
+});
+
+test("portfolio display prefers snapshot wallet over signing-key cache", () => {
+  const original = bot.config.walletAddress;
+  bot.config.walletAddress = "";
+  const viewing = "0xfc6b857464a3e70e75e1c78c9ee39c9f851cf6da";
+  const signerCached = "0xe3fa000000000000000000000000000000005166";
+  assert.equal(
+    bot.getPortfolioWallet({
+      portfolioWallet: signerCached,
+      portfolioSnapshot: {
+        wallet: viewing,
+        items: [{ address: "0x1111111111111111111111111111111111111111", symbol: "YARD" }],
+      },
+    }),
+    viewing,
   );
   bot.config.walletAddress = original;
 });
