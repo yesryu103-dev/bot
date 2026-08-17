@@ -511,6 +511,17 @@ async function resolveSwapLookbackBlocks(provider, options = {}) {
   return Math.min(8_000, Math.max(300, Math.ceil((wantMs / 1000) * bps * 1.25)));
 }
 
+/** Age of a log from block distance when we skip per-block timestamp fetches (light / V4). */
+function estimateLogAgeMs(blockNumber, latestBlock, blocksPerSec) {
+  const behind = Math.max(0, Number(latestBlock || 0) - Number(blockNumber || 0));
+  const bps = Number(blocksPerSec) > 0 ? Number(blocksPerSec) : chainPaceCache.blocksPerSec || 10;
+  return (behind / bps) * 1000;
+}
+
+function isAlertTooOld(ageMs) {
+  return Number(ageMs) > Number(config.maxAlertAgeMs || 120_000);
+}
+
 function isWsProviderReady() {
   return Boolean(config.rpcWsUrl && wsRuntime.provider && wsRuntime.healthy && !wsRuntime.httpFallback);
 }
@@ -561,7 +572,11 @@ async function getPoolMeta(pairAddress, provider = null) {
     ],
     rpc,
   );
-  const [token0, token1, fee] = await Promise.all([pool.token0(), pool.token1(), pool.fee()]);
+  const [token0, token1, fee] = await withTimeout(
+    Promise.all([pool.token0(), pool.token1(), pool.fee()]),
+    8_000,
+    `getPoolMeta ${compactAddress(pair)}`,
+  );
   const meta = {
     token0: normalizeAddress(token0),
     token1: normalizeAddress(token1),
@@ -798,8 +813,11 @@ async function pollRpcSwaps(state, options = {}) {
   const topic = iface.getEvent("Swap").topicHash;
   const now = Date.now();
   const lookback = await resolveSwapLookbackBlocks(provider, options);
+  const blocksPerSec = chainPaceCache.blocksPerSec || (await estimateBlocksPerSecond(provider));
   const light = Boolean(options.light);
   const alerted = [];
+  const pollEpoch = options.epoch;
+  const isStalePoll = () => pollEpoch != null && pollEpoch !== pollRpcSwaps._epoch;
   // Alchemy free: keep ≤10. Public nodes can use config default (100).
   const maxRange = Math.max(
     1,
@@ -820,6 +838,7 @@ async function pollRpcSwaps(state, options = {}) {
     const v4Topic = v4Iface.getEvent("Swap").topicHash;
 
     for (const poolId of v4Ids) {
+      if (isStalePoll()) return alerted.length;
       const cursorKey = `v4:${poolId}`;
       let fromBlock = Number(state.swapBlocks[cursorKey] || 0);
       if (!fromBlock || fromBlock < latest - lookback) fromBlock = latest - lookback;
@@ -853,6 +872,7 @@ async function pollRpcSwaps(state, options = {}) {
         topics: [v4Topic, poolId],
         maxRange,
       });
+      if (isStalePoll()) return alerted.length;
       logs = fetched.logs;
       scannedTo = fetched.scannedTo;
       if (fetched.error) {
@@ -875,14 +895,20 @@ async function pollRpcSwaps(state, options = {}) {
         } catch {
           continue;
         }
+        const bn = Number(log.blockNumber || 0);
+        const ageMs = estimateLogAgeMs(bn, latest, blocksPerSec);
+        if (isAlertTooOld(ageMs)) {
+          addSeen(state, [alertSeenKey(txHash, poolId)]);
+          continue;
+        }
         const trade = tradeFromV4SwapLog({
           amount0: parsed.args.amount0,
           amount1: parsed.args.amount1,
           key,
           baseToken: tracked.baseTokenAddress,
           txHash,
-          blockNumber: Number(log.blockNumber || 0),
-          timestampMs: now,
+          blockNumber: bn,
+          timestampMs: now - ageMs,
           sender: parsed.args.sender,
         });
         if (!trade) continue;
@@ -899,11 +925,12 @@ async function pollRpcSwaps(state, options = {}) {
   }
 
   if (options.v4Only) {
-    saveState(state);
+    if (!isStalePoll()) saveState(state);
     return alerted.length;
   }
 
   for (const pair of watchedPairSet()) {
+    if (isStalePoll()) return alerted.length;
     let fromBlock = Number(state.swapBlocks[pair] || 0);
     if (!fromBlock || fromBlock < latest - lookback) fromBlock = latest - lookback;
     if (fromBlock >= latest) {
@@ -921,6 +948,7 @@ async function pollRpcSwaps(state, options = {}) {
       }
       continue;
     }
+    if (isStalePoll()) return alerted.length;
 
     const tracked = findTrackedForPool(meta);
     if (!tracked) {
@@ -947,6 +975,7 @@ async function pollRpcSwaps(state, options = {}) {
       topics: [topic],
       maxRange,
     });
+    if (isStalePoll()) return alerted.length;
     logs = fetched.logs;
     scannedTo = fetched.scannedTo;
     if (fetched.error) {
@@ -981,8 +1010,17 @@ async function pollRpcSwaps(state, options = {}) {
       } catch {
         continue;
       }
-      const tsMs = light ? now : blockTs.get(Number(log.blockNumber)) || now;
-      if (now - tsMs > Number(config.maxAlertAgeMs || 120_000)) {
+      const bn = Number(log.blockNumber);
+      let tsMs;
+      let ageMs;
+      if (light) {
+        ageMs = estimateLogAgeMs(bn, latest, blocksPerSec);
+        tsMs = now - ageMs;
+      } else {
+        tsMs = blockTs.get(bn) || now;
+        ageMs = now - tsMs;
+      }
+      if (isAlertTooOld(ageMs)) {
         // Too old for a live alert — still mark scoped so we don't retry forever.
         addSeen(state, [alertSeenKey(txHash, pair)]);
         continue;
@@ -995,7 +1033,7 @@ async function pollRpcSwaps(state, options = {}) {
         quoteToken: tracked.quoteTokenAddress,
         baseToken: tracked.baseTokenAddress,
         txHash,
-        blockNumber: Number(log.blockNumber),
+        blockNumber: bn,
         timestampMs: tsMs,
         recipient: parsed.args.recipient,
       });
@@ -1009,7 +1047,7 @@ async function pollRpcSwaps(state, options = {}) {
     }
   }
 
-  saveState(state);
+  if (!isStalePoll()) saveState(state);
   return alerted.length;
 }
 
@@ -1070,6 +1108,14 @@ function enqueueTelegramAlert(text, replyMarkup = null) {
     processAlertTelegramQueue().catch((error) => {
       console.error(`Alert Telegram queue crashed: ${error.message}`);
       alertTgWorkerRunning = false;
+      if (alertTgQueue.length) {
+        setImmediate(() => {
+          processAlertTelegramQueue().catch((err) => {
+            console.error(`Alert Telegram queue crashed: ${err.message}`);
+            alertTgWorkerRunning = false;
+          });
+        });
+      }
     });
   }
 }
@@ -1741,7 +1787,8 @@ function startHealthServer() {
 }
 
 function addSeen(state, hashes) {
-  state.seen = [...new Set([...hashes, ...(state.seen || [])])].slice(0, 500);
+  // Scoped keys (tx:pool) need a larger ring — 500 wrapped too fast with 3 tokens and caused re-alerts.
+  state.seen = [...new Set([...hashes, ...(state.seen || [])])].slice(0, 5_000);
 }
 
 function isEvmAddress(value) {
@@ -1852,9 +1899,21 @@ async function rpcCall(label, fn, retries = 3) {
 }
 
 async function withTradeLock(fn, label = "trade", timeoutMs = TRADE_LOCK_TIMEOUT_MS) {
+  const generation = acquireTradeLock(label, timeoutMs);
+  try {
+    return await withTimeout(fn(), timeoutMs, `${label} broadcast`);
+  } finally {
+    releaseTradeLock(generation);
+  }
+}
+
+/** Acquire lock for broadcast+confirm. Caller must releaseTradeLock(generation). */
+function acquireTradeLock(label = "trade", timeoutMs = TRADE_LOCK_TIMEOUT_MS) {
+  // Confirm can outlive broadcast; allow takeover only after both windows elapse.
+  const maxHoldMs = Math.max(timeoutMs, TRADE_LOCK_TIMEOUT_MS + TRADE_CONFIRM_TIMEOUT_MS);
   const heldMs = tradeLock.busy ? Date.now() - tradeLock.startedAt : 0;
-  if (tradeLock.busy && heldMs < timeoutMs) {
-    const leftSec = Math.ceil((timeoutMs - heldMs) / 1000);
+  if (tradeLock.busy && heldMs < maxHoldMs) {
+    const leftSec = Math.ceil((maxHoldMs - heldMs) / 1000);
     throw new Error(
       `Trade đang chạy: ${tradeLock.label} (${Math.round(heldMs / 1000)}s). Đợi tối đa ${leftSec}s rồi bấm lại (tránh double-send).`,
     );
@@ -1862,16 +1921,14 @@ async function withTradeLock(fn, label = "trade", timeoutMs = TRADE_LOCK_TIMEOUT
   if (tradeLock.busy) {
     console.warn(`Trade lock stuck ${heldMs}ms on ${tradeLock.label}; taking it over for ${label}.`);
   }
-
   const generation = tradeLock.generation + 1;
   Object.assign(tradeLock, { busy: true, startedAt: Date.now(), label, generation });
-  try {
-    return await withTimeout(fn(), timeoutMs, `${label} broadcast`);
-  } finally {
-    // A stolen lock belongs to the newer trade; only its owner may clear it.
-    if (tradeLock.generation === generation) {
-      Object.assign(tradeLock, { busy: false, startedAt: 0, label: "" });
-    }
+  return generation;
+}
+
+function releaseTradeLock(generation) {
+  if (generation == null || tradeLock.generation === generation) {
+    Object.assign(tradeLock, { busy: false, startedAt: 0, label: "" });
   }
 }
 
@@ -2276,6 +2333,14 @@ async function executeSwap(side, amountText, overrides = {}) {
           return receipt;
         } catch (error) {
           const hash = extractTxHash(tx.hash, error);
+          const timedOut = /timed out/i.test(String(error?.message || error || ""));
+          if (timedOut) {
+            throw new Error(
+              hash
+                ? `Confirm timeout — tx có thể vẫn pending/success trên explorer. Kiểm tra trước khi gửi lại. Tx: ${hash}`
+                : `Confirm timeout — kiểm tra explorer trước khi gửi lại.`,
+            );
+          }
           throw new Error(
             hash
               ? `Swap reverted on-chain. Tx: ${hash}. ${formatSwapError(error)}`
@@ -4145,6 +4210,13 @@ async function withTimeout(promise, timeoutMs, label = "operation") {
 }
 
 async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
+  const assertTrackLive = () => {
+    if (options.trackEpoch != null && options.trackEpoch !== trackEpoch) {
+      throw new Error("Track job timed out / superseded");
+    }
+  };
+  assertTrackLive();
+
   const forced = Boolean(options.forced);
   const tradeRoute =
     options.tradeRoute ||
@@ -4183,25 +4255,36 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
   }
   normalizeAlertWatch(trackedPair);
 
-  upsertTrackedPair(state, trackedPair);
-
+  // Network work BEFORE mutating tracked state — so a timed-out job rarely leaves a half-applied track.
   if (tradeRoute === "v3" && isEvmAddress(trackedPair.pairAddress) && !isV4PoolId(trackedPair.pairAddress)) {
     try {
       const meta = await getPoolMeta(trackedPair.pairAddress);
-      if (Number.isFinite(meta.fee) && meta.fee > 0) config.uniswapV3Fee = meta.fee;
+      if (Number.isFinite(meta.fee) && meta.fee > 0) trackedPair._pendingFee = meta.fee;
     } catch (error) {
       console.warn(`Could not read pool fee: ${error.message}`);
     }
   }
 
+  assertTrackLive();
+  upsertTrackedPair(state, trackedPair);
+  if (Number.isFinite(trackedPair._pendingFee) && trackedPair._pendingFee > 0) {
+    config.uniswapV3Fee = trackedPair._pendingFee;
+  }
+  delete trackedPair._pendingFee;
+
   try {
-    await initRpcSwapCursors(state);
+    await withTimeout(initRpcSwapCursors(state), 10_000, "initRpcSwapCursors");
   } catch (error) {
     console.warn(`Could not init RPC swap cursor: ${error.message}`);
   }
 
+  assertTrackLive();
   saveState(state);
-  refreshWsSwapListener(state);
+  try {
+    refreshWsSwapListener(state);
+  } catch (error) {
+    console.warn(`WS refresh after track failed: ${error.message}`);
+  }
 
   const v4Watch = [...watchedV4PoolSet()];
   const v3Watch = [...watchedPairSet()];
@@ -4220,6 +4303,7 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
       ? `Listen: <b>1 pool</b> Uni V4 ETH sạch (no hook fee)${escapeHtml(liqNote)}`
       : `Listen: <b>1 pool</b> Uni V3 WETH sạch${escapeHtml(liqNote)}`;
   const keyboard = mainMenuKeyboard(state.portfolioSnapshot);
+  assertTrackLive();
   await telegramRequest("sendMessage", {
     chat_id: chatId,
     text: [
@@ -4244,7 +4328,7 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
   });
 }
 
-async function followPairAddress(pairAddress, state, chatId) {
+async function followPairAddress(pairAddress, state, chatId, trackOpts = {}) {
   const pair = await fetchDexPairByAddress(pairAddress);
   if (!pair || normalizeAddress(pair.chainId) !== config.chainId) {
     await telegramRequest("sendMessage", {
@@ -4276,7 +4360,7 @@ async function followPairAddress(pairAddress, state, chatId) {
       disable_web_page_preview: "true",
       reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
     });
-    if (isEvmAddress(tokenAddress)) await followTokenAddress(tokenAddress, state, chatId);
+    if (isEvmAddress(tokenAddress)) await followTokenAddress(tokenAddress, state, chatId, trackOpts);
     return;
   }
 
@@ -4311,10 +4395,14 @@ async function followPairAddress(pairAddress, state, chatId) {
 
   const trackedPair = trackedPairFromDexPair(pair, tokenAddress);
   trackedPair.watchPairAddresses = [trackedPair.pairAddress];
-  await activateTrackedPair(trackedPair, state, chatId, { forced: true, dexVer: "Uni V3 · forced pool" });
+  await activateTrackedPair(trackedPair, state, chatId, {
+    forced: true,
+    dexVer: "Uni V3 · forced pool",
+    trackEpoch: trackOpts.trackEpoch,
+  });
 }
 
-async function followTokenAddress(tokenAddress, state, chatId) {
+async function followTokenAddress(tokenAddress, state, chatId, trackOpts = {}) {
   const raw = normalizeAddress(tokenAddress);
   if (!isEvmAddress(raw)) {
     await telegramRequest("sendMessage", {
@@ -4332,7 +4420,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     const asPair = await fetchDexPairByAddress(raw);
     if (asPair?.pairAddress && (asPair.baseToken?.address || asPair.quoteToken?.address)) {
       if (isV3Pair(asPair)) {
-        await followPairAddress(raw, state, chatId);
+        await followPairAddress(raw, state, chatId, trackOpts);
         return;
       }
       const base = normalizeAddress(asPair.baseToken?.address);
@@ -4345,23 +4433,42 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     console.warn(`Dex pair lookup for ${raw} failed: ${error.message}`);
   }
   if (followAddress === raw) {
+    // Only probe as V3 pool AFTER Dex token lookup — eth_call token0() on an ERC-20
+    // can hang on some RH RPCs and used to stall the whole track queue forever.
+  }
+  if (followAddress !== raw && isEvmAddress(followAddress)) {
+    return followTokenAddress(followAddress, state, chatId, trackOpts);
+  }
+
+  let pairs = [];
+  try {
+    pairs = await withTimeout(fetchTokenPairs(followAddress), 12_000, "fetchTokenPairs");
+  } catch (error) {
+    console.warn(`fetchTokenPairs failed for ${followAddress}: ${error.message}`);
+    pairs = [];
+  }
+  if (!Array.isArray(pairs)) {
+    pairs = Array.isArray(pairs?.pairs) ? pairs.pairs : [];
+  }
+  let selected = chooseBestTradePairForToken(pairs, followAddress);
+
+  // Fallback: maybe user pasted a pool address (no Dex token rows).
+  if (!selected?.pair && followAddress === raw) {
     try {
-      const meta = await getPoolMeta(raw);
+      const meta = await getPoolMeta(followAddress);
       if (meta?.token0 && meta?.token1) {
         const weth = normalizeAddress(config.quoteTokenAddress);
-        followAddress = meta.token0 === weth ? meta.token1 : meta.token0;
-        console.log(`Pasted pool contract ${raw}; following token ${followAddress}`);
+        const tokenSide = meta.token0 === weth ? meta.token1 : meta.token0;
+        console.log(`Pasted pool contract ${raw}; following token ${tokenSide}`);
+        if (isEvmAddress(tokenSide) && tokenSide !== raw) {
+          return followTokenAddress(tokenSide, state, chatId, trackOpts);
+        }
       }
     } catch {
       // not a v3 pool
     }
   }
-  if (followAddress !== raw && isEvmAddress(followAddress)) {
-    return followTokenAddress(followAddress, state, chatId);
-  }
 
-  const pairs = await fetchTokenPairs(followAddress);
-  const selected = chooseBestTradePairForToken(pairs, followAddress);
   if (!selected?.pair) {
     try {
       let looksLikePool = false;
@@ -4438,6 +4545,7 @@ async function followTokenAddress(tokenAddress, state, chatId) {
       tradeRoute: "v4",
       liquidityUsd: selected.liquidityUsd,
       dexVer: "Uni V4 ETH · clean (no hooks)",
+      trackEpoch: trackOpts.trackEpoch,
     });
     return;
   }
@@ -4449,45 +4557,64 @@ async function followTokenAddress(tokenAddress, state, chatId) {
     tradeRoute: "v3",
     liquidityUsd: selected.liquidityUsd,
     dexVer: "Uni V3 · clean deepest",
+    trackEpoch: trackOpts.trackEpoch,
   });
 }
 
-async function followTrackInput(input, state, chatId) {
+async function followTrackInput(input, state, chatId, trackOpts = {}) {
   const parsed = typeof input === "string" ? parseTrackInput(input) : input;
   if (!parsed?.address) throw new Error("Invalid track input.");
 
   if (parsed.forced || parsed.kind === "pair") {
-    await followPairAddress(parsed.address, state, chatId);
+    await followPairAddress(parsed.address, state, chatId, trackOpts);
     return;
   }
 
   const asPair = await fetchDexPairByAddress(parsed.address).catch(() => null);
   if (asPair && normalizeAddress(asPair.chainId) === config.chainId && isV3Pair(asPair)) {
-    await followPairAddress(parsed.address, state, chatId);
+    await followPairAddress(parsed.address, state, chatId, trackOpts);
     return;
   }
-  await followTokenAddress(parsed.address, state, chatId);
+  await followTokenAddress(parsed.address, state, chatId, trackOpts);
 }
 
 
 const trackJobs = [];
 let trackWorkerRunning = false;
+let trackEpoch = 0;
+const TRACK_JOB_TIMEOUT_MS = 45_000;
 
 async function enqueueFollowToken(tokenAddress, state, chatId) {
   trackJobs.push({ input: tokenAddress, state, chatId });
+  return pumpTrackQueue();
+}
+
+async function pumpTrackQueue() {
   if (trackWorkerRunning) return;
   trackWorkerRunning = true;
   try {
     while (trackJobs.length) {
       const job = trackJobs.shift();
+      const epoch = ++trackEpoch;
       try {
-        await followTrackInput(job.input, job.state, job.chatId);
+        await withTimeout(
+          followTrackInput(job.input, job.state, job.chatId, { trackEpoch: epoch }),
+          TRACK_JOB_TIMEOUT_MS,
+          "Track token",
+        );
       } catch (error) {
+        // Invalidate zombie follow* work that may still mutate state after timeout.
+        if (/timed out/i.test(String(error?.message || ""))) trackEpoch++;
         console.error(`followTrackInput failed: ${error.message}`);
         try {
           await telegramRequest("sendMessage", {
             chat_id: job.chatId,
-            text: `Không theo dõi được:\n<code>${escapeHtml(job.input)}</code>\n${escapeHtml(error.message)}`,
+            text: [
+              `Không theo dõi được:`,
+              `<code>${escapeHtml(String(job.input || "").slice(0, 80))}</code>`,
+              escapeHtml(error.message),
+              `/menu rồi paste lại token.`,
+            ].join("\n"),
             parse_mode: "HTML",
             disable_web_page_preview: "true",
             reply_markup: mainMenuKeyboard(job.state?.portfolioSnapshot),
@@ -4499,6 +4626,12 @@ async function enqueueFollowToken(tokenAddress, state, chatId) {
     }
   } finally {
     trackWorkerRunning = false;
+    // Race: a job may have been pushed after the while drained but before unlock.
+    if (trackJobs.length) {
+      setImmediate(() => {
+        pumpTrackQueue().catch((error) => console.error(`track queue pump: ${error.message}`));
+      });
+    }
   }
 }
 
@@ -4836,8 +4969,14 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
   ).catch(() => {});
 
   let broadcastHash = "";
+  let lockGen;
   try {
-    const result = await withTradeLock(() => executeSwap(side, amount), `${side} ${config.baseSymbol}`);
+    lockGen = acquireTradeLock(`${side} ${config.baseSymbol}`);
+    const result = await withTimeout(
+      executeSwap(side, amount),
+      TRADE_LOCK_TIMEOUT_MS,
+      `${side} ${config.baseSymbol} broadcast`,
+    );
     broadcastHash = result.hash;
     await pending;
     const txUrl = explorerTxUrl(result.hash);
@@ -4855,7 +4994,7 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
       mainMenuKeyboard(state.portfolioSnapshot),
     ).catch(() => {});
 
-    // Confirm on-chain in background so Telegram getUpdates stays responsive.
+    // Hold lock until confirm settles — prevents double-broadcast / nonce clash.
     result
       .confirm()
       .then(async () => {
@@ -4888,8 +5027,12 @@ async function runConfirmedTrade(callbackQuery, side, amount) {
           formatTradeFailureMessage(error, broadcastHash),
           mainMenuKeyboard(state.portfolioSnapshot),
         ).catch(() => {});
+      })
+      .finally(() => {
+        releaseTradeLock(lockGen);
       });
   } catch (error) {
+    releaseTradeLock(lockGen);
     await pending;
     const state = loadState();
     await editTradeMessage(
@@ -4919,8 +5062,14 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
   ).catch(() => {});
 
   let broadcastHash = "";
+  let lockGen;
   try {
-    const result = await withTradeLock(() => executeSwap("SELL", amount, ctx), `SELL ${ctx.baseSymbol}`);
+    lockGen = acquireTradeLock(`SELL ${ctx.baseSymbol}`);
+    const result = await withTimeout(
+      executeSwap("SELL", amount, ctx),
+      TRADE_LOCK_TIMEOUT_MS,
+      `SELL ${ctx.baseSymbol} broadcast`,
+    );
     broadcastHash = result.hash;
     await pending;
     const txUrl = explorerTxUrl(result.hash);
@@ -4969,8 +5118,12 @@ async function runConfirmedBagSell(callbackQuery, tokenAddress, amount, state) {
           formatTradeFailureMessage(error, broadcastHash).replace("<b>Trade not sent</b>", "<b>Bag sell not sent</b>"),
           bagSellKeyboard(item),
         ).catch(() => {});
+      })
+      .finally(() => {
+        releaseTradeLock(lockGen);
       });
   } catch (error) {
+    releaseTradeLock(lockGen);
     await pending;
     const item = findBagItem(state, tokenAddress) || {
       address: ctx.baseTokenAddress,
@@ -5022,8 +5175,14 @@ async function sendTextTrade(chatId, state, side, amount) {
   }).catch(() => {});
 
   let broadcastHash = "";
+  let lockGen;
   try {
-    const result = await withTradeLock(() => executeSwap(side, amount), `${side} ${config.baseSymbol}`);
+    lockGen = acquireTradeLock(`${side} ${config.baseSymbol}`);
+    const result = await withTimeout(
+      executeSwap(side, amount),
+      TRADE_LOCK_TIMEOUT_MS,
+      `${side} ${config.baseSymbol} broadcast`,
+    );
     broadcastHash = result.hash;
     const txUrl = explorerTxUrl(result.hash);
     await telegramRequest("sendMessage", {
@@ -5072,8 +5231,12 @@ async function sendTextTrade(chatId, state, side, amount) {
           disable_web_page_preview: "true",
           reply_markup: mainMenuKeyboard(state.portfolioSnapshot),
         }).catch(() => {});
+      })
+      .finally(() => {
+        releaseTradeLock(lockGen);
       });
   } catch (error) {
+    releaseTradeLock(lockGen);
     await telegramRequest("sendMessage", {
       chat_id: chatId,
       text: formatTradeFailureMessage(error, broadcastHash),
@@ -5565,10 +5728,12 @@ async function main() {
     const needFullHttp = !wsOk;
     const due = now - lastHttpCatchupAt > (needFullHttp ? 2_000 : 4_000);
     if (needHttp && due && !pollRpcSwaps._inFlight) {
+      const epoch = (pollRpcSwaps._epoch = (pollRpcSwaps._epoch || 0) + 1);
       pollRpcSwaps._inFlight = withTimeout(
         pollRpcSwaps(state, {
           light: !needFullHttp,
           v4Only: false,
+          epoch,
         }),
         needFullHttp ? 45_000 : 35_000,
         needFullHttp ? "HTTP RPC swap poll" : "HTTP V3+V4 catch-up",
@@ -5577,6 +5742,10 @@ async function main() {
           lastHttpCatchupAt = Date.now();
         })
         .catch((error) => {
+          // Invalidate zombie poll so it stops advancing cursors / emitting after timeout.
+          if (/timed out/i.test(String(error?.message || ""))) {
+            pollRpcSwaps._epoch = (pollRpcSwaps._epoch || 0) + 1;
+          }
           if (Date.now() - lastRpcWarnAt > 60_000) {
             console.warn(`HTTP RPC poll failed (${config.rpcUrl}): ${error.message || error}`);
             lastRpcWarnAt = Date.now();
