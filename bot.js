@@ -148,8 +148,8 @@ const config = {
   stateFile: process.env.STATE_FILE || (activeChain.id === "bsc" ? "state.bsc.json" : "state.json"),
   maxItems: Number(process.env.MAX_ITEMS || 200),
   minUsd: Number(process.env.MIN_USD || 0),
-  // Default 0.2 ETH — 1.0 was filtering most retail "whale" prints on RH memes.
-  minQuoteAmount: Number(process.env.MIN_QUOTE_AMOUNT || 0.2),
+  // Alert only when pool ETH size is >= this (ETH, not USD).
+  minQuoteAmount: Number(process.env.MIN_QUOTE_AMOUNT || 1),
   // Only alert swaps younger than this (realtime). Stale txs after sleep/redeploy are ignored.
   maxAlertAgeMs: Number(process.env.MAX_ALERT_AGE_MS || 120_000),
   // Prefer time-based lookback — Robinhood ~0.1s/block so "100 blocks" was only ~10s and missed whales.
@@ -586,6 +586,12 @@ async function getPoolMeta(pairAddress, provider = null) {
   return meta;
 }
 
+function meetsMinQuoteAmount(quoteAmount, minQuote = config.minQuoteAmount) {
+  const min = Number(minQuote);
+  if (!Number.isFinite(min) || min <= 0) return true;
+  return Number(quoteAmount) >= min;
+}
+
 function tradeFromV3SwapLog({ amount0, amount1, token0, token1, quoteToken, baseToken, txHash, blockNumber, timestampMs, recipient }) {
   const quote = normalizeAddress(quoteToken);
   const base = normalizeAddress(baseToken);
@@ -606,8 +612,7 @@ function tradeFromV3SwapLog({ amount0, amount1, token0, token1, quoteToken, base
   const { ethers } = require("ethers");
   const quoteAmount = Number(ethers.formatUnits(quoteRaw, 18));
   const baseAmount = Number(ethers.formatUnits(baseRaw, 18));
-  const minQuote = Number(config.minQuoteAmount);
-  if (Number.isFinite(minQuote) && minQuote > 0 && quoteAmount < minQuote * 0.95) return null;
+  if (!meetsMinQuoteAmount(quoteAmount)) return null;
 
   return {
     txHash: String(txHash || "").toLowerCase(),
@@ -655,8 +660,7 @@ function tradeFromV4SwapLog({ amount0, amount1, key, baseToken, txHash, blockNum
   const baseRaw = baseDelta < 0n ? -baseDelta : baseDelta;
   const quoteAmount = Number(ethers.formatUnits(quoteRaw, 18));
   const baseAmount = Number(ethers.formatUnits(baseRaw, 18));
-  const minQuote = Number(config.minQuoteAmount);
-  if (Number.isFinite(minQuote) && minQuote > 0 && quoteAmount < minQuote * 0.95) return null;
+  if (!meetsMinQuoteAmount(quoteAmount)) return null;
 
   return {
     txHash: String(txHash || "").toLowerCase(),
@@ -1219,9 +1223,8 @@ function isSaneTradeAlert(trade) {
   const exec = Number(trade?.execPriceUsd ?? trade?.priceUsd);
   const spot = Number(trade?.spotPriceUsd);
   if (!(quote > 0) || !(base > 0)) return false;
-  // Must look like a real ETH size for our min filter.
-  const minQuote = Number(config.minQuoteAmount) || 0.2;
-  if (quote < minQuote * 0.95) return false;
+  const minQuote = Number(config.minQuoteAmount) || 1;
+  if (!meetsMinQuoteAmount(quote, minQuote)) return false;
   // Pool-log ETH size already passed min — trust it. Dex spot lag used to drop real V3 whales.
   if (String(trade?.dexVer || "").toLowerCase() === "v4") return true;
   if (quote >= minQuote) return true;
@@ -4758,8 +4761,7 @@ function classifyFromTransaction(tx, overrides = {}) {
   }
 
   const minQuote = Number(settings.minQuoteAmount);
-  // Soft floor: 0.95 ETH counts when threshold is 1 (fee/rounding near-1 buys).
-  if (Number.isFinite(minQuote) && minQuote > 0 && quoteAmount < minQuote * 0.95) return null;
+  if (!meetsMinQuoteAmount(quoteAmount, minQuote)) return null;
   if (Number.isFinite(quoteUsdValue) && quoteUsdValue < settings.minUsd) return null;
 
   return {

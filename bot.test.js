@@ -600,7 +600,7 @@ test("trade smaller than minimum quote amount is ignored", () => {
   assert.equal(trade, null);
 });
 
-test("near-threshold 1 ETH buy is still alerted", () => {
+test("sub-1 ETH buy is ignored when minQuoteAmount is 1", () => {
   const tx = {
     hash: "0xnear1",
     block_number: 4,
@@ -612,10 +612,25 @@ test("near-threshold 1 ETH buy is still alerted", () => {
     ],
   };
 
+  assert.equal(bot.classifyFromTransaction(tx, { buyWhenBaseLeavesPool: true, minQuoteAmount: 1 }), null);
+});
+
+test("exact 1 ETH buy is alerted when minQuoteAmount is 1", () => {
+  const tx = {
+    hash: "0xexact1",
+    block_number: 5,
+    timestamp: "2026-07-10T09:09:00Z",
+    from: addr("0xuser"),
+    token_transfers: [
+      transfer(bot.config.baseTokenAddress, bot.config.pairAddress, "0xuser", "1000000000000000000000", "0.002"),
+      transfer(bot.config.quoteTokenAddress, "0xuser", bot.config.pairAddress, "1000000000000000000", "3000"),
+    ],
+  };
+
   const trade = bot.classifyFromTransaction(tx, { buyWhenBaseLeavesPool: true, minQuoteAmount: 1 });
   assert.ok(trade);
   assert.equal(trade.side, "BUY");
-  assert.ok(trade.quoteAmount >= 0.95);
+  assert.equal(trade.quoteAmount, 1);
 });
 
 test("watch pair list keeps only primary V3 pool", () => {
@@ -985,7 +1000,7 @@ test("V4 alerts are not dropped by exec/spot ratio sanity check", () => {
     }),
     true,
   );
-  // Below minQuote still uses ratio guard (default min 0.2).
+  // Below 1 ETH is dropped.
   assert.equal(
     bot.isSaneTradeAlert({
       dexVer: "v3",
