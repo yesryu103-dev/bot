@@ -198,6 +198,7 @@ const config = {
   quoterAddress: process.env.QUOTER_ADDRESS || activeChain.quoter,
   uniswapV3Fee: Number(process.env.UNISWAP_V3_FEE || activeChain.defaultFee),
   tradeRoute: "v3",
+  dexFamily: "",
   v4TradePoolId: "",
   upPairAddress: "",
   slippageBps: Number(process.env.SLIPPAGE_BPS || 200),
@@ -2137,15 +2138,21 @@ async function pickBestTradeRoute({
   buyWithNativeEth,
   sellToNativeEth,
   allowV4 = true,
-  preferV4 = false,
   preferredV4PoolId = "",
   allowUp = true,
-  preferUp = false,
   preferredUpPool = "",
+  pinDex = "",
 }) {
   const { ethers } = require("ethers");
   const bestroute = require("./bestroute");
   const up = require("./up");
+  const pinned = String(pinDex || "").toLowerCase();
+  // Explicit DEX pick from Telegram: stay on that venue, deepest pool inside it.
+  const forceUp = pinned === "up";
+  const forceUni = pinned === "uni" || pinned === "v3" || pinned === "v4";
+  const useV3 = forceUp ? false : pinned === "v4" ? false : true;
+  const useV4 = forceUp ? false : pinned === "v3" ? false : Boolean(allowV4);
+  const useUp = forceUni ? false : Boolean(allowUp);
 
   let pairsCache = null;
   async function tokenPairs() {
@@ -2161,22 +2168,24 @@ async function pickBestTradeRoute({
 
   const candidates = [];
 
-  try {
-    const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, preferredFee);
-    if (quoted?.amountOut > 0n) {
-      candidates.push({
-        kind: "v3",
-        label: `${config.dexLabel || "Uni"} V3 ${config.wrappedSymbol || config.quoteSymbol || "WETH"}`,
-        amountOut: quoted.amountOut,
-        fee: quoted.fee,
-      });
+  if (useV3 && !forceUp) {
+    try {
+      const quoted = await quoteExactInputSingleAmount(provider, tokenIn, tokenOut, amountIn, preferredFee);
+      if (quoted?.amountOut > 0n) {
+        candidates.push({
+          kind: "v3",
+          label: `${config.dexLabel || "Uni"} V3 ${config.wrappedSymbol || config.quoteSymbol || "WETH"}`,
+          amountOut: quoted.amountOut,
+          fee: quoted.fee,
+        });
+      }
+    } catch (error) {
+      console.warn(`V3 quote failed: ${error.message}`);
     }
-  } catch (error) {
-    console.warn(`V3 quote failed: ${error.message}`);
   }
 
   let v4Meta = null;
-  if (allowV4 && config.enableV4 && (buyWithNativeEth || sellToNativeEth)) {
+  if (useV4 && config.enableV4 && (buyWithNativeEth || sellToNativeEth)) {
     try {
       const pairs = await tokenPairs();
       const want = normalizeAddress(preferredV4PoolId);
@@ -2233,7 +2242,7 @@ async function pickBestTradeRoute({
     return out;
   }
 
-  if (v4Meta) {
+  if (v4Meta && !forceUp) {
     const out4 = await quoteV4Amount(amountIn);
     if (out4 > 0n) {
       candidates.push({
@@ -2246,18 +2255,13 @@ async function pickBestTradeRoute({
     }
   }
 
-  if (allowUp && config.enableUp && (buyWithNativeEth || sellToNativeEth)) {
+  if (useUp && config.enableUp && (buyWithNativeEth || sellToNativeEth)) {
     try {
       const pairs = await tokenPairs();
       const want = normalizeAddress(preferredUpPool);
+      // Always prefer deepest UP WETH now — not a stale thinner tracked pool.
       const listed = chooseBestUpPairForToken(pairs, baseTokenAddress);
-      const upPair =
-        (want &&
-          (Array.isArray(pairs) ? pairs : []).find(
-            (pair) => isUpPair(pair) && normalizeAddress(pair.pairAddress) === want,
-          )) ||
-        listed;
-      const poolAddr = normalizeAddress(upPair?.pairAddress || want);
+      const poolAddr = normalizeAddress(listed?.pairAddress || want);
       if (isEvmAddress(poolAddr) && !isV4PoolId(poolAddr)) {
         const meta = await getPoolMeta(poolAddr, provider);
         const spacing = Number(meta?.tickSpacing || 0);
@@ -2275,30 +2279,41 @@ async function pickBestTradeRoute({
               amountOut: quoted.amountOut,
               tickSpacing: spacing,
               pairAddress: poolAddr,
+              liquidityUsd: Number(listed?.liquidity?.usd || 0),
             });
           }
+        } else if (forceUp) {
+          throw new Error(`UP pool ${compactAddress(poolAddr)} missing tickSpacing`);
         }
+      } else if (forceUp) {
+        throw new Error("Không tìm thấy pool UP WETH để swap.");
       }
     } catch (error) {
+      if (forceUp) throw error;
       console.warn(`up quote failed: ${error.message}`);
     }
   }
 
-  if (!candidates.length) {
+  let pool = candidates;
+  if (forceUp) pool = candidates.filter((item) => item.kind === "up");
+  else if (pinned === "v4") pool = candidates.filter((item) => item.kind === "v4");
+  else if (pinned === "v3") pool = candidates.filter((item) => item.kind === "v3");
+  else if (pinned === "uni") pool = candidates.filter((item) => item.kind === "v3" || item.kind === "v4");
+
+  if (!pool.length) {
+    if (forceUp) throw new Error("UP quote failed — không fallback Uni khi đã chọn DEX UP.");
+    if (forceUni) throw new Error("Uni quote failed — không fallback UP khi đã chọn Uni.");
     throw new Error("No Uni/up quote available. Try again in a few seconds.");
   }
 
-  candidates.sort((a, b) => {
+  // Within the pinned DEX: best quote wins (proxy for deepest / least impact).
+  pool.sort((a, b) => {
     if (b.amountOut !== a.amountOut) return b.amountOut > a.amountOut ? 1 : -1;
-    if (preferUp && a.kind === "up") return -1;
-    if (preferUp && b.kind === "up") return 1;
-    if (preferV4 && a.kind === "v4") return -1;
-    if (preferV4 && b.kind === "v4") return 1;
-    return 0;
+    return Number(b.liquidityUsd || 0) - Number(a.liquidityUsd || 0);
   });
-  const best = candidates[0];
+  const best = pool[0];
   console.log(
-    `Route ${best.label} out=${ethers.formatEther(best.amountOut)} (vs ${candidates
+    `Route ${best.label} out=${ethers.formatEther(best.amountOut)} (pin=${pinned || "auto"} vs ${candidates
       .map((item) => `${item.kind}:${ethers.formatEther(item.amountOut)}`)
       .join(", ")})`,
   );
@@ -2356,26 +2371,40 @@ async function executeSwap(side, amountText, overrides = {}) {
   const forcedV3Pool = preferredV3PoolForToken(baseTokenAddress);
   const preferredV4PoolId = normalizeAddress(overrides.v4TradePoolId || config.v4TradePoolId || "");
   const preferredUpPool = normalizeAddress(overrides.upPairAddress || config.upPairAddress || "");
-  const preferV4 =
-    !forcedV3Pool &&
-    (overrides.tradeRoute === "v4" ||
-      config.tradeRoute === "v4" ||
-      Boolean(preferredV4PoolId && isV4PoolId(preferredV4PoolId)));
-  const preferUp =
-    !forcedV3Pool && (overrides.tradeRoute === "up" || config.tradeRoute === "up" || Boolean(preferredUpPool));
+  const routeHint = String(overrides.tradeRoute || config.tradeRoute || "").toLowerCase();
+  const familyHint = String(overrides.dexFamily || config.dexFamily || "").toLowerCase();
+  // Picker choice wins: UP → only up deepest; Uni → only Uni V3/V4 deepest (never hop venues).
+  const pinDex =
+    forcedV3Pool || overrides.v3Only
+      ? "v3"
+      : familyHint === "up" || routeHint === "up"
+        ? "up"
+        : familyHint === "uni" || routeHint === "uni"
+          ? "uni"
+          : routeHint === "v4"
+            ? "uni"
+            : routeHint === "v3"
+              ? "uni"
+              : "";
   const pairAddress =
     forcedV3Pool ||
-    (preferV4 ? "" : normalizeAddress(overrides.pairAddress || config.pairAddress || ""));
-  const allowV4 = !forcedV3Pool && !overrides.v3Only && Boolean(config.enableV4);
-  const allowUp = !forcedV3Pool && !overrides.v3Only && Boolean(config.enableUp);
+    (pinDex === "up" || pinDex === "uni"
+      ? ""
+      : normalizeAddress(overrides.pairAddress || config.pairAddress || ""));
+  const allowV4 = !forcedV3Pool && !overrides.v3Only && Boolean(config.enableV4) && pinDex !== "up";
+  const allowUp =
+    !forcedV3Pool &&
+    !overrides.v3Only &&
+    Boolean(config.enableUp) &&
+    pinDex !== "uni" &&
+    pinDex !== "v3" &&
+    pinDex !== "v4";
   if (forcedV3Pool) {
     console.log(`Trade ${side} pinned to V3 pool ${compactAddress(forcedV3Pool)} (no V4/hook).`);
-  } else if (preferUp) {
-    console.log(`Trade ${side} prefers up CL ${preferredUpPool ? compactAddress(preferredUpPool) : "WETH pool"}.`);
-  } else if (preferV4) {
-    console.log(
-      `Trade ${side} prefers deepest Uni V4 ${preferredV4PoolId ? compactAddress(preferredV4PoolId) : "ETH pool"}.`,
-    );
+  } else if (pinDex === "up") {
+    console.log(`Trade ${side} PINNED to UP (deepest CL WETH).`);
+  } else if (pinDex === "uni") {
+    console.log(`Trade ${side} PINNED to Uni (deepest V3/V4, no up).`);
   }
   const preBaseBalance = await rpcCall("balanceOf(base)", () => baseTokenContract.balanceOf(wallet.address));
 
@@ -2467,12 +2496,13 @@ async function executeSwap(side, amountText, overrides = {}) {
     preferredFee: swapFee,
     buyWithNativeEth,
     sellToNativeEth,
-    allowV4: allowV4 || preferV4,
-    preferV4,
+    allowV4,
     preferredV4PoolId,
-    allowUp: allowUp || preferUp,
-    preferUp,
-    preferredUpPool,
+    allowUp,
+    preferredUpPool:
+      preferredUpPool ||
+      (pinDex === "up" ? normalizeAddress(overrides.pairAddress || config.pairAddress || "") : ""),
+    pinDex,
   });
   let minOut = (best.amountOut * BigInt(10000 - slipBps)) / 10000n;
   if (minOut <= 0n) throw new Error("Quote minOut is zero — amount too small or pool illiquid.");
@@ -3131,9 +3161,22 @@ function isV4PoolId(value) {
   return /^0x[a-fA-F0-9]{64}$/.test(String(value || "").trim());
 }
 
-/** Alert Uni deepest (V3 XOR V4) and up CL in parallel when both exist. */
+/** Alert on the chosen DEX's deepest pool only (no cross-DEX listen). */
 function normalizeAlertWatch(trackedPair) {
   if (!trackedPair) return trackedPair;
+  const family =
+    trackedPair.dexFamily === "up" || trackedPair.tradeRoute === "up"
+      ? "up"
+      : trackedPair.dexFamily === "uni" ||
+          trackedPair.tradeRoute === "uni" ||
+          trackedPair.tradeRoute === "v4" ||
+          trackedPair.tradeRoute === "v3" ||
+          isV4PoolId(trackedPair.pairAddress) ||
+          isV4PoolId(trackedPair.v4TradePoolId)
+        ? "uni"
+        : "";
+  if (family) trackedPair.dexFamily = family;
+
   const route =
     trackedPair.tradeRoute === "up"
       ? "up"
@@ -3141,15 +3184,34 @@ function normalizeAlertWatch(trackedPair) {
           isV4PoolId(trackedPair.pairAddress) ||
           isV4PoolId(trackedPair.v4TradePoolId)
         ? "v4"
-        : "v3";
-  trackedPair.tradeRoute = route;
+        : trackedPair.tradeRoute === "uni"
+          ? "uni"
+          : "v3";
+  trackedPair.tradeRoute = route === "uni" ? (isV4PoolId(trackedPair.pairAddress) || isV4PoolId(trackedPair.v4TradePoolId) ? "v4" : "v3") : route;
 
-  const upAddr = normalizeAddress(trackedPair.upPairAddress);
   const fromWatch = (trackedPair.watchPairAddresses || [])
     .map(normalizeAddress)
     .filter((address) => isEvmAddress(address) && !isV4PoolId(address));
 
-  if (route === "v4") {
+  if (trackedPair.dexFamily === "up" || trackedPair.tradeRoute === "up") {
+    trackedPair.tradeRoute = "up";
+    trackedPair.v4TradePoolId = "";
+    const primary = normalizeAddress(trackedPair.pairAddress);
+    const upAddr = normalizeAddress(trackedPair.upPairAddress);
+    const one =
+      (isEvmAddress(primary) && !isV4PoolId(primary) ? primary : "") ||
+      (isEvmAddress(upAddr) ? upAddr : "") ||
+      fromWatch[0] ||
+      "";
+    trackedPair.upPairAddress = one;
+    trackedPair.watchPairAddresses = one ? [one] : [];
+    if (one) trackedPair.pairAddress = one;
+    return trackedPair;
+  }
+
+  // Uni family: never also listen up.
+  trackedPair.upPairAddress = "";
+  if (trackedPair.tradeRoute === "v4" || isV4PoolId(trackedPair.pairAddress) || isV4PoolId(trackedPair.v4TradePoolId)) {
     const poolId = normalizeAddress(
       isV4PoolId(trackedPair.v4TradePoolId)
         ? trackedPair.v4TradePoolId
@@ -3157,57 +3219,49 @@ function normalizeAlertWatch(trackedPair) {
           ? trackedPair.pairAddress
           : "",
     );
+    trackedPair.tradeRoute = "v4";
     trackedPair.v4TradePoolId = poolId;
     if (poolId) trackedPair.pairAddress = poolId;
-    // Never listen Uni V3 alongside V4 (same aggregator tx used to duplicate/poison alerts).
-    // Do listen up CL — different factory, different pool.
-    const listenUp = isEvmAddress(upAddr) && !isV4PoolId(upAddr) ? upAddr : "";
-    trackedPair.upPairAddress = listenUp;
-    trackedPair.watchPairAddresses = listenUp ? [listenUp] : [];
+    trackedPair.watchPairAddresses = [];
     return trackedPair;
   }
 
+  trackedPair.tradeRoute = "v3";
   trackedPair.v4TradePoolId = "";
   const primary = normalizeAddress(trackedPair.pairAddress);
-  const evmPrimary = isEvmAddress(primary) && !isV4PoolId(primary) ? primary : "";
-  const listen = [];
-  const add = (address) => {
-    const value = normalizeAddress(address);
-    if (!isEvmAddress(value) || isV4PoolId(value) || listen.includes(value)) return;
-    listen.push(value);
-  };
-  add(evmPrimary);
-  add(upAddr);
-  for (const address of fromWatch) add(address);
-  trackedPair.watchPairAddresses = listen;
-  if (route === "up") {
-    trackedPair.upPairAddress = evmPrimary || upAddr;
-    if (trackedPair.upPairAddress && !trackedPair.pairAddress) {
-      trackedPair.pairAddress = trackedPair.upPairAddress;
-    }
-  } else {
-    trackedPair.upPairAddress = isEvmAddress(upAddr) ? upAddr : "";
-    if (evmPrimary) trackedPair.pairAddress = evmPrimary;
-  }
+  const one =
+    (isEvmAddress(primary) && !isV4PoolId(primary) ? primary : "") || fromWatch[0] || "";
+  trackedPair.watchPairAddresses = one ? [one] : [];
+  if (one) trackedPair.pairAddress = one;
   return trackedPair;
 }
 
+/** One pool only — exclusive to chosen DEX (UP or Uni V3). */
 function chooseWatchPairAddresses(pairs, tokenAddress, primaryPairAddress = "", options = {}) {
   const token = normalizeAddress(tokenAddress);
   const primary = normalizeAddress(primaryPairAddress);
-  const skipUniV3 = Boolean(options.skipUniV3);
+  const family = String(options.dexFamily || options.family || "").toLowerCase();
   const up = normalizeAddress(chooseBestUpPairForToken(pairs, token)?.pairAddress || "");
-  const uniV3 = skipUniV3 ? "" : normalizeAddress(chooseBestPairForToken(pairs, token)?.pairAddress || "");
-  const listen = [];
-  const add = (address) => {
-    const value = normalizeAddress(address);
-    if (!isEvmAddress(value) || isV4PoolId(value) || listen.includes(value)) return;
-    listen.push(value);
-  };
-  if (primary && isEvmAddress(primary) && !isV4PoolId(primary)) add(primary);
-  add(up);
-  if (!skipUniV3 && (!primary || primary === up)) add(uniV3);
-  return listen;
+  const uniV3 = normalizeAddress(chooseBestPairForToken(pairs, token)?.pairAddress || "");
+
+  let mode = family === "up" || family === "uni" ? family : "";
+  if (!mode) {
+    if (primary && up && primary === up) mode = "up";
+    else if (options.skipUniV3) mode = "up";
+    else if (primary && isEvmAddress(primary) && !isV4PoolId(primary)) mode = "uni";
+    else mode = up && !uniV3 ? "up" : uniV3 ? "uni" : up ? "up" : "";
+  }
+
+  let one = "";
+  if (mode === "up") {
+    one = (primary === up ? primary : "") || up || "";
+  } else if (mode === "uni") {
+    one =
+      (primary && primary !== up && isEvmAddress(primary) && !isV4PoolId(primary) ? primary : "") || uniV3 || "";
+  } else {
+    one = (primary && !isV4PoolId(primary) ? primary : "") || up || uniV3 || "";
+  }
+  return isEvmAddress(one) && !isV4PoolId(one) ? [one] : [];
 }
 
 function trackedPairsList() {
@@ -3299,9 +3353,14 @@ function applyTrackedPair(trackedPair) {
   config.tradeRoute =
     trackedPair.tradeRoute === "up"
       ? "up"
-      : trackedPair.tradeRoute === "v4" || isV4PoolId(trackedPair.pairAddress)
-        ? "v4"
-        : "v3";
+      : trackedPair.tradeRoute === "uni"
+        ? "uni"
+        : trackedPair.tradeRoute === "v4" || isV4PoolId(trackedPair.pairAddress)
+          ? "v4"
+          : "v3";
+  if (trackedPair.dexFamily === "up" || config.tradeRoute === "up") config.dexFamily = "up";
+  else if (trackedPair.dexFamily === "uni" || ["uni", "v3", "v4"].includes(config.tradeRoute)) config.dexFamily = "uni";
+  else config.dexFamily = "";
   config.v4TradePoolId = normalizeAddress(
     trackedPair.v4TradePoolId || (isV4PoolId(trackedPair.pairAddress) ? trackedPair.pairAddress : ""),
   );
@@ -4130,10 +4189,20 @@ function manageTrackedKeyboard() {
 }
 
 function mainMenuKeyboard(portfolio = null) {
+  const token = normalizeAddress(config.baseTokenAddress);
+  const limitRow = isEvmAddress(token)
+    ? [
+        [
+          { text: `Limit Sell · ${config.baseSymbol}`, callback_data: `limit:${token}` },
+          { text: "My Limits", callback_data: "limits" },
+        ],
+      ]
+    : [[{ text: "My Limits", callback_data: "limits" }]];
   return {
     inline_keyboard: [
       ...trackedSwitchRows(),
       ...tradeActionRows(),
+      ...limitRow,
       [
         { text: "Chart", url: config.dexscreenPairUrl },
         { text: "Update Price", callback_data: "portfolio:refresh" },
@@ -4213,12 +4282,438 @@ function bagSellKeyboard(item) {
   return {
     inline_keyboard: [
       ...chunkButtons(sellButtons, 4),
+      [{ text: `Limit Sell · ${symbol}`, callback_data: `limit:${token}` }],
       [
         { text: `Track ${symbol}`, callback_data: `bagtrack:${token}` },
         { text: "Main Menu", callback_data: "menu" },
       ],
     ],
   };
+}
+
+function ensureLimitOrders(state) {
+  if (!state.limitOrders || typeof state.limitOrders !== "object" || Array.isArray(state.limitOrders)) {
+    state.limitOrders = {};
+  }
+  return state.limitOrders;
+}
+
+function limitOrderKey(dex, tokenId) {
+  return `${String(dex || "up").toLowerCase()}:${String(tokenId)}`;
+}
+
+function parseLimitOrderKey(key) {
+  const raw = String(key || "");
+  const idx = raw.indexOf(":");
+  if (idx <= 0) return { dex: "up", tokenId: raw };
+  return { dex: raw.slice(0, idx).toLowerCase(), tokenId: raw.slice(idx + 1) };
+}
+
+function limitSellDexKeyboard(tokenAddress) {
+  const token = normalizeAddress(tokenAddress);
+  const rows = [];
+  if (config.enableUp) {
+    rows.push([{ text: "UP CL", callback_data: `limitdex:${token}:up` }]);
+  }
+  rows.push([{ text: "Uni V3", callback_data: `limitdex:${token}:uni` }]);
+  rows.push([{ text: "My Limits", callback_data: "limits" }]);
+  rows.push([{ text: "← Back", callback_data: `bag:${token}` }]);
+  return { inline_keyboard: rows };
+}
+
+function limitSellAmountKeyboard(tokenAddress, dex = "up") {
+  const token = normalizeAddress(tokenAddress);
+  const venue = String(dex || "up").toLowerCase();
+  const amounts = [
+    ...(config.sellPercents || [25, 50, 70]).map((percent) => ({
+      text: `${percent}%`,
+      callback_data: `limitamt:${token}:${percent}%:${venue}`,
+    })),
+    { text: "All", callback_data: `limitamt:${token}:ALL:${venue}` },
+  ];
+  return {
+    inline_keyboard: [
+      ...chunkButtons(amounts, 4),
+      [{ text: "← DEX", callback_data: `limit:${token}` }],
+    ],
+  };
+}
+
+function limitSellBandKeyboard(tokenAddress, amountText, dex = "up") {
+  const token = normalizeAddress(tokenAddress);
+  const amt = String(amountText || "ALL").toUpperCase();
+  const venue = String(dex || "up").toLowerCase();
+  return {
+    inline_keyboard: [
+      [
+        { text: "Tight · 1 tick", callback_data: `limitband:${token}:${amt}:1t:${venue}` },
+        { text: "+1%", callback_data: `limitband:${token}:${amt}:1:${venue}` },
+      ],
+      [
+        { text: "+3%", callback_data: `limitband:${token}:${amt}:3:${venue}` },
+        { text: "+5%", callback_data: `limitband:${token}:${amt}:5:${venue}` },
+      ],
+      [{ text: "← Amount", callback_data: `limitdex:${token}:${venue}` }],
+    ],
+  };
+}
+
+function bandLabel(band) {
+  const value = String(band || "").toLowerCase();
+  if (value === "1t" || value === "1tick" || value === "tight") return "tight 1 tick";
+  return `+${value}%`;
+}
+
+function dexLimitLabel(dex) {
+  return String(dex || "").toLowerCase() === "uni" ? "Uni V3" : "UP";
+}
+
+function limitOrdersPanelText(state) {
+  const orders = Object.values(ensureLimitOrders(state));
+  if (!orders.length) {
+    return [
+      `<b>Limit Sell (UP / Uni)</b>`,
+      "Chưa có lệnh. Bag → <b>Limit Sell</b> → chọn DEX.",
+      "",
+      "Maker: mint CL 1 phía ngoài giá · không trả phí taker khi fill.",
+      "Giá chạm band → claim ETH.",
+    ].join("\n");
+  }
+  return [
+    `<b>Limit Sell</b> · ${orders.length} lệnh`,
+    "",
+    ...orders.map((order) => {
+      const id = String(order.tokenId);
+      const status = String(order.status || "open").toUpperCase();
+      const dex = dexLimitLabel(order.dex || "up");
+      return [
+        `• <b>${escapeHtml(order.symbol || "TOKEN")}</b> [${escapeHtml(dex)}] ${escapeHtml(order.amountText || "?")} · ${escapeHtml(bandLabel(order.band))} · <b>${escapeHtml(status)}</b>`,
+        `  NFT <code>#${escapeHtml(id)}</code> · ticks ${order.tickLower}→${order.tickUpper}`,
+      ].join("\n");
+    }),
+  ].join("\n");
+}
+
+function limitOrdersKeyboard(state) {
+  const orders = Object.entries(ensureLimitOrders(state));
+  const rows = orders.map(([key, order]) => {
+    const dex = String(order.dex || parseLimitOrderKey(key).dex || "up").toLowerCase();
+    const id = String(order.tokenId || parseLimitOrderKey(key).tokenId);
+    return [
+      {
+        text: `Claim ${dexLimitLabel(dex)} #${id}`.slice(0, 28),
+        callback_data: `limitclaim:${dex}:${id}`,
+      },
+      {
+        text: "Cancel",
+        callback_data: `limitcancel:${dex}:${id}`,
+      },
+    ];
+  });
+  rows.push([{ text: "Refresh", callback_data: "limits" }]);
+  rows.push([{ text: "← Main Menu", callback_data: "menu" }]);
+  return { inline_keyboard: rows };
+}
+
+async function resolveLimitPool(tokenAddress, dex = "up") {
+  const token = normalizeAddress(tokenAddress);
+  const venue = String(dex || "up").toLowerCase();
+  const pairs = await fetchTokenPairs(token);
+  if (venue === "uni") {
+    // Uni V3 WETH only — never UP / V4 for maker limit.
+    const uni = chooseBestPairForToken(pairs, token);
+    const pool = normalizeAddress(uni?.pairAddress || "");
+    if (!isEvmAddress(pool) || isV4PoolId(pool) || !isUniV3Pair(uni)) {
+      throw new Error("Không có pool Uni V3 WETH cho Limit Sell (V4 chưa hỗ trợ).");
+    }
+    return pool;
+  }
+  if (!config.enableUp) throw new Error("UP DEX chưa bật trên chain này.");
+  const tracked = trackedPairsList().find((entry) => normalizeAddress(entry.baseTokenAddress) === token);
+  let pool = normalizeAddress(tracked?.upPairAddress || "");
+  if (tracked?.tradeRoute === "up" && isEvmAddress(tracked.pairAddress) && !isV4PoolId(tracked.pairAddress)) {
+    pool = normalizeAddress(tracked.pairAddress);
+  }
+  if (!isEvmAddress(pool)) {
+    pool = normalizeAddress(chooseBestUpPairForToken(pairs, token)?.pairAddress || "");
+  }
+  if (!isEvmAddress(pool)) throw new Error("Không có pool UP WETH cho token này.");
+  return pool;
+}
+
+async function placeLimitSell({ tokenAddress, amountText, band, state, symbol, dex = "up" }) {
+  if (!config.tradeEnabled) {
+    throw new Error("TRADE_ENABLED=0. Bật TRADE_ENABLED=1 sau khi cấu hình RPC_URL và WALLET_PRIVATE_KEY.");
+  }
+  if (!config.rpcUrl || !config.walletPrivateKey) {
+    throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
+  }
+
+  const up = require("./up");
+  const { ethers } = require("ethers");
+  const venue = String(dex || "up").toLowerCase() === "uni" ? "uni" : "up";
+  const token = normalizeAddress(tokenAddress);
+  const provider = getRpcProvider();
+  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
+  const poolAddress = await resolveLimitPool(token, venue);
+  const pool = await up.readPoolState(provider, poolAddress);
+  if (venue === "uni" && !(Number(pool.fee) > 0)) {
+    throw new Error(`Uni pool ${compactAddress(poolAddress)} thiếu fee — không mint limit được.`);
+  }
+  if (!(Number(pool.tickSpacing) > 0)) {
+    throw new Error(`Pool ${compactAddress(poolAddress)} thiếu tickSpacing.`);
+  }
+  const plan = up.planLimitSellBand({
+    currentTick: pool.tick,
+    tickSpacing: pool.tickSpacing,
+    token0: pool.token0,
+    token1: pool.token1,
+    sellToken: token,
+    band,
+  });
+
+  const tokenContract = new ethers.Contract(
+    token,
+    [
+      "function allowance(address owner,address spender) view returns (uint256)",
+      "function approve(address spender,uint256 amount) returns (bool)",
+      "function balanceOf(address owner) view returns (uint256)",
+      "function decimals() view returns (uint8)",
+    ],
+    wallet,
+  );
+  const decimals = Number(await tokenContract.decimals().catch(() => 18));
+  let amountIn;
+  const sellPercent = parseSellPercent(amountText);
+  if (sellPercent !== null) {
+    const balance = await tokenContract.balanceOf(wallet.address);
+    amountIn = balancePercent(balance, sellPercent);
+    if (sellPercent >= 100 && amountIn > 1n) amountIn -= 1n;
+  } else {
+    amountIn = ethers.parseUnits(String(amountText), decimals);
+  }
+  if (amountIn <= 0n) throw new Error("Amount limit sell = 0.");
+
+  const balance = await tokenContract.balanceOf(wallet.address);
+  if (balance < amountIn) {
+    throw new Error(
+      `Not enough ${symbol || "TOKEN"}. Need ${ethers.formatUnits(amountIn, decimals)}, have ${ethers.formatUnits(balance, decimals)}`,
+    );
+  }
+
+  await assertEthForGas(wallet, "LIMIT");
+
+  const npmAddr =
+    venue === "uni"
+      ? normalizeAddress(activeChain.uniPositionManager || up.UNI_V3_POSITION_MANAGER)
+      : normalizeAddress(activeChain.upPositionManager || up.POSITION_MANAGER);
+  if (!isEvmAddress(npmAddr)) throw new Error(`PositionManager chưa cấu hình cho ${venue}.`);
+
+  const allowance = await tokenContract.allowance(wallet.address, npmAddr);
+  if (allowance < amountIn) {
+    const approvePopulated = await tokenContract.approve.populateTransaction(npmAddr, ethers.MaxUint256);
+    const approveGas = await resolveTradeGasOverrides(provider, { ...approvePopulated, from: wallet.address });
+    const approveTx = await rpcCall("approve limit", () => tokenContract.approve(npmAddr, ethers.MaxUint256, approveGas), 1);
+    const approveReceipt = await withTimeout(approveTx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `approve ${approveTx.hash}`);
+    if (!approveReceipt || approveReceipt.status !== 1) throw new Error("Approve limit sell failed.");
+  }
+
+  const amount0Desired = plan.sellingToken0 ? amountIn : 0n;
+  const amount1Desired = plan.sellingToken0 ? 0n : amountIn;
+  const amount0Min = plan.sellingToken0 ? (amountIn * 9950n) / 10000n : 0n;
+  const amount1Min = plan.sellingToken0 ? 0n : (amountIn * 9950n) / 10000n;
+  const deadline = Math.floor(Date.now() / 1000) + 600;
+
+  const npmAbi = venue === "uni" ? up.UNI_V3_POSITION_MANAGER_ABI : up.POSITION_MANAGER_ABI;
+  const mintParams =
+    venue === "uni"
+      ? {
+          token0: pool.token0,
+          token1: pool.token1,
+          fee: pool.fee,
+          tickLower: plan.tickLower,
+          tickUpper: plan.tickUpper,
+          amount0Desired,
+          amount1Desired,
+          amount0Min,
+          amount1Min,
+          recipient: wallet.address,
+          deadline,
+        }
+      : {
+          token0: pool.token0,
+          token1: pool.token1,
+          tickSpacing: plan.tickSpacing,
+          tickLower: plan.tickLower,
+          tickUpper: plan.tickUpper,
+          amount0Desired,
+          amount1Desired,
+          amount0Min,
+          amount1Min,
+          recipient: wallet.address,
+          deadline,
+          sqrtPriceX96: 0,
+        };
+
+  const npm = new ethers.Contract(npmAddr, npmAbi, wallet);
+  const predicted = await rpcCall("simulate limit mint", () => npm.mint.staticCall(mintParams));
+  const predictedId = String(predicted.tokenId ?? predicted[0]);
+  const populated = await npm.mint.populateTransaction(mintParams);
+  const gasOverrides = await resolveTradeGasOverrides(provider, { ...populated, from: wallet.address });
+  const tx = await rpcCall("limit mint", () => npm.mint(mintParams, gasOverrides), 1);
+  const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `limit mint ${tx.hash}`);
+  if (!receipt || Number(receipt.status) !== 1) {
+    throw new Error(`Limit mint reverted. Tx: ${tx.hash}`);
+  }
+
+  let tokenId = predictedId;
+  for (const log of receipt.logs || []) {
+    try {
+      const parsed = npm.interface.parseLog({ topics: log.topics, data: log.data });
+      if (parsed?.name === "IncreaseLiquidity" && parsed.args?.tokenId != null) {
+        tokenId = String(parsed.args.tokenId);
+        break;
+      }
+    } catch {
+      // not our log
+    }
+  }
+  if (!tokenId) throw new Error(`Mint ok nhưng không đọc được tokenId. Tx: ${tx.hash}`);
+
+  const key = limitOrderKey(venue, tokenId);
+  const orders = ensureLimitOrders(state);
+  orders[key] = {
+    key,
+    dex: venue,
+    npm: npmAddr,
+    tokenId,
+    token,
+    symbol: symbol || "TOKEN",
+    pool: poolAddress,
+    fee: pool.fee,
+    tickLower: plan.tickLower,
+    tickUpper: plan.tickUpper,
+    tickSpacing: plan.tickSpacing,
+    sellingToken0: plan.sellingToken0,
+    band: plan.band,
+    amountText: String(amountText || "").toUpperCase(),
+    amountIn: amountIn.toString(),
+    decimals,
+    txHash: tx.hash,
+    createdAt: Date.now(),
+  };
+  saveState(state, { flush: true });
+
+  return {
+    hash: tx.hash,
+    tokenId,
+    dex: venue,
+    pool: poolAddress,
+    plan,
+    amountIn: ethers.formatUnits(amountIn, decimals),
+    wallet: wallet.address,
+  };
+}
+
+async function closeLimitOrder({ tokenId, dex = "up", state, mode = "claim" }) {
+  if (!config.tradeEnabled) {
+    throw new Error("TRADE_ENABLED=0.");
+  }
+  if (!config.rpcUrl || !config.walletPrivateKey) {
+    throw new Error("Missing RPC_URL or WALLET_PRIVATE_KEY.");
+  }
+  const up = require("./up");
+  const { ethers } = require("ethers");
+  const venue = String(dex || "up").toLowerCase() === "uni" ? "uni" : "up";
+  const id = String(tokenId);
+  const key = limitOrderKey(venue, id);
+  const orders = ensureLimitOrders(state);
+  const stored = orders[key] || orders[id];
+  const npmAddr = normalizeAddress(
+    stored?.npm ||
+      (venue === "uni"
+        ? activeChain.uniPositionManager || up.UNI_V3_POSITION_MANAGER
+        : activeChain.upPositionManager || up.POSITION_MANAGER),
+  );
+  const npmAbi = venue === "uni" ? up.UNI_V3_POSITION_MANAGER_ABI : up.POSITION_MANAGER_ABI;
+  const provider = getRpcProvider();
+  const wallet = new ethers.Wallet(config.walletPrivateKey, provider);
+  const npm = new ethers.Contract(npmAddr, npmAbi, wallet);
+  const owner = normalizeAddress(await npm.ownerOf(id));
+  if (owner !== normalizeAddress(wallet.address)) {
+    throw new Error(`NFT #${id} (${venue}) không thuộc ví signing.`);
+  }
+  const pos = await up.readPosition(provider, id, venue, npmAddr);
+  const deadline = Math.floor(Date.now() / 1000) + 600;
+  const calls = [];
+  if (pos.liquidity > 0n) {
+    calls.push(
+      npm.interface.encodeFunctionData("decreaseLiquidity", [
+        {
+          tokenId: id,
+          liquidity: pos.liquidity,
+          amount0Min: 0n,
+          amount1Min: 0n,
+          deadline,
+        },
+      ]),
+    );
+  }
+  calls.push(
+    npm.interface.encodeFunctionData("collect", [
+      {
+        tokenId: id,
+        recipient: npmAddr,
+        amount0Max: up.MAX_UINT128,
+        amount1Max: up.MAX_UINT128,
+      },
+    ]),
+  );
+  calls.push(npm.interface.encodeFunctionData("unwrapWETH9", [0n, wallet.address]));
+  calls.push(npm.interface.encodeFunctionData("sweepToken", [pos.token0, 0n, wallet.address]));
+  calls.push(npm.interface.encodeFunctionData("sweepToken", [pos.token1, 0n, wallet.address]));
+  calls.push(npm.interface.encodeFunctionData("refundETH", []));
+
+  await rpcCall("simulate limit close", () => npm.multicall.staticCall(calls));
+  const populated = await npm.multicall.populateTransaction(calls);
+  const gasOverrides = await resolveTradeGasOverrides(provider, { ...populated, from: wallet.address });
+  const tx = await rpcCall(`limit ${mode}`, () => npm.multicall(calls, gasOverrides), 1);
+  const receipt = await withTimeout(tx.wait(1), TRADE_CONFIRM_TIMEOUT_MS, `limit close ${tx.hash}`);
+  if (!receipt || Number(receipt.status) !== 1) {
+    throw new Error(`Close limit reverted. Tx: ${tx.hash}`);
+  }
+
+  delete orders[key];
+  delete orders[id];
+  saveState(state, { flush: true });
+  return { hash: tx.hash, tokenId: id, dex: venue, mode };
+}
+
+async function refreshLimitOrderStatuses(state) {
+  const up = require("./up");
+  const orders = ensureLimitOrders(state);
+  const keys = Object.keys(orders);
+  if (!keys.length) return orders;
+  const provider = getRpcProvider();
+  for (const key of keys) {
+    const order = orders[key];
+    try {
+      const pool = await up.readPoolState(provider, order.pool);
+      order.status = up.classifyLimitFill({
+        currentTick: pool.tick,
+        tickLower: order.tickLower,
+        tickUpper: order.tickUpper,
+        sellingToken0: Boolean(order.sellingToken0),
+      });
+      order.currentTick = pool.tick;
+      if (!order.dex) order.dex = parseLimitOrderKey(key).dex || "up";
+    } catch (error) {
+      order.status = order.status || "unknown";
+      console.warn(`limit status ${key}: ${error.message}`);
+    }
+  }
+  saveState(state);
+  return orders;
 }
 
 function formatBagButtonLabel(item) {
@@ -4567,6 +5062,9 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
     trackedPair.tradeRoute ||
     (isV4PoolId(trackedPair.pairAddress) ? "v4" : "v3");
   trackedPair.tradeRoute = tradeRoute;
+  if (options.dexFamily) trackedPair.dexFamily = options.dexFamily;
+  else if (tradeRoute === "up") trackedPair.dexFamily = "up";
+  else if (["uni", "v3", "v4"].includes(tradeRoute)) trackedPair.dexFamily = trackedPair.dexFamily || "uni";
   const dexVer =
     options.dexVer ||
     (forced
@@ -4656,10 +5154,10 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
     : "";
   const listenLine =
     tradeRoute === "v4"
-      ? `Listen: <b>Uni V4 ETH</b> sạch (no hook fee)${escapeHtml(liqNote)}`
+      ? `Listen + trade: <b>Uni V4</b> (deepest clean)${escapeHtml(liqNote)}`
       : tradeRoute === "up"
-        ? `Listen: <b>up CL WETH</b>${escapeHtml(liqNote)}`
-        : `Listen: <b>Uni V3 WETH</b> sạch${escapeHtml(liqNote)}`;
+        ? `Listen + trade: <b>UP CL</b> (deepest WETH)${escapeHtml(liqNote)}`
+        : `Listen + trade: <b>Uni V3</b> (deepest WETH)${escapeHtml(liqNote)}`;
   const keyboard = mainMenuKeyboard(state.portfolioSnapshot);
   assertTrackLive();
   await telegramRequest("sendMessage", {
@@ -4674,7 +5172,7 @@ async function activateTrackedPair(trackedPair, state, chatId, options = {}) {
       tradeRoute === "v4" && !v4Watch.length
         ? "⚠️ V4 listen set trống — restart bot nếu alert không về."
         : "",
-      `Alert ≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol || "ETH")} trên DEX đã chọn.`,
+      `Buy/Sell chỉ trên DEX đã chọn · pool LP sâu nhất. Alert ≥${config.minQuoteAmount} ${escapeHtml(trackedPair.quoteSymbol || "ETH")}.`,
       `Pair: <code>${escapeHtml(compactAddress(trackedPair.pairAddress))}</code>`,
       forced ? "Buy/Sell dùng đúng pool này." : "",
       `<a href="${escapeHtml(trackedPair.pairUrl)}">Dexscreener</a>`,
@@ -4798,6 +5296,7 @@ async function activateTrackFromDexChoice(followAddress, pairs, dexChoice, state
       return;
     }
     const trackedPair = trackedPairFromDexPair(options.up.pair, followAddress);
+    trackedPair.dexFamily = "up";
     trackedPair.tradeRoute = "up";
     trackedPair.v4TradePoolId = "";
     trackedPair.upPairAddress = trackedPair.pairAddress;
@@ -4805,7 +5304,7 @@ async function activateTrackFromDexChoice(followAddress, pairs, dexChoice, state
     await activateTrackedPair(trackedPair, state, chatId, {
       tradeRoute: "up",
       liquidityUsd: options.up.liquidityUsd,
-      dexVer: "up CL WETH",
+      dexVer: "up CL · deepest WETH",
       trackEpoch: trackOpts.trackEpoch,
     });
     return;
@@ -4824,6 +5323,7 @@ async function activateTrackFromDexChoice(followAddress, pairs, dexChoice, state
     }
     const selected = options.uni;
     const trackedPair = trackedPairFromDexPair(selected.pair, followAddress);
+    trackedPair.dexFamily = "uni";
     trackedPair.upPairAddress = "";
 
     if (selected.kind === "v4") {
@@ -4847,7 +5347,7 @@ async function activateTrackFromDexChoice(followAddress, pairs, dexChoice, state
       await activateTrackedPair(trackedPair, state, chatId, {
         tradeRoute: "v4",
         liquidityUsd: selected.liquidityUsd,
-        dexVer: "Uni V4 ETH · clean (no hooks)",
+        dexVer: "Uni · deepest V4 ETH",
         trackEpoch: trackOpts.trackEpoch,
       });
       return;
@@ -4859,7 +5359,7 @@ async function activateTrackFromDexChoice(followAddress, pairs, dexChoice, state
     await activateTrackedPair(trackedPair, state, chatId, {
       tradeRoute: "v3",
       liquidityUsd: selected.liquidityUsd,
-      dexVer: "Uni V3 WETH",
+      dexVer: "Uni · deepest V3 WETH",
       trackEpoch: trackOpts.trackEpoch,
     });
     return;
@@ -4912,10 +5412,6 @@ async function followTokenAddress(tokenAddress, state, chatId, trackOpts = {}) {
     }
   } catch (error) {
     console.warn(`Dex pair lookup for ${raw} failed: ${error.message}`);
-  }
-  if (followAddress === raw) {
-    // Only probe as V3 pool AFTER Dex token lookup — eth_call token0() on an ERC-20
-    // can hang on some RH RPCs and used to stall the whole track queue forever.
   }
   if (followAddress !== raw && isEvmAddress(followAddress)) {
     return followTokenAddress(followAddress, state, chatId, trackOpts);
@@ -5347,7 +5843,23 @@ async function resolveSellContext(tokenAddress, state = {}) {
   }
 
   const pairs = await fetchTokenPairs(token);
-  const selected = chooseBestTradePairForToken(pairs, token);
+  const trackedHit = trackedPairsList().find((entry) => normalizeAddress(entry.baseTokenAddress) === token);
+  const family =
+    trackedHit?.dexFamily === "up" || trackedHit?.tradeRoute === "up"
+      ? "up"
+      : trackedHit?.dexFamily === "uni" || ["uni", "v3", "v4"].includes(String(trackedHit?.tradeRoute || ""))
+        ? "uni"
+        : "";
+
+  let selected = null;
+  if (family === "up") {
+    const upPair = chooseBestUpPairForToken(pairs, token);
+    if (upPair) selected = { pair: upPair, kind: "up", liquidityUsd: Number(upPair.liquidity?.usd || 0) };
+  } else if (family === "uni") {
+    selected = chooseBestUniTradePairForToken(pairs, token);
+  } else {
+    selected = chooseBestTradePairForToken(pairs, token);
+  }
   if (!selected?.pair?.pairAddress) {
     throw new Error(`Không tìm thấy pool up / Uni V3 WETH / Uni V4 ETH thanh khoản cho token.`);
   }
@@ -5367,8 +5879,9 @@ async function resolveSellContext(tokenAddress, state = {}) {
       decimals: await decimalsForToken(18),
       v3Only: false,
       tradeRoute: "v4",
+      dexFamily: "uni",
       v4TradePoolId: poolId,
-      upPairAddress: normalizeAddress(chooseBestUpPairForToken(pairs, token)?.pairAddress || ""),
+      upPairAddress: "",
     };
   }
 
@@ -5395,6 +5908,7 @@ async function resolveSellContext(tokenAddress, state = {}) {
       decimals: await decimalsForToken(18),
       v3Only: false,
       tradeRoute: "up",
+      dexFamily: "up",
       upPairAddress: tracked.pairAddress,
     };
   }
@@ -5420,9 +5934,10 @@ async function resolveSellContext(tokenAddress, state = {}) {
     priceNative: Number(pair.priceNative),
     priceUsd: Number(fromBag?.priceUsd || pair.priceUsd),
     decimals: await decimalsForToken(18),
-    v3Only: selected.kind !== "up",
-    tradeRoute: selected.kind === "up" ? "up" : "v3",
-    upPairAddress: normalizeAddress(chooseBestUpPairForToken(pairs, token)?.pairAddress || ""),
+    v3Only: false,
+    tradeRoute: "v3",
+    dexFamily: "uni",
+    upPairAddress: "",
   };
 }
 
@@ -5769,7 +6284,7 @@ async function handleCallbackQueryInner(callbackQuery, state) {
   const chatId = callbackQuery.message?.chat?.id;
   const data = String(callbackQuery.data || "");
   const toast =
-    data.startsWith("qtrade:") || data.startsWith("bagsell:")
+    data.startsWith("qtrade:") || data.startsWith("bagsell:") || data.startsWith("limitband:")
       ? "Sending…"
       : data === "portfolio:refresh"
         ? "Updating…"
@@ -5781,6 +6296,10 @@ async function handleCallbackQueryInner(callbackQuery, state) {
               ? "Buy…"
                 : data.startsWith("trackdex:")
                   ? "Chọn DEX…"
+                : data.startsWith("limit:") || data.startsWith("limitdex:") || data.startsWith("limitamt:") || data === "limits"
+                  ? "Limit…"
+                : data.startsWith("limitclaim:") || data.startsWith("limitcancel:")
+                  ? "Closing…"
                 : data.startsWith("switch:")
                 ? "Switching…"
                 : data.startsWith("trackremove:")
@@ -5906,6 +6425,197 @@ async function handleCallbackQueryInner(callbackQuery, state) {
     enqueueFollowToken(token, state, chatId, { dexChoice: dex }).catch((error) => {
       console.error(`trackdex follow failed: ${error.message}`);
     });
+    return;
+  }
+
+  if (data === "limits") {
+    await refreshLimitOrderStatuses(state).catch(() => {});
+    await editTradeMessage(callbackQuery, limitOrdersPanelText(state), limitOrdersKeyboard(state));
+    return;
+  }
+
+  if (data.startsWith("limit:") && !data.startsWith("limitdex:") && !data.startsWith("limitamt:") && !data.startsWith("limitband:") && !data.startsWith("limitclaim:") && !data.startsWith("limitcancel:")) {
+    const token = normalizeAddress(data.slice("limit:".length));
+    if (!isEvmAddress(token)) {
+      await editTradeMessage(callbackQuery, "Token không hợp lệ.", mainMenuKeyboard(state.portfolioSnapshot));
+      return;
+    }
+    const item = findBagItem(state, token);
+    const symbol = item?.symbol || config.baseSymbol || "TOKEN";
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>Limit Sell · ${escapeHtml(symbol)}</b>`,
+        "Chọn DEX để mint CL 1 phía (maker · không phí taker).",
+        "UP = Slipstream · Uni = Uniswap V3 (pool WETH sâu nhất).",
+        "",
+        "<i>V4 chưa hỗ trợ limit sell.</i>",
+      ].join("\n"),
+      limitSellDexKeyboard(token),
+    );
+    return;
+  }
+
+  if (data.startsWith("limitdex:")) {
+    const parts = data.split(":");
+    const token = normalizeAddress(parts[1] || "");
+    const dex = String(parts[2] || "up").toLowerCase();
+    if (!isEvmAddress(token) || !["up", "uni"].includes(dex)) {
+      await editTradeMessage(callbackQuery, "DEX không hợp lệ.", mainMenuKeyboard(state.portfolioSnapshot));
+      return;
+    }
+    if (dex === "up" && !config.enableUp) {
+      await editTradeMessage(callbackQuery, "UP chưa bật trên chain này.", limitSellDexKeyboard(token));
+      return;
+    }
+    const item = findBagItem(state, token);
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>Limit Sell ${escapeHtml(dexLimitLabel(dex))} · ${escapeHtml(item?.symbol || "TOKEN")}</b>`,
+        "Chọn % bán.",
+      ].join("\n"),
+      limitSellAmountKeyboard(token, dex),
+    );
+    return;
+  }
+
+  if (data.startsWith("limitamt:")) {
+    const parts = data.split(":");
+    const token = normalizeAddress(parts[1] || "");
+    // limitamt:token:25%:up  OR legacy limitamt:token:25%
+    let amount = "";
+    let dex = "up";
+    if (parts.length >= 4 && ["up", "uni"].includes(String(parts[parts.length - 1]).toLowerCase())) {
+      dex = String(parts[parts.length - 1]).toLowerCase();
+      amount = String(parts.slice(2, -1).join(":") || "").toUpperCase();
+    } else {
+      amount = String(parts.slice(2).join(":") || "").toUpperCase();
+    }
+    if (!isEvmAddress(token) || !amount) {
+      await editTradeMessage(callbackQuery, "Limit amount không hợp lệ.", mainMenuKeyboard(state.portfolioSnapshot));
+      return;
+    }
+    if (parseSellPercent(amount) === null && !/^[0-9]*\.?[0-9]+$/.test(amount)) {
+      await editTradeMessage(callbackQuery, "Amount không hợp lệ.", limitSellAmountKeyboard(token, dex));
+      return;
+    }
+    const item = findBagItem(state, token);
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>Chọn band · ${escapeHtml(dexLimitLabel(dex))} · ${escapeHtml(item?.symbol || "TOKEN")}</b>`,
+        `Amount: <b>${escapeHtml(amount)}</b>`,
+        "",
+        "Tight = fill gần giá hiện tại (1 tickSpacing).",
+        "+1% / +3% / +5% = chờ token pump thêm rồi fill.",
+      ].join("\n"),
+      limitSellBandKeyboard(token, amount, dex),
+    );
+    return;
+  }
+
+  if (data.startsWith("limitband:")) {
+    const parts = data.split(":");
+    const token = normalizeAddress(parts[1] || "");
+    const amount = String(parts[2] || "").toUpperCase();
+    const band = String(parts[3] || "1t").toLowerCase();
+    const dex = ["up", "uni"].includes(String(parts[4] || "").toLowerCase())
+      ? String(parts[4]).toLowerCase()
+      : "up";
+    if (!isEvmAddress(token) || !amount) {
+      await editTradeMessage(callbackQuery, "Limit band không hợp lệ.", mainMenuKeyboard(state.portfolioSnapshot));
+      return;
+    }
+    const item = findBagItem(state, token);
+    const symbol = item?.symbol || "TOKEN";
+    await editTradeMessage(
+      callbackQuery,
+      [
+        `<b>Đang đặt Limit Sell ${escapeHtml(dexLimitLabel(dex))}…</b>`,
+        `${escapeHtml(symbol)} · ${escapeHtml(amount)} · ${escapeHtml(bandLabel(band))}`,
+      ].join("\n"),
+    );
+    let lockGen;
+    try {
+      lockGen = acquireTradeLock(`LIMIT ${symbol}`);
+      const result = await withTimeout(
+        placeLimitSell({ tokenAddress: token, amountText: amount, band, state, symbol, dex }),
+        TRADE_LOCK_TIMEOUT_MS,
+        `LIMIT ${symbol}`,
+      );
+      releaseTradeLock(lockGen);
+      const txUrl = explorerTxUrl(result.hash);
+      await editTradeMessage(
+        callbackQuery,
+        [
+          `<b>Limit Sell ${escapeHtml(dexLimitLabel(result.dex || dex))} đã đặt</b>`,
+          `Token: <b>${escapeHtml(symbol)}</b>`,
+          `Amount: <b>${escapeHtml(result.amountIn)}</b>`,
+          `Band: <b>${escapeHtml(bandLabel(band))}</b> · ticks ${result.plan.tickLower}→${result.plan.tickUpper}`,
+          `NFT: <code>#${escapeHtml(result.tokenId)}</code>`,
+          `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+          "",
+          "Chờ giá chạm band rồi bấm <b>My Limits → Claim</b>.",
+        ].join("\n"),
+        limitOrdersKeyboard(state),
+      );
+    } catch (error) {
+      releaseTradeLock(lockGen);
+      await editTradeMessage(
+        callbackQuery,
+        formatTradeFailureMessage(error),
+        limitSellBandKeyboard(token, amount, dex),
+      );
+    }
+    return;
+  }
+
+  if (data.startsWith("limitclaim:") || data.startsWith("limitcancel:")) {
+    const claim = data.startsWith("limitclaim:");
+    const parts = data.split(":");
+    // limitclaim:up:123  OR legacy limitclaim:123
+    let dex = "up";
+    let tokenId = "";
+    if (parts.length >= 3 && ["up", "uni"].includes(String(parts[1]).toLowerCase())) {
+      dex = String(parts[1]).toLowerCase();
+      tokenId = String(parts[2] || "");
+    } else {
+      tokenId = String(parts[1] || "");
+    }
+    if (!/^\d+$/.test(tokenId)) {
+      await editTradeMessage(callbackQuery, "tokenId không hợp lệ.", limitOrdersKeyboard(state));
+      return;
+    }
+    await editTradeMessage(
+      callbackQuery,
+      `<b>${claim ? "Claim" : "Cancel"} ${escapeHtml(dexLimitLabel(dex))} #${escapeHtml(tokenId)}…</b>`,
+    );
+    let lockGen;
+    try {
+      lockGen = acquireTradeLock(`LIMITCLOSE ${dex} ${tokenId}`);
+      const result = await withTimeout(
+        closeLimitOrder({ tokenId, dex, state, mode: claim ? "claim" : "cancel" }),
+        TRADE_LOCK_TIMEOUT_MS,
+        `LIMITCLOSE ${tokenId}`,
+      );
+      releaseTradeLock(lockGen);
+      const txUrl = explorerTxUrl(result.hash);
+      await refreshLimitOrderStatuses(state).catch(() => {});
+      await editTradeMessage(
+        callbackQuery,
+        [
+          `<b>${claim ? "Claimed" : "Cancelled"} ${escapeHtml(dexLimitLabel(result.dex || dex))} #${escapeHtml(tokenId)}</b>`,
+          `Tx: <a href="${escapeHtml(txUrl)}">${escapeHtml(compactAddress(result.hash))}</a>`,
+          "",
+          limitOrdersPanelText(state),
+        ].join("\n"),
+        limitOrdersKeyboard(state),
+      );
+    } catch (error) {
+      releaseTradeLock(lockGen);
+      await editTradeMessage(callbackQuery, formatTradeFailureMessage(error), limitOrdersKeyboard(state));
+    }
     return;
   }
 
@@ -6413,6 +7123,11 @@ module.exports = {
   formatPnlPct,
   positionEntryLines,
   bagSellKeyboard,
+  limitSellDexKeyboard,
+  limitSellAmountKeyboard,
+  limitSellBandKeyboard,
+  limitOrdersPanelText,
+  limitOrdersKeyboard,
   withTradeLock,
   acquireTradeLock,
   releaseTradeLock,

@@ -23,6 +23,9 @@ const CHAINS = {
     upSwapRouter: "0xC062b870E813fcA720f1e002c234369Ab3aB9415",
     upQuoter: "0x03983AB2C057a2eac211ff01738a1e49ff325B49",
     upFactory: "0x1ac9dB4a2608ba45D6127B1737949b51Bb54B7F3",
+    upPositionManager: "0x07F44c47743A2f36414A82b9F558ECFCf0EEdCEf",
+    // Official Uniswap V3 NFPM on Robinhood (limit sell CL).
+    uniPositionManager: "0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3",
     // Robinhood Uni V4 singleton (Blockscout name: PoolManager).
     poolManager: "0x8366a39CC670B4001A1121B8F6A443A643e40951",
     // Sample pair for docs / empty boot (REPE/WETH).
@@ -51,6 +54,8 @@ const CHAINS = {
     upSwapRouter: "",
     upQuoter: "",
     upFactory: "",
+    upPositionManager: "",
+    uniPositionManager: "",
     poolManager: "",
     defaultPair: "",
     defaultBase: "",

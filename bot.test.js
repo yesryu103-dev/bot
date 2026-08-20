@@ -1092,13 +1092,14 @@ test("paste-token prefers deeper up CL WETH over thinner Uni V4", () => {
   assert.equal(bot.isUpPair(selected.pair), true);
 });
 
-test("V4 track still listens up CL in parallel, not Uni V3", () => {
+test("V4 / Uni track does not listen up CL after exclusive DEX pick", () => {
   const prev = bot.config.trackedPairs;
   const poolId = "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a";
   const v3 = "0x09a431261eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const upPool = "0xcd2937592f73968ebaa916f37e5f6c1b27713469";
   bot.config.trackedPairs = [
     {
+      dexFamily: "uni",
       tradeRoute: "v4",
       pairAddress: poolId,
       v4TradePoolId: poolId,
@@ -1111,10 +1112,34 @@ test("V4 track still listens up CL in parallel, not Uni V3", () => {
     },
   ];
   bot.normalizeAlertWatch(bot.config.trackedPairs[0]);
-  assert.deepEqual(bot.config.trackedPairs[0].watchPairAddresses, [upPool]);
+  assert.deepEqual(bot.config.trackedPairs[0].watchPairAddresses, []);
+  assert.equal(bot.config.trackedPairs[0].upPairAddress, "");
   const watched = [...bot.watchedPairSet()];
-  assert.equal(watched.includes(upPool), true);
+  assert.equal(watched.includes(upPool), false);
   assert.equal(watched.includes(v3), false);
+  bot.config.trackedPairs = prev;
+});
+
+test("UP track listens only the up pool", () => {
+  const prev = bot.config.trackedPairs;
+  const upPool = "0xcd2937592f73968ebaa916f37e5f6c1b27713469";
+  const uni = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  bot.config.trackedPairs = [
+    {
+      dexFamily: "up",
+      tradeRoute: "up",
+      pairAddress: upPool,
+      upPairAddress: upPool,
+      baseTokenAddress: "0xa5be0eeb82a013dc7867b9e020c36a69da666666",
+      baseSymbol: "CLOCKIN",
+      quoteTokenAddress: bot.config.quoteTokenAddress,
+      quoteSymbol: "WETH",
+      watchPairAddresses: [upPool, uni],
+    },
+  ];
+  bot.normalizeAlertWatch(bot.config.trackedPairs[0]);
+  assert.deepEqual(bot.config.trackedPairs[0].watchPairAddresses, [upPool]);
+  assert.equal([...bot.watchedPairSet()].includes(uni), false);
   bot.config.trackedPairs = prev;
 });
 
@@ -1181,7 +1206,7 @@ test("chooseBestUniTradePairForToken ignores up pools", () => {
   assert.equal(selected.kind, "v3");
 });
 
-test("watch list pairs up CL with Uni V3 when both exist", () => {
+test("watch list stays exclusive to UP when primary is up CL", () => {
   const token = "0xa5be0eeb82a013dc7867b9e020c36a69da666666";
   const upPool = "0xcd2937592f73968ebaa916f37e5f6c1b27713469";
   const uni = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1208,6 +1233,81 @@ test("watch list pairs up CL with Uni V3 when both exist", () => {
     ],
     token,
     upPool,
+    { dexFamily: "up" },
   );
-  assert.deepEqual(watched, [upPool, uni]);
+  assert.deepEqual(watched, [upPool]);
+});
+
+test("up limit sell band sits below market when selling token1", () => {
+  const up = require("./up");
+  const weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+  const token = "0xA5be0eEb82a013Dc7867B9e020c36A69DA666666";
+  const plan = up.planLimitSellBand({
+    currentTick: 136621,
+    tickSpacing: 200,
+    token0: weth,
+    token1: token,
+    sellToken: token,
+    band: "1t",
+  });
+  assert.equal(plan.sellingToken0, false);
+  assert.ok(plan.tickUpper <= 136621);
+  assert.equal(plan.tickUpper - plan.tickLower, 200);
+  assert.equal(
+    up.classifyLimitFill({
+      currentTick: 136621,
+      tickLower: plan.tickLower,
+      tickUpper: plan.tickUpper,
+      sellingToken0: false,
+    }),
+    "open",
+  );
+  assert.equal(
+    up.classifyLimitFill({
+      currentTick: plan.tickLower - 1,
+      tickLower: plan.tickLower,
+      tickUpper: plan.tickUpper,
+      sellingToken0: false,
+    }),
+    "filled",
+  );
+});
+
+test("up +5% limit band is farther than tight 1 tick", () => {
+  const up = require("./up");
+  const weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+  const token = "0xA5be0eEb82a013Dc7867B9e020c36A69DA666666";
+  const tight = up.planLimitSellBand({
+    currentTick: 136621,
+    tickSpacing: 200,
+    token0: weth,
+    token1: token,
+    sellToken: token,
+    band: "1t",
+  });
+  const wide = up.planLimitSellBand({
+    currentTick: 136621,
+    tickSpacing: 200,
+    token0: weth,
+    token1: token,
+    sellToken: token,
+    band: "5",
+  });
+  assert.ok(wide.tickUpper < tight.tickUpper);
+});
+
+test("bag sell keyboard exposes Limit Sell", () => {
+  const kb = bot.bagSellKeyboard({
+    address: "0xa5be0eeb82a013dc7867b9e020c36a69da666666",
+    symbol: "CLOCKIN",
+  });
+  const flat = kb.inline_keyboard.flat().map((btn) => btn.callback_data);
+  assert.ok(flat.some((data) => String(data).startsWith("limit:0xa5be")));
+});
+
+test("limit sell dex picker offers UP and Uni", () => {
+  const kb = bot.limitSellDexKeyboard("0xa5be0eeb82a013dc7867b9e020c36a69da666666");
+  const flat = kb.inline_keyboard.flat().map((btn) => btn.callback_data);
+  assert.ok(flat.some((data) => String(data).includes(":up")));
+  assert.ok(flat.some((data) => String(data).includes(":uni")));
 });
