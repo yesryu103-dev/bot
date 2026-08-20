@@ -416,6 +416,18 @@ test("trade lock rejects double-send but releases a wedged trade", async () => {
   assert.equal(await bot.withTradeLock(async () => "ok", "BUY GME", 120), "ok");
 });
 
+test("failed second tap does not unlock an in-flight trade", async () => {
+  const gen = bot.acquireTradeLock("BUY FRONG", 30_000);
+  bot.releaseTradeLock(undefined);
+  bot.releaseTradeLock(null);
+  await assert.rejects(
+    () => bot.withTradeLock(async () => "second", "BUY GME", 120),
+    /Trade đang chạy: BUY FRONG/,
+  );
+  bot.releaseTradeLock(gen);
+  assert.equal(await bot.withTradeLock(async () => "ok", "BUY GME", 120), "ok");
+});
+
 test("broadcast timeout warns to check the chain instead of claiming not sent", () => {
   const formatted = bot.formatSwapError(new Error("BUY GME broadcast timed out after 150000ms"));
   assert.match(formatted, /explorer|ví/i);
@@ -633,7 +645,7 @@ test("exact 1 ETH buy is alerted when minQuoteAmount is 1", () => {
   assert.equal(trade.quoteAmount, 1);
 });
 
-test("watch pair list keeps only primary V3 pool", () => {
+test("watch pair list keeps primary Uni V3 and does not add a second Uni pool", () => {
   const token = "0x020bfc650a365f8bb26819deaabf3e21291018b4";
   const watched = bot.chooseWatchPairAddresses(
     [
@@ -1047,4 +1059,155 @@ test("V4 track is excluded from V3 watch set (deepest pool only)", () => {
   assert.equal(watched.includes(v3), false);
   assert.equal(watched.includes(poolId), false);
   bot.config.trackedPairs = prev;
+});
+
+test("paste-token prefers deeper up CL WETH over thinner Uni V4", () => {
+  const token = "0xa5be0eeb82a013dc7867b9e020c36a69da666666";
+  const upPool = "0xcd2937592f73968ebaa916f37e5f6c1b27713469";
+  const selected = bot.chooseBestTradePairForToken(
+    [
+      {
+        chainId: "robinhood",
+        dexId: "up",
+        pairAddress: upPool,
+        labels: [],
+        liquidity: { usd: 393000 },
+        baseToken: { address: token, symbol: "CLOCKIN" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        dexId: "uniswap",
+        pairAddress: "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a",
+        labels: ["v4"],
+        liquidity: { usd: 73000 },
+        baseToken: { address: token, symbol: "CLOCKIN" },
+        quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" },
+      },
+    ],
+    token,
+  );
+  assert.equal(selected.kind, "up");
+  assert.equal(selected.pair.pairAddress.toLowerCase(), upPool);
+  assert.equal(bot.isUpPair(selected.pair), true);
+});
+
+test("V4 track still listens up CL in parallel, not Uni V3", () => {
+  const prev = bot.config.trackedPairs;
+  const poolId = "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a";
+  const v3 = "0x09a431261eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const upPool = "0xcd2937592f73968ebaa916f37e5f6c1b27713469";
+  bot.config.trackedPairs = [
+    {
+      tradeRoute: "v4",
+      pairAddress: poolId,
+      v4TradePoolId: poolId,
+      upPairAddress: upPool,
+      baseTokenAddress: "0xa5be0eeb82a013dc7867b9e020c36a69da666666",
+      baseSymbol: "CLOCKIN",
+      quoteTokenAddress: bot.config.quoteTokenAddress,
+      quoteSymbol: "WETH",
+      watchPairAddresses: [v3, upPool],
+    },
+  ];
+  bot.normalizeAlertWatch(bot.config.trackedPairs[0]);
+  assert.deepEqual(bot.config.trackedPairs[0].watchPairAddresses, [upPool]);
+  const watched = [...bot.watchedPairSet()];
+  assert.equal(watched.includes(upPool), true);
+  assert.equal(watched.includes(v3), false);
+  bot.config.trackedPairs = prev;
+});
+
+test("dex picker offers UP and Uni with liquidity labels", () => {
+  const token = "0x6245e67affa44a23077f0ea7f981a8dc743a0c47";
+  const upPool = "0xcd2937592f73968ebaa916f37e5f6c1b27713469";
+  const uniV4 = "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a";
+  const pairs = [
+    {
+      chainId: "robinhood",
+      dexId: "up",
+      pairAddress: upPool,
+      labels: [],
+      liquidity: { usd: 393000 },
+      baseToken: { address: token, symbol: "FRONG" },
+      quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+    },
+    {
+      chainId: "robinhood",
+      dexId: "uniswap",
+      pairAddress: uniV4,
+      labels: ["v4"],
+      liquidity: { usd: 260000 },
+      baseToken: { address: token, symbol: "FRONG" },
+      quoteToken: { address: "0x0000000000000000000000000000000000000000", symbol: "ETH" },
+    },
+  ];
+  const options = bot.buildDexTrackOptions(pairs, token);
+  assert.equal(options.symbol, "FRONG");
+  assert.equal(options.up.pair.pairAddress.toLowerCase(), upPool);
+  assert.equal(options.uni.kind, "v4");
+  assert.match(bot.dexPickerMessage(options), /Chọn DEX/);
+  const kb = bot.dexPickerKeyboard(options);
+  assert.equal(kb.inline_keyboard.length, 3);
+  assert.match(kb.inline_keyboard[0][0].callback_data, /^trackdex:up:/);
+  assert.match(kb.inline_keyboard[1][0].callback_data, /^trackdex:uni:/);
+});
+
+test("chooseBestUniTradePairForToken ignores up pools", () => {
+  const token = "0xa5be0eeb82a013dc7867b9e020c36a69da666666";
+  const selected = bot.chooseBestUniTradePairForToken(
+    [
+      {
+        chainId: "robinhood",
+        dexId: "up",
+        pairAddress: "0xcd2937592f73968ebaa916f37e5f6c1b27713469",
+        labels: [],
+        liquidity: { usd: 393000 },
+        baseToken: { address: token, symbol: "CLOCKIN" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        dexId: "uniswap",
+        pairAddress: "0x09a431261eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        labels: ["v3"],
+        liquidity: { usd: 16000 },
+        baseToken: { address: token, symbol: "CLOCKIN" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+    ],
+    token,
+  );
+  assert.equal(selected.kind, "v3");
+});
+
+test("watch list pairs up CL with Uni V3 when both exist", () => {
+  const token = "0xa5be0eeb82a013dc7867b9e020c36a69da666666";
+  const upPool = "0xcd2937592f73968ebaa916f37e5f6c1b27713469";
+  const uni = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const watched = bot.chooseWatchPairAddresses(
+    [
+      {
+        chainId: "robinhood",
+        dexId: "up",
+        pairAddress: upPool,
+        labels: [],
+        liquidity: { usd: 393000 },
+        baseToken: { address: token, symbol: "CLOCKIN" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+      {
+        chainId: "robinhood",
+        dexId: "uniswap",
+        pairAddress: uni,
+        labels: ["v3"],
+        liquidity: { usd: 10000 },
+        baseToken: { address: token, symbol: "CLOCKIN" },
+        quoteToken: { address: bot.config.quoteTokenAddress, symbol: "WETH" },
+      },
+    ],
+    token,
+    upPool,
+  );
+  assert.deepEqual(watched, [upPool, uni]);
 });
