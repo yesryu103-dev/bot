@@ -1273,7 +1273,7 @@ test("up limit sell band sits below market when selling token1", () => {
   );
 });
 
-test("up +5% limit band is farther than tight 1 tick", () => {
+test("up +100% limit band is farther than tight 1 tick", () => {
   const up = require("./up");
   const weth = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
   const token = "0xA5be0eEb82a013Dc7867B9e020c36A69DA666666";
@@ -1291,7 +1291,7 @@ test("up +5% limit band is farther than tight 1 tick", () => {
     token0: weth,
     token1: token,
     sellToken: token,
-    band: "5",
+    band: "100",
   });
   assert.ok(wide.tickUpper < tight.tickUpper);
 });

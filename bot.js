@@ -4347,12 +4347,13 @@ function limitSellBandKeyboard(tokenAddress, amountText, dex = "up") {
     inline_keyboard: [
       [
         { text: "Tight · 1 tick", callback_data: `limitband:${token}:${amt}:1t:${venue}` },
-        { text: "+1%", callback_data: `limitband:${token}:${amt}:1:${venue}` },
+        { text: "+10%", callback_data: `limitband:${token}:${amt}:10:${venue}` },
       ],
       [
-        { text: "+3%", callback_data: `limitband:${token}:${amt}:3:${venue}` },
-        { text: "+5%", callback_data: `limitband:${token}:${amt}:5:${venue}` },
+        { text: "+20%", callback_data: `limitband:${token}:${amt}:20:${venue}` },
+        { text: "+50%", callback_data: `limitband:${token}:${amt}:50:${venue}` },
       ],
+      [{ text: "+100%", callback_data: `limitband:${token}:${amt}:100:${venue}` }],
       [{ text: "← Amount", callback_data: `limitdex:${token}:${venue}` }],
     ],
   };
@@ -6508,7 +6509,7 @@ async function handleCallbackQueryInner(callbackQuery, state) {
         `Amount: <b>${escapeHtml(amount)}</b>`,
         "",
         "Tight = fill gần giá hiện tại (1 tickSpacing).",
-        "+1% / +3% / +5% = chờ token pump thêm rồi fill.",
+        "+10% / +20% / +50% / +100% = chờ token pump thêm rồi fill.",
       ].join("\n"),
       limitSellBandKeyboard(token, amount, dex),
     );

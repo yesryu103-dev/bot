@@ -89,7 +89,7 @@ function ticksForPricePct(pct) {
 
 /**
  * Plan a one-sided out-of-range band that fills when sellToken price rises vs WETH.
- * band: "1t" | "1" | "3" | "5" (percent of token price, or one tickSpacing).
+ * band: "1t" | "10" | "20" | "50" | "100" (percent of token price, or one tickSpacing).
  */
 function planLimitSellBand({
   currentTick,
